@@ -590,7 +590,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@ / 垫底快照=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
              up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
              up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
