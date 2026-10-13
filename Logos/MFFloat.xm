@@ -242,6 +242,37 @@ static BOOL gMFProbedMutableSetters = NO;
 static BOOL      gMFFgUsable = YES;
 static NSInteger gMFFgFailStreak = 0;
 
+// 【0.14.0 新增】③ `setDeactivationReasons:` 到底**管不管用** —— 同样写完读回验证。
+//
+// 归档(14) 把"不黑但闪"的账算清楚了：
+//   预防档的**差量判据**是 `h.deact != 0`，而本机的常态就是 `deact = 32`（画面好好的），
+//   于是**每一拍都有"差量"** ⇒ 每拍都调一次 `updateSettingsWithBlock:` ⇒
+//   每拍一次 SpringBoard 全量重算 + scene 重新提交 ⇒ 屏幕上就是持续地"闪"。
+//   更糟的是这个写**根本写不进去**：日志里 `已写 settings（预防差量(deact=1)）-> deact=32`，
+//   写完读回还是 32 —— 属于"纯亏"：付了一次重排的代价，换回 0 收益。
+// ⇒ 0.14.0 给这一项装上**和 setForeground 一样的熔断**：写完读回若仍是原值，
+//   连败 N 次就**停止再写它**。判据是"实测有效才继续用"，而不是"理论上该有用就一直写"。
+//   （阈值可配：keepAliveDeactFuse，0 = 不熔断，用于 A/B 复现 0.13.0 的持续闪。）
+static BOOL      gMFDeactUsable = YES;
+static NSInteger gMFDeactFailStreak = 0;
+
+// 【0.14.0 新增】④ 真黑恢复的**分级档位**（tier）。
+//
+// 归档(14) 的日志里，"真黑 → 恢复"是一次事件里最刺眼的那一下：
+//   真黑第 1 拍 ⇒ 我们立刻发"全量写"，而全量写里含 `setDisplayConfiguration:`
+//   —— 它**会把 frame 打回整屏 430x932**，紧接着的 `setFrame:` 再改回浮窗尺寸。
+//   一次写换来**两次几何重排**，画面从整屏"跳"回浮窗 ⇒ 用户看到的就是那一下闪。
+// ⇒ 0.14.0 把恢复动作拆成三级，**从最温和的一级试起**，哪一级救回来就停在哪一级：
+//     L1 = 只写状态量（fg / idle / deact / level），**一个几何字节都不碰** ⇒ 零几何变化 = 零可见闪
+//     L2 = L1 + `setFrame:`（仅当尺寸真的漂了）⇒ 一次重排
+//     L3 = L2 + `setDisplayConfiguration:`（0.13.0 的老全量写）⇒ 两次重排，最猛
+//   绝大多数"一过性真黑"应该在第 1 拍就被 L1 拉回来 —— 那就永远走不到 L2/L3，也就不闪。
+//   （开关：keepAliveTieredRestore，默认 YES；关掉则恒为 L3 = 回到 0.13.0 行为。）
+static NSInteger gMFLastRestoreTier  = 0;   // 最近一次真黑恢复用的档位（1/2/3），供日志与统计
+static NSInteger gMFRestoreTier1Hits = 0;   // L1 就救回来的次数（越接近"全部"越说明几何写是可以省的）
+static NSInteger gMFRestoreTier2Hits = 0;   // 升到 L2 才救回来的次数
+static NSInteger gMFRestoreTier3Hits = 0;   // 升到 L3 才救回来的次数
+
 // 【0.9.0】scene 守护（keep-alive）用到的状态。
 // 声明放在这里而不是"函数旁边"，因为在它下面出现的 MFLogPresenterState 也要读它们。
 static NSTimer *gMFKeepAliveTimer = nil;        // 守护定时器
@@ -915,7 +946,14 @@ static BOOL MFFrameMemoHit(id scene, CGRect r) {
 ///   **会把 frame 打回整屏 430x932**（日志里"写完 settings 之后 frame 就是 430x932"反复出现，
 ///   包括 P0 那一次），于是比例崩、还要再补一次 setFrame: —— 一次写换两次重排，纯亏。
 /// ⇒ 现在它们只在"真黑连续 N 拍都没救回来"时才作为升级手段出现，且 frame 一律放在**最后**设。
-static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate, BOOL verbose) {
+/// 【0.14.0 关键改动】`escalate` 布尔量换成**三档 tier** —— 恢复动作从最温和的一级试起。
+///   tier 1 = 只写状态量（fg / idle / deact / level），**不碰几何**（不写 DC、不写 frame）
+///   tier 2 = tier 1 + `setFrame:`（仅当尺寸真的漂了）
+///   tier 3 = tier 2 + `setDisplayConfiguration:`（0.13.0 的老全量写，"最猛但最闪"）
+/// 为什么值得这么拆：`setDisplayConfiguration:` 会把 frame 打回整屏 430x932、随后 `setFrame:`
+/// 再改回来 —— 一次写换来两次几何重排，画面上是明显的"跳一下"。而大多数真黑是**一过性**的
+/// （归档(14)：真黑持续 1 拍就恢复），根本不需要动几何。（开关 keepAliveTieredRestore）
+static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, NSInteger tier, BOOL verbose) {
     if (scene == nil) return @"scene=nil";
 
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
@@ -934,10 +972,14 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
     // App 遂被挂起（归档(13) 报告：`taskState: Suspended; visibility: Background`），图层永久消失。
     // `setForeground:` 在 settings 上**确实存在**（存在性矩阵 settings=YES）。
     BOOL doFg    = (p0 || MFConfigBool(cfg, @"keepAliveForeground", YES)) && gMFFgUsable;
-    BOOL doEsc   = p0 || escalate;
+    // 【0.14.0】几何按档位放行：tier>=3 才动 DC，tier>=2 才动 frame。
+    // P0（承载前的一次性设置，cfg=nil）永远按 tier 3 走 —— 那时候画面还没出来，闪不闪无所谓，
+    // 但比例必须一次到位。
+    BOOL doEsc   = p0 || (tier >= 3);
 
     CGSize want = gMFDesiredContentSize;
-    BOOL  wantFrame = gMFDesiredContentValid && want.width > 1.0 && want.height > 1.0;
+    BOOL  wantFrame = gMFDesiredContentValid && want.width > 1.0 && want.height > 1.0 &&
+                      (p0 || tier >= 2);
 
     // 【0.12.0】把 dc 的来源提到 block 外面：一是别在 settings block 里调 UIScreen，
     // 二是要能把"它到底有没有值"写进日志 —— 0.11.0 那行 `dc=__NSCFConstantString`
@@ -983,7 +1025,8 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         return @"exception";
     }
 
-    NSString *summary = [NSString stringWithFormat:@"fg=%d idle=%d deact=%d 升级=%d frame=%d(%.0fx%.0f)",
+    NSString *summary = [NSString stringWithFormat:@"L%ld fg=%d idle=%d deact=%d DC=%d frame=%d(%.0fx%.0f)",
+                         (long)(p0 ? 3 : tier),
                          (int)doFg, (int)doIdle, (int)doDeact, (int)doEsc, (int)wantFrame,
                          want.width, want.height];
 
@@ -1049,7 +1092,10 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
                 gMFFgUsable && h.hasSceneFg && !h.sceneFg;
 
     BOOL doIdle  = MFConfigBool(cfg, @"keepAlivePreventIdle",  YES) && h.hasIdle  && h.idle;
-    BOOL doDeact = MFConfigBool(cfg, @"keepAlivePreventDeact", YES) && h.hasDeact && h.deact != 0;
+    // 【0.14.0】这一项加了熔断。归档(14) 实测：本机 `deact` 常态就是 32（画面好好的），
+    // 于是每拍都有"差量" ⇒ 每拍写一次；而写完读回**还是 32** ⇒ 写了个寂寞，只换来一次重排。
+    BOOL doDeact = MFConfigBool(cfg, @"keepAlivePreventDeact", YES) &&
+                   gMFDeactUsable && h.hasDeact && h.deact != 0;
 
     // level：0.9.1 每拍都发；这里只在"真的不是 1.0"时发一次。
     BOOL wantLevel = MFConfigBool(cfg, @"keepAlivePreventLevel", YES);
@@ -1057,7 +1103,13 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
 
     BOOL hard = MFConfigBool(cfg, @"keepAlivePreventHard", NO);
 
-    if (!doFg && !doIdle && !doDeact && !doLevel && !hard) {
+    // 【0.14.0 修正】`hard` **不再参与"要不要写"的判断**。
+    // 0.13.0 把它并进了短路条件 ⇒ 逃生门一开就"每拍必写"（归档(14)：26 秒写了 14 次，
+    // 且每次都叠 `setDisplayConfiguration:` + `setFrame:` = 每次两次几何重排）
+    // ⇒ 那 26 秒里就是"每 1~2 秒闪一下"。逃生门的本意是"差量写按不住时加猛药"，
+    // 不是"每拍灌一次"。现在改成：hard 只在**本来就有差量**时额外带上几何（作为强化），
+    // 没差量就仍然一个字都不写。
+    if (!doFg && !doIdle && !doDeact && !doLevel) {
         // 关键：一个差量都没有 ⇒ **一个字都不写**。这是"不闪"的来源。
         return @"无差量（未调用 updateSettingsWithBlock:）";
     }
@@ -1113,6 +1165,32 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
         }
     }
 
+    // ---------- 4) 写完同样验证 `setDeactivationReasons:` ----------
+    // 【0.14.0 新增】这是本版最重要的一次"自证"：
+    //   如果写完读回 deact 仍然是原值（归档(14) 里就是 32、1 之类），
+    //   那这一项就是纯亏（付一次重排、换零收益）—— 连败 keepAliveDeactFuse 次就熔断、永不回写。
+    //   反过来，如果它真的能清零，熔断就永远不会触发，功能原样保留。
+    //   ⇒ 这条日志一出来，下一轮就不用再猜"闪是不是它造成的"了。
+    if (doDeact) {
+        MFHealth a2 = MFReadHealth(scene);
+        NSInteger fuse = MFConfigInt(cfg, @"keepAliveDeactFuse", 5);
+        if (a2.hasDeact && a2.deact == 0) {
+            gMFDeactFailStreak = 0;
+            if (verbose) MFLogS(@"[keepalive] ✔ setDeactivationReasons:0 生效（写完读回 deact=0）");
+        } else {
+            gMFDeactFailStreak += 1;
+            MFLog(@"[keepalive] ✘ setDeactivationReasons:0 写完读回仍是 %@ —— 系统又把它设回来了（第 %ld 次）",
+                  a2.hasDeact ? [NSString stringWithFormat:@"%llu", a2.deact] : @"?",
+                  (long)gMFDeactFailStreak);
+            if (fuse > 0 && gMFDeactFailStreak >= fuse) {
+                gMFDeactUsable = NO;
+                MFLog(@"[keepalive] ★ 熔断：setDeactivationReasons: 连写 %ld 次都无效 -> 停止再写它"
+                      @"（每拍写一次 = 每拍闪一次，而实测零收益；keepAliveDeactFuse=0 可关掉熔断做 A/B）",
+                      (long)fuse);
+            }
+        }
+    }
+
     if (verbose) {
         MFHealth a = MFReadHealth(scene);
         MFLog(@"[pres] 已写 settings（%@）-> cs=%ld layers=%ld deact=%llu idle=%d fgS=%@(%d)",
@@ -1122,10 +1200,10 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
     return summary;
 }
 
-/// P0：承载前把目标 scene 拉成可渲染。**一次性、全开**
+/// P0：承载前把目标 scene 拉成可渲染。**一次性、全开**（恒按 tier 3）
 /// （本机不存在的 setter 会被 responds 守卫自动跳过）。
 static void MFForceSceneRenderable(id scene) {
-    MFWriteSceneSettings(scene, nil, YES, YES);
+    MFWriteSceneSettings(scene, nil, 3, YES);
 }
 
 #pragma mark ========== 0.7.0：presenter 主链（Route 3 / Route 4 共用）==========
@@ -1691,9 +1769,11 @@ static void MFKeepAliveTick(void) {
     // ---------------- 健康 ----------------
     if (kind == MFDropNone) {
         if (gMFKeepAliveDownTicks > 0) {
-            MFLog(@"[keepalive] 已恢复：本次真黑持续 %ld 拍（约 %ld ms），期间写了 %ld 次 settings",
+            MFLog(@"[keepalive] 已恢复：本次真黑持续 %ld 拍（约 %ld ms），写了 %ld 次 settings"
+                  @"（末次档位 L%ld）｜ 本轮累计 L1救回=%ld L2救回=%ld L3救回=%ld",
                   (long)gMFKeepAliveDownTicks, (long)(gMFKeepAliveDownTicks * ms),
-                  (long)gMFKeepAliveWritesInDrop);
+                  (long)gMFKeepAliveWritesInDrop, (long)gMFLastRestoreTier,
+                  (long)gMFRestoreTier1Hits, (long)gMFRestoreTier2Hits, (long)gMFRestoreTier3Hits);
         }
         // 【0.12.0】预防档结束 —— 本轮最该看的一行：
         // "被去激活了 N 拍、写了 M 次状态量、图层始终没掉" = 预防成功（用户什么都感觉不到）。
@@ -1856,6 +1936,10 @@ static void MFKeepAliveTick(void) {
         if (capMs > 0 && effWriteMs > capMs) effWriteMs = capMs;
     }
 
+    // 【0.14.0】真黑第 1 拍**立刻写** —— 黑的时间越短，用户越看不到。
+    // （真黑是采样到的那一刻才发现的，再叠一层限流只会把黑拖长。）
+    if (gMFKeepAliveDownTicks <= 1) effWriteMs = 0;
+
     // ---- 刹车 3：两次写入的最小间隔（退避后取放大值）----
     if (gMFKeepAliveLastWriteTime > 0 &&
         (now - gMFKeepAliveLastWriteTime) * 1000.0 < (double)effWriteMs) {
@@ -1874,8 +1958,25 @@ static void MFKeepAliveTick(void) {
     // —— 这两项才是让 render server 重新给这个 scene 建图层的开关。
     // 所以：真黑 ⇒ 全量写（含 level + displayConfiguration + idle + deact + frame）。
     // 要复现 0.10.0 的黑屏（仅用于对照实验）可以把 keepAliveHardWrite 设成 false。
+    //
+    // 【0.14.0 修正】"全量写"里那两项几何（尤其 `setDisplayConfiguration:` 会把 frame 打回
+    // 整屏再被 `setFrame:` 改回来 = 两次重排）正是归档(14) 里"切换那一下"的来源。
+    // 而归档(14) 同时证明：**真黑几乎都是一过性的**（"本次真黑持续 1 拍"，写 1 次就回来）。
+    // ⇒ 从最温和的 L1 试起，哪级救回来就停在哪级。多数情况下 L1 就够，几何根本不用动，也就不闪。
     BOOL hardWrite = MFConfigBool(cfg, @"keepAliveHardWrite", YES);
-    NSString *did = MFWriteSceneSettings(scene, cfg, hardWrite, YES);
+    BOOL tiered    = MFConfigBool(cfg, @"keepAliveTieredRestore", YES);
+    NSInteger tier = 3;
+    if (!hardWrite) {
+        tier = 1;                                  // 对照实验：永远只写状态量（≈ 0.10.0 的"最小写"）
+    } else if (tiered) {
+        tier = (gMFKeepAliveDownTicks >= 3) ? 3
+             : (gMFKeepAliveDownTicks >= 2) ? 2 : 1;
+    }
+    NSString *did = MFWriteSceneSettings(scene, cfg, tier, YES);
+    gMFLastRestoreTier = tier;
+    if (tier <= 1)      gMFRestoreTier1Hits += 1;
+    else if (tier == 2) gMFRestoreTier2Hits += 1;
+    else                gMFRestoreTier3Hits += 1;
     gMFKeepAliveLastWriteTime = now;
     gMFKeepAliveWritesInDrop += 1;
 
@@ -1926,6 +2027,14 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFFgUsable = YES;
     gMFFgFailStreak = 0;
 
+    // 【0.14.0】deact 熔断同理：每次重新承载都重新试，并清空恢复档位统计。
+    gMFDeactUsable = YES;
+    gMFDeactFailStreak = 0;
+    gMFLastRestoreTier  = 0;
+    gMFRestoreTier1Hits = 0;
+    gMFRestoreTier2Hits = 0;
+    gMFRestoreTier3Hits = 0;
+
     NSTimer *t = [NSTimer timerWithTimeInterval:(ms / 1000.0)
                                         repeats:YES
                                           block:^(NSTimer *timer) { MFKeepAliveTick(); }];
@@ -1933,14 +2042,17 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveTimer = t;
 
     MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 预防档=%d @ %ld ms"
-          @"（差量写：只发真变化的项，含 setForeground:，**不碰几何**）/ "
-          @"预防退避=%ld 拍后至 %ld ms / 真黑全量写=%d / 宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
+          @"（差量写：只发真变化的项，含 setForeground:，**不碰几何**；"
+          @"deact 写带熔断 keepAliveDeactFuse=%ld） / "
+          @"预防退避=%ld 拍后至 %ld ms / 真黑恢复=分级(L1纯状态量/L2+frame/L3+DC) tiered=%d / "
+          @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
           ms, bundleID ?: @"?",
           (int)MFConfigBool(cfg, @"keepAlivePrevent", YES),
           (long)MFConfigInt(cfg, @"keepAlivePreventMs", 250),
+          (long)MFConfigInt(cfg, @"keepAliveDeactFuse", 5),
           (long)MFConfigInt(cfg, @"keepAlivePreventBackoffAfter", 40),
           (long)MFConfigInt(cfg, @"keepAlivePreventBackoffMaxMs", 2000),
-          (int)MFConfigBool(cfg, @"keepAliveHardWrite", YES),
+          (int)MFConfigBool(cfg, @"keepAliveTieredRestore", YES),
           (long)MFConfigInt(cfg, @"keepAliveGraceMs", 600),
           (long)MFConfigInt(cfg, @"keepAliveMinWriteMs", 300),
           (long)MFConfigInt(cfg, @"keepAliveBackoffMaxMs", 2000));

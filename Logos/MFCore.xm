@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.13.0";
+    return @"0.14.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -245,10 +245,13 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   归档(12)：这是唯一有效的时机 —— 图层
                                                        //   掉光之后就不可逆了（81 次全量写全灭）。
         @"keepAlivePreventMs"     : @250,              // 【0.12.0 新增】预防写的限流间隔
-        @"keepAlivePreventHard"   : @NO,               // 【0.12.0 新增 / 0.13.0 语义收窄】走"0.9.1 的完整版"：
+        @"keepAlivePreventHard"   : @NO,               // 【0.12.0 新增 / 0.14.0 语义再收窄】走"0.9.1 的完整版"：
                                                        //   再叠加 displayConfiguration + frame（会闪但最猛）。
                                                        //   默认 NO：预防档**不碰任何几何**，因为归档(10)
                                                        //   测到那一帧黑就是 displayConfiguration + frame 造成的。
+                                                       //   0.14.0：hard 不再参与「要不要写」的差量判断
+                                                       //   （归档(14) 里用户开了 hard ⇒ hard 恒为真 ⇒
+                                                       //   每拍都「有差量」⇒ 每拍写一次 = 每拍闪一次）。
         // ---- 【0.13.0 新增】预防档的"差量写"开关（只发真的不一样的那几项）----
         @"keepAlivePreventForeground" : @YES,          //   **核心**：发 setForeground:YES。
                                                        //   先在 FBScene 上读 foreground，只有是 0 才写；
@@ -258,17 +261,28 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAlivePreventLevel"      : @YES,          //   补 setLevel:1（只在 level != 1 时发）
         @"keepAlivePreventBackoffAfter" : @40,         //   连续多少拍还在预防档之后开始退避
         @"keepAlivePreventBackoffMaxMs" : @2000,       //   预防退避的间隔上限（永不放弃，只降频）
+        // ---- 【0.14.0 新增】消闪三件套 ----
+        @"keepAliveDeactFuse"     : @5,                //   deact 写的熔断阈值：写完读回发现没变过
+                                                       //   就连续计败，达到 N 次后**永不回写 deact**
+                                                       //   （0 = 关熔断，用于 A/B 复现 0.13.0 的持续闪）。
+                                                       //   归档(14)：deact 常态就是 32，每拍写回 0
+                                                       //   等于每拍付一次 scene 重提交、换零收益。
+        @"keepAliveTieredRestore" : @YES,              //   真黑恢复**分级**：L1 只写状态量（不碰几何）
+                                                       //   → L2 +frame → L3 +displayConfiguration。
+                                                       //   归档(14)：真黑 1 拍就恢复，多半 L1 就够；
+                                                       //   关掉 = 回到 0.13.0 恒为 L3（含 DC，必闪）。
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @14,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @15,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
     MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / "
-          @"keepAlive=true@200ms / 预防档=差量写含 setForeground: / keepAliveForeground=true / 真黑全量写=true）",
+          @"keepAlive=true@200ms / 预防档=差量写含 setForeground: / keepAliveForeground=true / "
+          @"deact 熔断=5 / 真黑分级恢复=true）",
           path, (int)ok);
 }
 
@@ -303,8 +317,10 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAlivePreventForeground"] == nil || cfg[@"keepAlivePreventIdle"] == nil ||
                         cfg[@"keepAlivePreventDeact"] == nil || cfg[@"keepAlivePreventLevel"] == nil ||
                         cfg[@"keepAlivePreventBackoffAfter"] == nil ||
-                        cfg[@"keepAlivePreventBackoffMaxMs"] == nil);
-    if (cur >= 14 && !missingKeys) return;
+                        cfg[@"keepAlivePreventBackoffMaxMs"] == nil ||
+                        cfg[@"keepAliveDeactFuse"] == nil ||
+                        cfg[@"keepAliveTieredRestore"] == nil);
+    if (cur >= 15 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -347,6 +363,9 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAlivePreventLevel"]      == nil) up[@"keepAlivePreventLevel"]      = @YES;
         if (up[@"keepAlivePreventBackoffAfter"] == nil) up[@"keepAlivePreventBackoffAfter"] = @40;
         if (up[@"keepAlivePreventBackoffMaxMs"] == nil) up[@"keepAlivePreventBackoffMaxMs"] = @2000;
+        // ---- 0.14.0 消闪三件套 ----
+        if (up[@"keepAliveDeactFuse"]     == nil) up[@"keepAliveDeactFuse"]     = @5;   // 0.14.0 新增
+        if (up[@"keepAliveTieredRestore"] == nil) up[@"keepAliveTieredRestore"] = @YES; // 0.14.0 新增
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -508,13 +527,36 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @14;
         }
 
+        // ---- 0.14 -> 0.15：消闪（不黑了，但每拍还在闪）----
+        // 归档(14) 真机证据（用户原话："这次没有黑屏，但是悬浮窗在切换应用时依旧会闪一下"）：
+        //   · 黑屏判定通过：setForeground 回读从 0 -> 1，App 进程不再被挂起；
+        //   · 但日志里「预防写[deact=1]」每拍出现（deact=32 共 32 次），fgS=n(0)；
+        //   · 用户还开了逃生门 keepAlivePreventHard=true ⇒ hard 恒为真 ⇒
+        //     「无差量」短路永远不成立 ⇒ 每拍一次 updateSettingsWithBlock: = 每拍闪一次。
+        // 三处修正：
+        //   ① deact 写加熔断（常态 32 写回 0 实测零收益，纯亏一次重排）；
+        //   ② hard 不再参与差量判断（只影响写什么，不再制造"假差量"）；
+        //   ③ 真黑恢复分级：L1 只写状态量 → L2 +frame → L3 +DC（归档(14) 真黑 1 拍即恢复，
+        //      说明多数情况根本不需要动几何 —— DC 正是把 frame 打回整屏的那个）。
+        if (cur < 15) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=15：消闪三件套 ——");
+            MFLogS(@"[cfg]     ① 新增 keepAliveDeactFuse=5：deact 写完读回若从未生效，连败 5 次后熔断、不再回写");
+            MFLogS(@"[cfg]        （归档(14)：deact 常态就是 32，每拍写回 0 = 每拍付一次重排换零收益）；");
+            MFLogS(@"[cfg]     ② keepAlivePreventHard 不再参与「要不要写」的差量判断，只决定写什么");
+            MFLogS(@"[cfg]        （它开着时恒为真，把差量短路顶掉了 = 每拍写 = 每拍闪）；");
+            MFLogS(@"[cfg]     ③ 新增 keepAliveTieredRestore=YES：真黑恢复从最温和的 L1 试起，");
+            MFLogS(@"[cfg]        L1=纯状态量 → L2=+frame → L3=+displayConfiguration（关掉 = 回 0.13.0 恒 L3）。");
+            up[@"cfgVersion"] = @15;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
              up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
              up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
              up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"],
-             up[@"keepAliveForeground"], up[@"keepAlivePreventForeground"]);
+             up[@"keepAliveForeground"], up[@"keepAlivePreventForeground"],
+             up[@"keepAliveDeactFuse"], up[@"keepAliveTieredRestore"]);
         return;
     }
 }
