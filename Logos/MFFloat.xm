@@ -726,7 +726,8 @@ static CGRect MFRectProp(id obj, NSString *selName, BOOL *has) {
 ///
 /// 所以判据收紧成**唯一一条**：只有"一个图层都没有"才算黑。
 ///   layers<=0 或 presenter 宿主 hosted<=0 —— 那块表面什么都没有，这就是黑屏本身。
-/// deact / idle 降级为"软警告"：只写日志，默认什么都不做（keepAliveSoft 可开，用于 A/B）。
+/// deact / idle 降级为"软警告"：只写日志，**永远不动手**
+/// （keepAliveSoft 打开只是把这类波动也记进日志，用于观察，不会写任何 settings）。
 typedef NS_ENUM(NSInteger, MFDropKind) {
     MFDropNone     = 0,   // 健康
     MFDropAdvisory = 1,   // 软警告：被去激活 / 进了 idle，但画面还在（**不许动手**）

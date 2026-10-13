@@ -104,11 +104,11 @@ NSDictionary *MFLoadConfig(void) {
 //                              归档(10) 里"闪的频率 = 1/keepAliveMs"是因为那时**健康时也每拍写**
 //                              （判据太宽），现在只有真的一个图层都没有时才写，所以调小它
 //                              不会让闪更频繁。反过来，真黑时调小它是**好事**（救得更快）。
-//    keepAliveSoft  = false ——是否把 deact!=0 / idle=1 也当成"要动手"。
+//    keepAliveSoft  = false ——【0.11.0 澄清】它**只是日志开关，永不动手**。
 //                              **默认 false，这是 0.10.0 修掉闪屏的关键一档。** 归档(10) 日志里
 //                              deact=32/33 出现 20+ 次而其中绝大多数 layers/hosted 完好（画面是好的），
 //                              0.9.1 拿它当判据 → 每拍都写 settings → 每写一次就闪一次。
-//                              打开它只用于 A/B 对照。
+//                              打开它只是为了把 deact/idle 的波动记进日志观察，**不会写任何 settings**。
 //    keepAliveForeground = false ——本机（iOS 17.3.1）settings 上**根本没有**
 //                              setForeground: / foreground（responds 守卫静默跳过）。
 //                              它现在只作为日志字段；开关留着以防别的机型上真有。
@@ -120,9 +120,9 @@ NSDictionary *MFLoadConfig(void) {
 //                              idle + deact + frame）一次都拉不回来 —— layers=0 连续 220+ 拍、
 //                              其间写了十几次全灭。0.9.1 能拉回来，差别就是这两项。
 //                              设成 false 等于复现 0.10.0 的黑屏，仅用于对照实验。
-//    keepAliveLevel = false ——【0.11.0 澄清】它现在只管**软警告**那一档：
-//                              软警告要不要也动手、以及动手时要不要带 level。真黑不看它。
-//    keepAliveEscalateAfter = 5    ——（0.11.0 起仅供软警告档参考）
+//    keepAliveLevel = false ——【0.11.0 起**废弃**：代码不再读取它】保留键只为兼容旧配置。
+//                              真黑一律全量写（见 keepAliveHardWrite），不再有"升级写"这一档。
+//    keepAliveEscalateAfter = 5    ——【0.11.0 起**废弃**：代码不再读取它】同上。
 //    keepAliveMinWriteMs    = 300  ——两次写 settings 的最小间隔（限流）。
 //    keepAliveGraceMs       = 600  ——【0.11.0 改 1500 -> 600】挂载宽限期：
 //                                     presenter 建 hosting 是异步的，刚挂上时"没有图层"很正常，
@@ -173,16 +173,16 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   本机没有 setForeground:，这一项一直是空转
         @"keepAliveIdle"   : @YES,                     // 真掉出时清 idleModeEnabled
         @"keepAliveDeact"  : @YES,                     // 真掉出时清 deactivationReasons=0
-        @"keepAliveLevel"  : @NO,                       // 【0.11.0 澄清】现在只管"软警告要不要也动手"
-        @"keepAliveSoft"   : @NO,                      // 【0.10.0 新增】是否把 deact/idle 也当"要动手"。
-                                                       //   **默认 NO 是 0.10.0 修掉闪屏的关键**：归档(10) 里
+        @"keepAliveLevel"  : @NO,                      // 【0.11.0 起废弃】代码不再读取；保留键只为兼容旧配置
+        @"keepAliveSoft"   : @NO,                      // 【0.11.0 澄清】**只是日志开关，永不动手**。
+                                                       //   默认 NO 是 0.10.0 修掉闪屏的关键：归档(10) 里
                                                        //   deact 波动 20+ 次而画面大多是好的，一动手就闪。
         @"keepAliveHardWrite"     : @YES,              // 【0.11.0 新增】真黑时全量写（idle+deact+level+dc+frame）。
                                                        //   归档(11) 证明 0.10.0 的"最小写"一次都拉不回来。
                                                        //   false = 复现 0.10.0 的黑屏，仅用于对照实验。
         @"keepAliveMinWriteMs"    : @300,              // 【0.10.0 新增】两次写 settings 的最小间隔
         @"keepAliveGraceMs"       : @600,              // 【0.11.0 改 1500 -> 600】挂载宽限期（只观察不写）
-        @"keepAliveEscalateAfter" : @5,                // 【0.10.0 新增】（0.11.0 起仅供软警告档参考）
+        @"keepAliveEscalateAfter" : @5,                // 【0.11.0 起废弃】代码不再读取
         @"keepAliveGiveUpAfter"   : @0,                // 【0.11.0 改 30 -> 0】**0 = 永不放弃**。
                                                        //   真黑是"必须救"的状态，放弃 = 永久黑屏。
         @"keepAliveBackoffAfter"  : @50,               // 【0.11.0 新增】连续多少拍没救回来开始退避
