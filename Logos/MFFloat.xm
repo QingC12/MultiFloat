@@ -41,13 +41,23 @@
 //            用户点得晚，标记早没了 => 危险动作完全没保护。
 //            修法：标记改为【只在承载前后】写/清，并且承载入口每次都重新检查标记。
 //
-//  ============ 0.4.0 的三道防线 ============
+//  ============ 0.4.0 的三道防线（0.5.0 沿用）============
 //   防线 1  默认 hostEnabled=false：装上只显示外壳，一个 SpringBoard 对象都不碰。
 //   防线 2  承载前写 /var/mobile/MF-float-attempt.txt，链路走完并存活 20 秒才清除。
 //           任何一次崩溃都会让标记留下 => 之后所有承载直接拒绝 => 物理上不可能崩循环。
 //   防线 3  承载链路每一步写 `>>> 步名` / `<<< 步名 ok` 到 /var/mobile/MF-host-step.txt。
 //           崩了就靠"最后一个没配对的 >>>"定位；下一次启动自动写成 MF-crash-attribution.txt。
 //           配合配置项 hostStep(1..6) 可以做不崩的逐步逼近。
+//
+//  ============ 0.5.0 修的是什么 ============
+//  0.4.0 真机：用户装好后【一个浮窗都没有】。日志只有一个原因：
+//      [gate] enabled=false -> 完全惰性
+//  用户只把 hostEnabled 改成了 true，而 enabled（总显示开关）仍是 false。
+//  两个开关名字太像 => 又一次"开关把用户坑了"。0.5.0 的处理：
+//      (a) 默认 enabled=true —— 装上就显示外壳（0.3.0 已证明外壳安全）；
+//      (b) 启动时自动修复 "enabled=false 且 hostEnabled=true" 的自相矛盾；
+//      (c) enabled=false 时的日志直接点明"只改 hostEnabled 没用"。
+//  承载链路（S1..S7）本身与 0.4.0 完全一致，没有改动。
 //
 //  另外：本版仍然【一个 hook 都不装】。
 //
@@ -744,8 +754,13 @@ void MFFloatBootstrap(void) {
     }
     // 老 plist 缺 0.4.0 的新键时原地补齐，省得用户手打键名
     MFUpgradeConfigIfNeeded(config);
+    // 【0.5.0】修复 "enabled=false 但 hostEnabled=true" 的自相矛盾
+    //（用户把 hostEnabled 改成了 true 却漏了总开关 —— 那正是"改了开关却不出浮窗"的原因）
+    config = MFRepairConfigContradiction(config);
     if (!MFConfigBool(config, @"enabled", NO)) {
-        MFLogRawC("[gate] enabled=false -> 完全惰性（把 /var/mobile/MultiFloat.plist 里 enabled 改成 <true/> 后 respring）\n");
+        MFLogRawC("[gate] enabled=false -> 完全惰性（浮窗不出现）\n"
+                  "[gate]    注意：enabled 是【总开关】，优先于一切；hostEnabled 只是【真承载】的二级开关。\n"
+                  "[gate]    只改 hostEnabled 不会让浮窗出现 —— 要用就把 enabled 也改成 <true/> 再 respring。\n");
         return;
     }
 
@@ -761,7 +776,7 @@ void MFFloatBootstrap(void) {
     double delay = 12.0;
     id cfgDelay = config[@"showDelay"];
     if ([cfgDelay respondsToSelector:@selector(doubleValue)]) delay = [cfgDelay doubleValue];
-    MFLog(@"[gate] %.1f 秒后显示浮窗（0.4.0 不做任何自动承载）", delay);
+    MFLog(@"[gate] %.1f 秒后显示浮窗（0.5.0 不做任何自动承载）", delay);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

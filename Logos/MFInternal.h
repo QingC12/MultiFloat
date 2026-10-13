@@ -14,6 +14,10 @@
 //      0.3.0 真机事故：用户在 Filza 里把 mode 写成 shell，iOS 键盘自动更正成 she'll，
 //      于是 `isEqualToString:@"shell"` 判定失败 → 走进了 host 分支 → 每次启动自动承载 → 崩循环。
 //      现在所有行为开关一律用 **布尔/整数**；字符串只做展示。
+//   7. 【0.5.0 新增 · 又一个事故】两个布尔开关名字太像也会出事。
+//      0.4.0 真机：用户只把 hostEnabled 改成 true，漏了 enabled 总显示开关，
+//      于是 tweak 完全惰性、浮窗根本不出现。修法：默认 enabled=true（装上就显示外壳），
+//      并在启动时自动修复 "enabled=false 且 hostEnabled=true" 这种自相矛盾。
 //
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H
@@ -45,6 +49,11 @@ NSDictionary *MFLoadConfig(void);
 void MFWriteDefaultConfigIfNeeded(void);
 /// 老版本写下的 plist 缺 0.4.0 的新键时，原地补齐（避免用户手打键名被键盘自动更正坑到）
 void MFUpgradeConfigIfNeeded(NSDictionary *cfg);
+
+/// 【0.5.0 新增】修复自相矛盾的配置：enabled=false 但 hostEnabled=true
+/// => 说明用户改开关时漏了总开关，这里把 enabled 补成 true 并回写磁盘。
+/// 返回可能被修正过的配置，**调用方必须用返回值继续判断**（无需修正时原样返回）。
+NSDictionary *MFRepairConfigContradiction(NSDictionary *cfg);
 
 /// 配置读取一律走这三个，缺键/类型不符时返回 fallback（绝不返回垃圾值）
 BOOL        MFConfigBool(NSDictionary *cfg, NSString *key, BOOL fallback);

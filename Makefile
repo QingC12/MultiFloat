@@ -6,6 +6,11 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.5.0 变更：
+#   - 修 0.4.0 的配置坑：总开关 enabled 默认 false 导致"改了 hostEnabled 却无任何画面"
+#   - 默认 enabled=true（装上就显示外壳）；新增"enabled=false 且 hostEnabled=true"自修复
+#   - enabled=false 时的日志直接点明"只改 hostEnabled 没用"
+#   - 承载链路 S1..S7 与 0.4.0 完全一致，未改动
 # 0.4.0 变更：
 #   - 修 0.3.0 的"崩→重启→再崩→安全模式"循环（三处独立缺陷，详见 MFFloat.xm 头部注释）
 #   - 启动不再自动承载；行为开关全部改成布尔（hostEnabled），字符串不再参与判断

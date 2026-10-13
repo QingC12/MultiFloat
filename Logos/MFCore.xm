@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.4.0";
+    return @"0.5.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -86,16 +86,23 @@ NSDictionary *MFLoadConfig(void) {
     return nil;
 }
 
-//  0.4.0 的默认配置刻意做到"装上什么都不做"：
-//    enabled    = false   —— 总开关
+//  0.5.0 的默认配置：**装上就显示外壳，但绝不承载**。
+//    enabled    = true    —— 总显示开关（0.4.0 这里误设为 false，直接导致"改了 hostEnabled 却毫无反应"）
 //    hostEnabled= false   —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的宿主视图）
 //    hostStep   = 6       —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode       = "shell" —— 纯展示用，**不再参与任何判断**（见 MFInternal.h 里 she'll 事故记录）
+//
+//  为什么 0.5.0 把 enabled 默认改成 true：
+//    0.4.0 的注释写着"防线 1 默认 hostEnabled=false：装上只显示外壳"，
+//    但代码里 enabled 也写成了 false —— 装上连外壳都不显示，与设计意图自相矛盾，
+//    用户改 hostEnabled 时也被这个隐形的总开关挡住（真机事故：浮窗完全不出现）。
+//    0.3.0 已真机证明"只显示外壳"是安全的（可拖可缩放，连续多轮 respring 无崩），
+//    所以总开关默认打开安全；真正危险的 hostEnabled 仍然默认关。
 void MFWriteDefaultConfigIfNeeded(void) {
     NSString *path = @"/var/mobile/MultiFloat.plist";
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return;
     NSDictionary *def = @{
-        @"enabled"        : @NO,
+        @"enabled"        : @YES,                      // 总显示开关：装上就显示外壳
         @"mode"           : @"shell",                  // 仅展示
         @"hostEnabled"    : @NO,                       // 真承载：默认关
         @"hostStep"       : @6,                        // 承载最多走到第几步
@@ -104,7 +111,7 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"windowLevel"    : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=false，纯惰性）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -127,6 +134,33 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         MFLog(@"[cfg] 补齐 0.4.0 新键于 %@ ok=%d（hostEnabled=false / hostStep=6）", path, (int)ok);
         return;
     }
+}
+
+/// 0.5.0 真机事故的修复：用户把 hostEnabled 改成 true，却漏了 enabled 这个总开关
+/// （它俩名字太像），于是 tweak 完全惰性、连外壳都不显示，用户以为"改了开关没反应"。
+/// 与其再被这样绊一次，启动时直接把这种自相矛盾的配置修好：
+///     enabled=false 且 hostEnabled=true  =>  用户意图显然是"要用" => 把 enabled 补成 true。
+/// 只补总显示开关，**绝不自动打开 hostEnabled**（真承载开关必须由用户显式打开）。
+/// 返回可能被修正过的配置（调用方必须用返回值继续判断），无需修正时原样返回。
+NSDictionary *MFRepairConfigContradiction(NSDictionary *cfg) {
+    if (cfg == nil) return cfg;
+    BOOL enabled  = MFConfigBool(cfg, @"enabled", NO);
+    BOOL hostWanted = MFConfigBool(cfg, @"hostEnabled", NO);
+    if (enabled || !hostWanted) return cfg;   // 不矛盾，什么都不做
+
+    MFLogRawC("[cfg] !! 配置自相矛盾：enabled=false 但 hostEnabled=true\n"
+              "[cfg]    （这就是“改了 hostEnabled 却没出现浮窗”的原因：enabled 是总开关，优先于一切）\n"
+              "[cfg]    已自动把 enabled 补成 true；hostEnabled 保持你自己的选择不变。\n");
+
+    NSMutableDictionary *fixed = [cfg mutableCopy];
+    fixed[@"enabled"] = @YES;
+    for (NSString *path in MFConfigCandidatePaths()) {
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
+        BOOL ok = [fixed writeToFile:path atomically:YES];
+        MFLog(@"[cfg] 回写修正后的配置 %@ ok=%d（enabled=true）", path, (int)ok);
+        break;
+    }
+    return fixed;
 }
 
 #pragma mark - ---------- 崩溃自解除闸门 ----------
