@@ -6,6 +6,21 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.7.0 变更：
+#   - 0.6.0 真机：presenter 链 P1..P5 全通、拿到真 _UIScenePresentationView、不崩 —— 但内容区纯黑
+#   - 根因：0.6.0 用 [[UIScenePresentationManager alloc] _initWithScene:] 自造 manager，
+#     它不在 scene 自己的 presenter owner 体系里 => presenter 永远进不了 hosting =>
+#     _UIScenePresentationView 一直画 backgroundColorWhileNotHosting（黑）
+#   - 对照 khanhduytran0/FrontBoardAppLauncher（LiveContainer 多任务同款源码）：
+#     manager 必须来自 scene 自己 —— [scene.uiPresentationManager createPresenterWithIdentifier:]
+#     并且要在 createPresenter 之后 modifyPresentationContext:{ appearanceStyle = 2 }
+#   - hostRoute 四路：3=接管已存在 scene（默认）/ 4=自建 scene（FrontBoardAppLauncher 原版）
+#                     / 2=旧的 _initWithScene:（A/B）/ 1=SB 宿主 VC（兜底）
+#   - 新增 P0 步：承载前把 scene settings 拉成 foreground=YES / level=1 / portrait
+#     （被切到后台的 scene foreground=NO，App 不会再往里渲染）
+#   - 删除 forceActivate：真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉（归因 S7-settle）
+#   - 配置改为"每次承载重新读盘"，调参不用 respring
+#   - 新增 P3b（appearanceStyle）/ P6（presenter isHosting + 图层计数）两处插桩
 # 0.6.0 变更：
 #   - 0.5.0 真机：浮窗出现、S1..S7 全通、不崩，但内容区纯黑（sceneIfExists active=1 contentState=0）
 #   - 根因：Route B 的 SBDeviceApplicationSceneViewController 是给 SpringBoard 自己布局系统用的，

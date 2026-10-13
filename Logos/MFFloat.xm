@@ -81,6 +81,50 @@
 //
 //  另外：本版仍然【一个 hook 都不装】。
 //
+//  ============ 0.7.0 修的是什么 ============
+//  0.6.0 真机结果（归档(5)）：浮窗外壳正常、S1..S7 全走完、20 秒存活、**不崩**，
+//  presenter 链 P1..P5 也全通，拿到了真正的 _UIScenePresentationView，
+//  但点 Safari 之后内容区**依然纯黑**。
+//
+//  对照一个公开、可用、且同样是 iOS 17 的实现后找到根因：
+//      khanhduytran0/FrontBoardAppLauncher（LiveContainer 的多任务同款源码）
+//  它拿 presenter 的写法只有一种：
+//      FBScene *scene = [[FBSceneManager sharedInstance] createSceneWithDefinition:definition
+//                                                              initialParameters:parameters];
+//      self.presenter = [scene.uiPresentationManager createPresenterWithIdentifier:self.sceneID];
+//      [self.presenter modifyPresentationContext:^(UIMutableScenePresentationContext *ctx){
+//          ctx.appearanceStyle = 2;
+//      }];
+//      [self.presenter activate];
+//      self.view = self.presenter.presentationView;
+//  注意两件事：
+//   (1) **manager 来自 scene 自己**（`scene.uiPresentationManager`），
+//       而我们 0.6.0 是 `[[UIScenePresentationManager alloc] _initWithScene:scene]` 自己造的。
+//       自造的 manager 不在 scene 自己的 presenter owner 体系里，
+//       presenter 永远进不了 "hosting" 状态 —— 而 _UIScenePresentationView 在
+//       "not hosting" 时画的就是呈现上下文里的 backgroundColorWhileNotHosting（默认黑）。
+//       => 那层黑底不是"没渲染出来"，是"presenter 明确在显示未承载态的背景色"。
+//   (2) 它承载前会把 scene 的 settings 设成 **foreground=YES / level=1 / frame /
+//       displayConfiguration**，也就是"这个 scene 是活的、在显示"。
+//       已被 App 切到后台的 scene，设置里 foreground=NO，App 进程不会再往它里面渲染。
+//
+//  0.7.0 因此改成四条路线，默认走 3：
+//      hostRoute=3（默认）接管**已存在**的 scene，用 **scene 自己的** manager 取 presenter，
+//                        并在前面加 P0 步把 settings 拉成 foreground=YES/level=1/portrait。
+//                        —— 改动最小、最像 Stheno 的做法。
+//      hostRoute=4        完全照搬 FrontBoardAppLauncher：自己 createSceneWithDefinition: 造一个
+//                        scene 给目标 App 渲染，再用它自己的 manager 取 presenter。
+//                        —— 唯一有公开源码背书"能出画面"的路径。
+//      hostRoute=2        0.6.0 的旧路（自建 _initWithScene: manager），保留做 A/B 对照。
+//      hostRoute=1        0.5.0 的 Route B（SpringBoard 宿主 VC），已知黑屏，仅兜底。
+//
+//  同时【删掉 forceActivate】：真机实测那一次承载在写完 S7-settle 之后、
+//  20 秒存活窗口之内进程就没了（MF-crash-attribution.txt: crashedStep=S7-settle）。
+//  换句话说 forceActivate 引发的不是同步崩溃，而是 SpringBoard 在其后几秒里被弄挂。
+//  现在改用"改 settings"这种非侵入手段达到同样目的。
+//
+//  另外：本版仍然【一个 hook 都不装】。
+//
 #import "MFInternal.h"
 
 // ============ 承载链路步骤名（顺序即执行顺序）============
@@ -97,14 +141,19 @@ static NSString *const kMFStepPm      = @"P1-pm";
 static NSString *const kMFStepCtx     = @"P2-ctx";
 static NSString *const kMFStepPres    = @"P3-pres";
 static NSString *const kMFStepAct     = @"P4-act";
-static NSString *const kMFStepForce   = @"P4b-force";
 static NSString *const kMFStepPView   = @"P5-view";
+
+// ============ 0.7.0 新增的步骤名 ============
+static NSString *const kMFStepP0      = @"P0-scene";   // 把 scene settings 拉成可渲染
+static NSString *const kMFStepOwn     = @"P4-scene";   // Route 4：自己造一个 scene
+static NSString *const kMFStepState   = @"P6-state";   // 挂载后 dump presenter / layer 状态
 
 // 0.6.0：ARC 下必须把"我们真正持有的"对象放进静态 strong 变量。
 // 否则局部变量一出作用域就被释放 —— 那个 presenter/宿主 VC 一死，浮窗里立刻变黑。
 static id gMFPM        = nil;   // UIScenePresentationManager
 static id gMFPresenter = nil;   // _UIScenePresenter
 static id gMFHostVC    = nil;   // Route B 的宿主 VC
+static id gMFOwnScene  = nil;   // Route 4 自己造出来的 FBScene（必须持有，否则立刻失效）
 
 // 启动时由 HookBridge 灌入"上一轮崩在哪一步"（nil = 上一轮没崩）
 static NSString *gMFBootCrashStep = nil;
@@ -319,31 +368,13 @@ static UIView *MFTryPresenterRoute(id scene, NSDictionary *config) {
     }
     MFStepOk(kMFStepAct);
 
-    // ---- P4b（可选，默认关）：强制激活那个 FBScene ----
-    // 0.3.0 崩在 activateWithTransitionContext:nil。日志显示 scene 本来 active=1，一般不需要；
-    // 真要试请把配置 forceActivate 设成 <true/> —— 这里用的是 FBScene -_createTransitionContext
-    // 造出来的**非空**上下文，不走 0.3.0 的 nil 老路。
-    MFStepMark(kMFStepForce);
-    if (MFConfigBool(config, @"forceActivate", NO)) {
-        if (MFBoolProp(scene, NSSelectorFromString(@"isActive"))) {
-            MFLog(@"[pres] forceActivate=true 但 scene 已 active，跳过");
-        } else {
-            id ctx = MFMsg(scene, NSSelectorFromString(@"_createTransitionContext"));
-            MFLog(@"[pres] _createTransitionContext=%@", ctx ? NSStringFromClass([ctx class]) : @"nil");
-            SEL act2 = NSSelectorFromString(@"activateWithTransitionContext:");
-            if (ctx != nil && [scene respondsToSelector:act2]) {
-                @try {
-                    ((void (*)(id, SEL, id))objc_msgSend)(scene, act2, ctx);
-                    MFLogS(@"[pres] activateWithTransitionContext 已发送（非空上下文）");
-                } @catch (NSException *e) {
-                    MFLog(@"[pres] activateWithTransitionContext 抛异常: %@", e.reason);
-                }
-            }
-        }
-    } else {
-        MFLog(@"[pres] forceActivate=false（默认；只有 A2 仍黑屏时才需要设 true）");
-    }
-    MFStepOk(kMFStepForce);
+    // ---- P4b 已删除（0.6.0 的 forceActivate）----
+    // 真机实测：开着 forceActivate 的那一轮，S7-settle 写出后 20 秒内存活窗口都还没走完
+    // 进程就没了（MF-crash-attribution.txt: crashedStep=S7-settle）。
+    // 也就是说它不是同步崩溃，而是把 SpringBoard 弄进了一个几秒后才爆的状态。
+    // 0.7.0 改用"改 settings"（P0）这种非侵入手段，不再碰 activateWithTransitionContext:。
+    (void)config;
+    MFLogS(@"[pres] （Route 2 旧路）已不包含 forceActivate —— 改用 P0 的 settings 方案");
 
     // ---- P5：取呈现视图 ----
     MFStepMark(kMFStepPView);
@@ -354,6 +385,404 @@ static UIView *MFTryPresenterRoute(id scene, NSDictionary *config) {
     MFStepOk(kMFStepPView);
 
     return [v isKindOfClass:[UIView class]] ? (UIView *)v : nil;
+}
+
+#pragma mark ========== 0.7.0：带类型的消息发送（全部守卫）==========
+
+// 这些 helper 只做一件事：在 respondsToSelector + @try 两层保护下按**正确 ABI**发消息。
+// 0.3.0 的崩溃就是"参数类型/可空性想当然"造成的，这里不再犯。
+static void MFMvBool(id o, NSString *selName, BOOL v) {
+    if (o == nil || selName == nil) return;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return;
+    @try { ((void (*)(id, SEL, BOOL))objc_msgSend)(o, s, v); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); }
+}
+
+static void MFMvDouble(id o, NSString *selName, double v) {
+    if (o == nil || selName == nil) return;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return;
+    @try { ((void (*)(id, SEL, double))objc_msgSend)(o, s, v); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); }
+}
+
+static void MFMvLong(id o, NSString *selName, long v) {
+    if (o == nil || selName == nil) return;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return;
+    @try { ((void (*)(id, SEL, long))objc_msgSend)(o, s, v); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); }
+}
+
+static void MFMvRect(id o, NSString *selName, CGRect r) {
+    if (o == nil || selName == nil) return;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return;
+    @try { ((void (*)(id, SEL, CGRect))objc_msgSend)(o, s, r); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); }
+}
+
+static id MFMvObj(id o, NSString *selName, id a) {
+    if (o == nil || selName == nil) return nil;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return nil;
+    @try { return ((id (*)(id, SEL, id))objc_msgSend)(o, s, a); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); return nil; }
+}
+
+static id MFMvObj2(id o, NSString *selName, id a, id b) {
+    if (o == nil || selName == nil) return nil;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return nil;
+    @try { return ((id (*)(id, SEL, id, id))objc_msgSend)(o, s, a, b); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); return nil; }
+}
+
+/// 按名字取类对象（objc_getClass 不会 realize 任何类，安全）
+static id MFCls(NSString *name) {
+    if (name.length == 0) return nil;
+    Class c = objc_getClass(name.UTF8String);
+    return c ? (id)c : nil;
+}
+
+static double MFDProp(id obj, SEL sel) {
+    if (obj == nil || sel == NULL) return 0.0;
+    if (![obj respondsToSelector:sel]) return 0.0;
+    @try { return ((double (*)(id, SEL))objc_msgSend)(obj, sel); }
+    @catch (NSException *e) { return 0.0; }
+}
+
+/// KVC 取一串"能打印的东西"，失败返回 <无>
+static NSString *MFKV(id obj, NSString *key) {
+    if (obj == nil || key == nil) return @"nil";
+    @try {
+        id v = [obj valueForKey:key];
+        if (v == nil) return @"nil";
+        return [NSString stringWithFormat:@"%@", v];
+    } @catch (NSException *e) { return @"<无>"; }
+}
+
+/// KVC 取容器元素个数（hostedLayers / nonHostedLayers 这类）
+static NSInteger MFKVCount(id obj, NSString *key) {
+    if (obj == nil || key == nil) return -1;
+    @try {
+        id v = [obj valueForKey:key];
+        if (v == nil) return -1;
+        if ([v respondsToSelector:@selector(count)]) return (NSInteger)[v count];
+        return -1;
+    } @catch (NSException *e) { return -1; }
+}
+
+#pragma mark ========== 0.7.0：P0 —— 让 scene 变成"可渲染" ==========
+
+/// 把目标 scene 的 settings 拉成"前台 + 在该屏 + 竖屏"。
+///
+/// 为什么必须做：App 被切到后台后，它的 scene settings 里 foreground=NO，
+/// App 进程不会再往这个 scene 里渲染 —— 这种 scene 就算被 presenter 正确承载，
+/// 拿到的也只是一块没有内容的表面。
+/// 公开可用的实现（khanhduytran0/FrontBoardAppLauncher）在**创建** scene 时就直接给了
+///     settings.foreground = YES;
+///     settings.level = 1;
+///     settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
+///     settings.interfaceOrientation = UIInterfaceOrientationPortrait;
+/// 我们这里对**已存在**的 scene 做同样的事（唯一区别是用 updateSettingsWithBlock: 原地改）。
+static void MFForceSceneRenderable(id scene) {
+    if (scene == nil) return;
+
+    id before = MFMsg(scene, NSSelectorFromString(@"settings"));
+    MFLog(@"[pres] P0 前 settings: foreground=%d level=%.1f frame=%@ contentState=%ld active=%d",
+         (int)MFBoolProp(before, NSSelectorFromString(@"foreground")),
+         MFDProp(before, NSSelectorFromString(@"level")),
+         MFKV(before, @"frame") ?: @"-",
+         (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
+         (int)MFBoolProp(scene, NSSelectorFromString(@"isActive")));
+
+    SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
+    if (![scene respondsToSelector:upd]) {
+        MFLogS(@"[pres] !! scene 没有 updateSettingsWithBlock:，P0 跳过");
+        return;
+    }
+
+    id dc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
+
+    void (^blk)(id) = ^(id st) {
+        if (st == nil) return;
+        MFMvBool(st,   @"setForeground:", YES);
+        MFMvDouble(st, @"setLevel:", 1.0);
+        MFMvLong(st,   @"setInterfaceOrientation:", (long)UIInterfaceOrientationPortrait);
+        if (dc != nil) MFMvObj(st, @"setDisplayConfiguration:", dc);
+    };
+
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
+        MFLogS(@"[pres] P0 已发 updateSettingsWithBlock（foreground=YES / level=1 / portrait）");
+    } @catch (NSException *e) {
+        MFLog(@"[pres] P0 updateSettingsWithBlock 抛异常: %@", e.reason);
+    }
+
+    id after = MFMsg(scene, NSSelectorFromString(@"settings"));
+    MFLog(@"[pres] P0 后 settings: foreground=%d level=%.1f frame=%@ contentState=%ld",
+         (int)MFBoolProp(after, NSSelectorFromString(@"foreground")),
+         MFDProp(after, NSSelectorFromString(@"level")),
+         MFKV(after, @"frame") ?: @"-",
+         (long)MFIntProp(scene, NSSelectorFromString(@"contentState")));
+}
+
+#pragma mark ========== 0.7.0：presenter 主链（Route 3 / Route 4 共用）==========
+
+/// 把 scene 的渲染尺寸直接改成浮窗内容区大小。
+/// 与 resizesHostedContext 是**两种不同的做法**，任选其一即可：
+///   - resizesHostedContext=YES（P2，默认）：不动 scene 设置，由 presenter 把宿主内容缩放进浮窗
+///   - 本函数：直接把 scene 的 frame 设成浮窗尺寸，让 App 自己按这个尺寸重新布局
+/// 公开实现（FrontBoardAppLauncher）用的是后者；万一前者不出画面/尺寸不对，
+/// 把配置 hostSceneFrame 设成 true 就能切到后者（原生分屏的手感）。
+static void MFSetSceneFrame(id scene, CGRect frame) {
+    if (scene == nil) return;
+    SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
+    if (![scene respondsToSelector:upd]) return;
+
+    void (^blk)(id) = ^(id st) {
+        if (st == nil) return;
+        MFMvRect(st, @"setFrame:", frame);
+    };
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
+        MFLog(@"[pres] 已把 scene.frame 设成 %@（hostSceneFrame=true）", NSStringFromCGRect(frame));
+    } @catch (NSException *e) {
+        MFLog(@"[pres] 设 scene.frame 抛异常: %@", e.reason);
+    }
+}
+
+static id MFCreatePresenterForScene(id pm, NSString *ident) {
+    if (pm == nil || ident.length == 0) return nil;
+    SEL s2 = NSSelectorFromString(@"createPresenterWithIdentifier:priority:");
+    SEL s1 = NSSelectorFromString(@"createPresenterWithIdentifier:");
+    @try {
+        if ([pm respondsToSelector:s2]) {
+            return ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(pm, s2, ident, (NSInteger)0);
+        }
+        if ([pm respondsToSelector:s1]) {
+            return ((id (*)(id, SEL, id))objc_msgSend)(pm, s1, ident);
+        }
+        MFLogS(@"[pres] manager 两个 createPresenter 都没有");
+    } @catch (NSException *e) {
+        MFLog(@"[pres] createPresenter 抛异常: %@", e.reason);
+    }
+    return nil;
+}
+
+/// presenter 完整链，返回可直接挂进浮窗的 presentationView。
+///
+/// **manager 一定优先取 scene 自己的**（`scene.uiPresentationManager`）——
+/// 这是 0.6.0 黑屏的根因：自己 alloc 的 `_initWithScene:` manager 不在 scene 的
+/// presenter owner 体系里，presenter 永远进不了 hosting 状态，
+/// _UIScenePresentationView 就一直画 backgroundColorWhileNotHosting（黑）。
+static UIView *MFPresentScene(id scene, NSString *sceneID, NSDictionary *config, NSString **outPMSource) {
+    if (scene == nil || sceneID.length == 0) return nil;
+    if (outPMSource) *outPMSource = @"?";
+
+    // ---- P1：presentation manager（首选 scene 自己的）----
+    MFStepMark(kMFStepPm);
+    id pm = MFMsg(scene, NSSelectorFromString(@"uiPresentationManager"));
+    NSString *src = @"scene.uiPresentationManager";
+    if (pm == nil) {
+        pm = MFCreatePresentationManager(scene);
+        src = @"自建 _initWithScene:（0.6.0 旧法，已知进不了 hosting）";
+    }
+    MFLog(@"[pres] presentationManager=%@（来源=%@）", pm ? NSStringFromClass([pm class]) : @"nil", src);
+    MFStepOk(kMFStepPm);
+    if (pm == nil) return nil;
+    gMFPM = pm;
+    if (outPMSource) *outPMSource = src;
+
+    // ---- P2：默认呈现上下文 ----
+    MFStepMark(kMFStepCtx);
+    if (MFConfigBool(config, @"resizesHosted", YES)) {
+        SEL modifySel = NSSelectorFromString(@"modifyDefaultPresentationContext:");
+        if ([pm respondsToSelector:modifySel]) {
+            @try {
+                void (^blk)(id) = ^(id mc) {
+                    if (mc == nil) return;
+                    MFMvBool(mc, @"setResizesHostedContext:", YES);
+                    MFLog(@"[pres] 已在 %@ 上设 resizesHostedContext=YES",
+                          NSStringFromClass([mc class]));
+                };
+                ((void (*)(id, SEL, id))objc_msgSend)(pm, modifySel, (id)blk);
+            } @catch (NSException *e) {
+                MFLog(@"[pres] modifyDefaultPresentationContext 抛异常: %@", e.reason);
+            }
+        } else {
+            MFLogS(@"[pres] manager 没有 modifyDefaultPresentationContext:（跳过）");
+        }
+    } else {
+        MFLogS(@"[pres] resizesHosted=false -> 不设 resizesHostedContext");
+    }
+    id defCtx = MFMsg(pm, NSSelectorFromString(@"defaultPresentationContext"));
+    MFLog(@"[pres] defaultPresentationContext=%@ resizesHostedContext=%d",
+         defCtx ? NSStringFromClass([defCtx class]) : @"nil",
+         (int)MFBoolProp(defCtx, NSSelectorFromString(@"resizesHostedContext")));
+    MFStepOk(kMFStepCtx);
+
+    // ---- P3：建 presenter ----
+    MFStepMark(kMFStepPres);
+    id pres = MFCreatePresenterForScene(pm, sceneID);
+    MFLog(@"[pres] presenter=%@", pres ? NSStringFromClass([pres class]) : @"nil");
+    MFStepOk(kMFStepPres);
+    if (pres == nil) return nil;
+    gMFPresenter = pres;
+
+    // ---- P3b：presenter 自己的呈现上下文（照抄 FrontBoardAppLauncher 的 appearanceStyle=2）----
+    SEL presModify = NSSelectorFromString(@"modifyPresentationContext:");
+    if ([pres respondsToSelector:presModify]) {
+        @try {
+            void (^blk)(id) = ^(id mc) {
+                if (mc == nil) return;
+                MFMvLong(mc, @"setAppearanceStyle:", 2);
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(pres, presModify, (id)blk);
+            MFLogS(@"[pres] P3b 已设 appearanceStyle=2（FrontBoardAppLauncher 同款）");
+        } @catch (NSException *e) {
+            MFLog(@"[pres] modifyPresentationContext 抛异常: %@", e.reason);
+        }
+    } else {
+        MFLogS(@"[pres] presenter 没有 modifyPresentationContext:（跳过）");
+    }
+
+    // ---- P4：activate ----
+    MFStepMark(kMFStepAct);
+    SEL actSel = NSSelectorFromString(@"activate");
+    if ([pres respondsToSelector:actSel]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(pres, actSel);
+        } @catch (NSException *e) {
+            MFLog(@"[pres] activate 抛异常: %@", e.reason);
+        }
+    } else {
+        MFLogS(@"[pres] presenter 没有 activate（不致命，继续取视图）");
+    }
+    MFStepOk(kMFStepAct);
+
+    // ---- P5：取呈现视图 ----
+    MFStepMark(kMFStepPView);
+    id v = MFMsg(pres, NSSelectorFromString(@"presentationView"));
+    MFLog(@"[pres] presentationView=%@ frame=%@",
+         v ? NSStringFromClass([v class]) : @"nil",
+         [v isKindOfClass:[UIView class]] ? NSStringFromCGRect(((UIView *)v).frame) : @"-");
+    MFStepOk(kMFStepPView);
+
+    return [v isKindOfClass:[UIView class]] ? (UIView *)v : nil;
+}
+
+/// 挂载后打印 presenter / 图层宿主的真实状态。
+/// 这是 0.7.0 专门为"万一下一轮还得改"准备的第一手证据：
+///   isHosting=0  => presenter 没进 hosting（manager 来源不对，或 scene 不可渲染）
+///   isHosting=1 且 hostedLayers=0 => presenter 在承载，但 scene 没有可放的图层
+///   isHosting=1 且 hostedLayers>0 但仍旧黑 => 是尺寸/变换/层级问题，不是内容问题
+static void MFLogPresenterState(NSString *tag, id pres, id view) {
+    MFLog(@"[pres] %@ presenter=%@ isActive=%d isHosting=%d isInvalidated=%d",
+         tag,
+         pres ? NSStringFromClass([pres class]) : @"nil",
+         (int)MFBoolProp(pres, NSSelectorFromString(@"isActive")),
+         (int)MFBoolProp(pres, NSSelectorFromString(@"isHosting")),
+         (int)MFBoolProp(pres, NSSelectorFromString(@"isInvalidated")));
+
+    if (![view isKindOfClass:[UIView class]]) return;
+    UIView *v = (UIView *)view;
+    id host = MFMsg(v, NSSelectorFromString(@"hostContainerView"));
+    MFLog(@"[pres] %@ view=%@ frame=%@ subviews=%lu hostContainer=%@",
+         tag, NSStringFromClass([view class]), NSStringFromCGRect(v.frame),
+         (unsigned long)v.subviews.count,
+         host ? NSStringFromClass([host class]) : @"nil");
+    if (host != nil) {
+        MFLog(@"[pres] %@ hostContainer hostedLayers=%ld nonHostedLayers=%ld hostViews=%ld",
+             tag,
+             (long)MFKVCount(host, @"hostedLayers"),
+             (long)MFKVCount(host, @"nonHostedLayers"),
+             (long)MFKVCount(host, @"_hostViews"));
+    }
+    id hostScene = MFMsg(pres, NSSelectorFromString(@"scene"));
+    if (hostScene != nil) {
+        id st = MFMsg(hostScene, NSSelectorFromString(@"settings"));
+        id lm = MFMsg(hostScene, NSSelectorFromString(@"layerManager"));
+        // 这几项能直接回答"SpringBoard 有没有把我们设的 foreground=YES 又改回去"：
+        // 若 P0 后是 1、这里变成 0，说明 SB 的 _scene:interceptUpdateWithNewSettings: 覆盖了我们。
+        MFLog(@"[pres] %@ scene=%@ foreground=%@ level=%@ frame=%@ contentState=%@ layers=%ld",
+             tag, NSStringFromClass([hostScene class]),
+             MFKV(st, @"foreground"), MFKV(st, @"level"), MFKV(st, @"frame"),
+             MFKV(hostScene, @"contentState"), (long)MFKVCount(lm, @"layers"));
+    }
+}
+
+#pragma mark ========== 0.7.0：Route 4 —— 自建 scene ==========
+
+/// 完全照搬 khanhduytran0/FrontBoardAppLauncher 的 scene 构造：
+///   FBSMutableSceneDefinition（新 identity + 目标 App 的进程身份）
+///   + UIMutableApplicationSceneSettings（foreground=YES / frame / level / displayConfiguration）
+///   + UIMutableApplicationSceneClientSettings
+///   → [[FBSceneManager sharedInstance] createSceneWithDefinition:initialParameters:]
+/// 拿到的是一个**全新的**、生来就是"前台可渲染"的 scene。
+static id MFCreateOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect frame) {
+    id mgrCls = MFCls(@"FBSceneManager");
+    id defCls = MFCls(@"FBSMutableSceneDefinition");
+    id idnCls = MFCls(@"FBSSceneIdentity");
+    id cliCls = MFCls(@"FBSSceneClientIdentity");
+    id spcCls = MFCls(@"UIApplicationSceneSpecification");
+    id parCls = MFCls(@"FBSMutableSceneParameters");
+    id setCls = MFCls(@"UIMutableApplicationSceneSettings");
+    id cstCls = MFCls(@"UIMutableApplicationSceneClientSettings");
+    id rbsCls = MFCls(@"RBSProcessIdentity");
+
+    if (mgrCls == nil || defCls == nil || idnCls == nil || cliCls == nil ||
+        spcCls == nil || parCls == nil || setCls == nil || cstCls == nil || rbsCls == nil) {
+        MFLog(@"[pres] Route4 缺类：mgr=%d def=%d idn=%d cli=%d spec=%d par=%d set=%d cset=%d rbs=%d",
+              mgrCls != nil, defCls != nil, idnCls != nil, cliCls != nil, spcCls != nil,
+              parCls != nil, setCls != nil, cstCls != nil, rbsCls != nil);
+        return nil;
+    }
+
+    // ---- 定义 ----
+    MFStepMark(kMFStepOwn);
+    id procIdentity = MFMvObj(rbsCls, @"identityForEmbeddedApplicationIdentifier:", bundleID);
+    id def = MFMsg(defCls, NSSelectorFromString(@"definition"));
+    if (def == nil) { MFStepOk(kMFStepOwn); MFLogS(@"[pres] Route4 定义创建失败"); return nil; }
+
+    MFMvObj(def, @"setIdentity:", MFMvObj(idnCls, @"identityForIdentifier:", sceneID));
+    if (procIdentity != nil) MFMvObj(def, @"setClientIdentity:", MFMvObj(cliCls, @"identityForProcessIdentity:", procIdentity));
+    id spec = MFMsg(spcCls, NSSelectorFromString(@"specification"));
+    MFMvObj(def, @"setSpecification:", spec);
+    MFLog(@"[pres] Route4 定义 identity=%@ client=%d spec=%@",
+          MFKV(def, @"identity"), procIdentity != nil, spec ? NSStringFromClass([spec class]) : @"nil");
+
+    // ---- 参数 ----
+    id params = MFMvObj(parCls, @"parametersForSpecification:", spec);
+    if (params == nil) { MFStepOk(kMFStepOwn); MFLogS(@"[pres] Route4 parameters 创建失败"); return nil; }
+
+    id st = MFMsg(setCls, NSSelectorFromString(@"new"));
+    MFMvBool(st,   @"setForeground:", YES);
+    MFMvDouble(st, @"setLevel:", 1.0);
+    MFMvBool(st,   @"setCanShowAlerts:", YES);
+    MFMvBool(st,   @"setStatusBarDisabled:", YES);
+    MFMvLong(st,   @"setInterfaceOrientation:", (long)UIInterfaceOrientationPortrait);
+    MFMvRect(st,   @"setFrame:", frame);
+    MFMvObj(st,    @"setPersistenceIdentifier:", sceneID);
+    id dc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
+    if (dc != nil) MFMvObj(st, @"setDisplayConfiguration:", dc);
+    MFMvObj(params, @"setSettings:", st);
+
+    id cs = MFMsg(cstCls, NSSelectorFromString(@"new"));
+    MFMvLong(cs, @"setInterfaceOrientation:", (long)UIInterfaceOrientationPortrait);
+    MFMvLong(cs, @"setStatusBarStyle:", 0);
+    MFMvObj(params, @"setClientSettings:", cs);
+
+    // ---- 建 scene ----
+    id mgr = MFMsg(mgrCls, NSSelectorFromString(@"sharedInstance"));
+    id scene = MFMvObj2(mgr, @"createSceneWithDefinition:initialParameters:", def, params);
+    MFStepOk(kMFStepOwn);
+    MFLog(@"[pres] Route4 createSceneWithDefinition -> %@（mgr=%@）",
+          scene ? NSStringFromClass([scene class]) : @"nil",
+          mgr ? NSStringFromClass([mgr class]) : @"nil");
+    return scene;
 }
 
 /// 能力报告：把关键类的"自有方法表"和目标对象的 responds 矩阵写到
@@ -367,7 +796,13 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
                           @"UIScenePresentationContext", @"UIMutableScenePresentationContext",
                           @"_UIScenePresentationView", @"_UISceneLayerHostView",
                           @"_UISceneLayerHostContainerView", @"UIApplicationSceneDeactivationManager",
-                          @"SBDeviceApplicationSceneViewController" ];
+                          @"SBDeviceApplicationSceneViewController",
+                          // Route 4 需要的那一串（缺一个就造不出 scene）
+                          @"FBSceneManager", @"FBSMutableSceneDefinition", @"FBSSceneIdentity",
+                          @"FBSSceneClientIdentity", @"UIApplicationSceneSpecification",
+                          @"FBSMutableSceneParameters", @"UIMutableApplicationSceneSettings",
+                          @"UIMutableApplicationSceneClientSettings", @"RBSProcessIdentity",
+                          @"RBSProcessHandle", @"FBProcessManager" ];
     for (NSString *cn in classes) {
         Class c = objc_getClass(cn.UTF8String);
         [s appendFormat:@"---- %@ : %@\n", cn, c ? @"存在" : @"不存在"];
@@ -408,10 +843,40 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
     dump(@"handle", handle);
     dump(@"hostVC(Route B)", hostVC);
 
-    [s appendFormat:@"\n==== 我们持有的对象（静态 strong）====\npm=%@\npresenter=%@\nhostVC=%@\n",
+    // ---- 0.7.0 新增：真正决定"黑不黑"的那几个取值 ----
+    [s appendFormat:@"\n==== scene.settings 关键值 ====\n"];
+    id st = MFMsg(scene, NSSelectorFromString(@"settings"));
+    [s appendFormat:@"  foreground           = %@\n", MFKV(st, @"foreground")];
+    [s appendFormat:@"  level                = %@\n", MFKV(st, @"level")];
+    [s appendFormat:@"  frame                = %@\n", MFKV(st, @"frame")];
+    [s appendFormat:@"  interfaceOrientation = %@\n", MFKV(st, @"interfaceOrientation")];
+    [s appendFormat:@"  scene.contentState   = %@\n", MFKV(scene, @"contentState")];
+    [s appendFormat:@"  scene.isActive       = %@\n", MFKV(scene, @"isActive")];
+    id lm = MFMsg(scene, NSSelectorFromString(@"layerManager"));
+    [s appendFormat:@"  scene.layerManager   = %@ layers=%ld\n",
+     lm ? NSStringFromClass([lm class]) : @"nil", (long)MFKVCount(lm, @"layers")];
+
+    [s appendFormat:@"\n==== presenter 状态（isHosting 就是黑屏的分水岭）====\n"];
+    [s appendFormat:@"  isActive            = %@\n", MFKV(gMFPresenter, @"isActive")];
+    [s appendFormat:@"  isHosting           = %@\n", MFKV(gMFPresenter, @"isHosting")];
+    [s appendFormat:@"  identifier          = %@\n", MFKV(gMFPresenter, @"identifier")];
+    [s appendFormat:@"  isInvalidated       = %@\n", MFKV(gMFPresenter, @"isInvalidated")];
+    [s appendFormat:@"  presentationContext = %@\n", MFKV(gMFPresenter, @"presentationContext")];
+    id pv = MFMsg(gMFPresenter, NSSelectorFromString(@"presentationView"));
+    [s appendFormat:@"  presentationView    = %@\n", pv ? NSStringFromClass([pv class]) : @"nil"];
+    if ([pv isKindOfClass:[UIView class]]) {
+        id host = MFMsg(pv, NSSelectorFromString(@"hostContainerView"));
+        [s appendFormat:@"  view.hostContainerView                    = %@\n", host ? NSStringFromClass([host class]) : @"nil"];
+        [s appendFormat:@"  view.hostContainerView.hostedLayers       = %ld\n", (long)MFKVCount(host, @"hostedLayers")];
+        [s appendFormat:@"  view.hostContainerView.nonHostedLayers    = %ld\n", (long)MFKVCount(host, @"nonHostedLayers")];
+        [s appendFormat:@"  view.hostContainerView._hostViews         = %ld\n", (long)MFKVCount(host, @"_hostViews")];
+    }
+
+    [s appendFormat:@"\n==== 我们持有的对象（静态 strong）====\npm=%@\npresenter=%@\nhostVC=%@\nownScene=%@\n",
      gMFPM ? NSStringFromClass([gMFPM class]) : @"nil",
      gMFPresenter ? NSStringFromClass([gMFPresenter class]) : @"nil",
-     gMFHostVC ? NSStringFromClass([gMFHostVC class]) : @"nil"];
+     gMFHostVC ? NSStringFromClass([gMFHostVC class]) : @"nil",
+     gMFOwnScene ? NSStringFromClass([gMFOwnScene class]) : @"nil"];
 
     NSString *p = @"/var/mobile/MF-presenter-report.txt";
     BOOL ok = [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
@@ -776,8 +1241,8 @@ static char kMFRowBundleIDKey;
                 detail:[NSString stringWithFormat:
                         @"配置里 hostStep=%ld，链路只走到第 %ld 步就主动停下。\n"
                         @"step=1 只解析应用；2 拿 sceneHandle；3 拿 FBScene；"
-                        @"4 建宿主 VC；5 设 resizesHostedContext；6 挂载视图。\n"
-                        @"把 hostStep 调大一位再 respring，就能不崩溃地逼近崩点。",
+                        @"4 拿承载视图（presenter / 宿主 VC）；5 设渲染尺寸；6 挂载视图。\n"
+                        @"把 hostStep 调大一位再点一次应用名（不用 respring）就能继续。",
                         (long)limit, (long)limit]];
     [panel setStatusText:[NSString stringWithFormat:@"hostStep=%ld 上限停止", (long)limit]];
 }
@@ -787,6 +1252,19 @@ static char kMFRowBundleIDKey;
     if (panel == nil) return;
 
     MFLog(@"[host] ========== begin bid=%@ ==========", bundleID);
+
+    // 【0.7.0】每次承载都重新读盘。
+    // 原因：respring 会把目标 App 的 scene 一起杀掉，而调参（hostRoute / forceForeground /
+    // resizesHosted）本来就得反复试。改成"点了才读"之后，用户在 Filza 改完 plist
+    // 直接再点一次应用名就生效，**不用 respring**，也就不会丢掉想承载的那个 scene。
+    NSDictionary *freshCfg = MFLoadConfig();
+    if (freshCfg != nil) self.config = freshCfg;
+    MFLog(@"[cfg] 本次生效配置：hostRoute=%ld forceForeground=%d resizesHosted=%d hostSceneFrame=%d hostStep=%ld",
+          (long)MFConfigInt(self.config, @"hostRoute", 3),
+          (int)MFConfigBool(self.config, @"forceForeground", YES),
+          (int)MFConfigBool(self.config, @"resizesHosted", YES),
+          (int)MFConfigBool(self.config, @"hostSceneFrame", NO),
+          (long)MFConfigInt(self.config, @"hostStep", 6));
 
     // ---------- 闸门 1：行为开关一律用布尔，绝不用字符串 ----------
     if (!MFConfigBool(self.config, @"hostEnabled", NO)) {
@@ -889,36 +1367,83 @@ static char kMFRowBundleIDKey;
     }
     if (limit < 4) { [self stopAtStep:4 limit:limit]; return; }
 
-    // ---------- S4：取"呈现载体"（0.6.0 起有两条路）----------
-    //   hostRoute=2（默认）Route A2：自建 UIScenePresentationManager → _UIScenePresenter → presentationView
-    //                       —— Stheno / TrollOpen 用的就是这条
-    //   hostRoute=1        Route B ：借 SpringBoard 的 SBDeviceApplicationSceneViewController
-    //                       —— 0.5.0 实测：不崩，但内容区**纯黑**（那个 VC 缺 SB 自己的 presenter 就只是黑底）
+    // ---------- S4：取"呈现载体"（0.7.0 起四条路，默认 3）----------
+    //   hostRoute=3  接管已存在的 scene，用 **scene 自己的** uiPresentationManager 取 presenter
+    //                （前面加 P0：把 scene settings 拉成 foreground=YES/level=1/portrait）
+    //   hostRoute=4  自己 createSceneWithDefinition: 造一个新 scene 再呈现（FrontBoardAppLauncher 原版）
+    //   hostRoute=2  0.6.0 的旧路（自建 _initWithScene: manager）—— 实测黑屏，仅留做 A/B 对照
+    //   hostRoute=1  0.5.0 的 Route B（SpringBoard 宿主 VC）—— 实测黑屏，仅兜底
     MFStepMark(kMFStepVC);
 
-    NSInteger route = MFConfigInt(self.config, @"hostRoute", 2);
-    if (route != 1 && route != 2) route = 2;
-    MFLog(@"[host] hostRoute=%ld（2=自建 presenter / 1=SpringBoard 宿主 VC）", (long)route);
+    NSInteger route = MFConfigInt(self.config, @"hostRoute", 3);
+    if (route != 1 && route != 2 && route != 3 && route != 4) route = 3;
+    NSString *routeName = (route == 3) ? @"3=接管已存在 scene（默认）"
+                        : (route == 4) ? @"4=自建 scene 再呈现"
+                        : (route == 2) ? @"2=旧版自建 _initWithScene: manager（已知黑屏）"
+                        : @"1=SpringBoard 宿主 VC（已知黑屏）";
+    MFLog(@"[host] hostRoute=%ld（%@）", (long)route, routeName);
 
     UIView *contentView = nil;
     id hostVC = nil;
+    id targetScene = scene;
 
-    if (route == 2) {
-        contentView = MFTryPresenterRoute(scene, self.config);
-        MFLog(@"[host] Route A2(presenter) -> %@", contentView ? @"拿到呈现视图" : @"失败，退回 Route B");
+    // ---------- P0：让 scene 变成"可渲染"（route 3/4 才需要）----------
+    // route=4 自己造的 scene 生来就是 foreground=YES，不用再拉。
+    if (route == 3) {
+        if (MFConfigBool(self.config, @"forceForeground", YES)) {
+            MFStepMark(kMFStepP0);
+            MFForceSceneRenderable(scene);
+            MFStepOk(kMFStepP0);
+        } else {
+            MFLogS(@"[pres] forceForeground=false -> 跳过 P0（不改 scene settings）");
+        }
     }
+
+    // 可选：直接把 scene 的 frame 设成浮窗内容区尺寸（与 resizesHostedContext 二选一）
+    if ((route == 3 || route == 4) && MFConfigBool(self.config, @"hostSceneFrame", NO)) {
+        MFStepMark(kMFStepP0);
+        MFSetSceneFrame(targetScene, panel.contentArea.bounds);
+        MFStepOk(kMFStepP0);
+    }
+
+    // ---------- Route 4：先造一个属于我们的 scene ----------
+    if (route == 4) {
+        NSString *ownID = [NSString stringWithFormat:@"sceneID:%@-multifloat", bundleID];
+        id ownScene = MFCreateOwnSceneForApp(bundleID, ownID, panel.contentArea.bounds);
+        if (ownScene != nil) {
+            gMFOwnScene = ownScene;
+            targetScene = ownScene;
+            MFLogS(@"[host] Route 4 已造出属于我们的 scene，改用它作为承载目标");
+        } else {
+            MFLogS(@"[host] Route 4 造 scene 失败 -> 退回 route 3（接管已存在的 scene）");
+        }
+    }
+
+    if (route == 3 || route == 4) {
+        NSString *pmSource = @"?";
+        contentView = MFPresentScene(targetScene,
+                                     [NSString stringWithFormat:@"MultiFloat-%@", bundleID],
+                                     self.config, &pmSource);
+        MFLog(@"[host] Route %ld 结果 -> %@（manager 来源：%@）",
+              (long)route, contentView ? @"拿到呈现视图" : @"失败", pmSource);
+    } else if (route == 2) {
+        contentView = MFTryPresenterRoute(scene, self.config);
+        MFLog(@"[host] Route 2(旧 A2) -> %@", contentView ? @"拿到呈现视图" : @"失败");
+    }
+
     if (contentView == nil) {
         hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
-        MFLog(@"[host] newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
+        MFLog(@"[host] 兜底 Route B newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
         gMFHostVC = hostVC;   // 静态 strong 持有，否则出作用域就释放 -> 黑屏
     }
     MFWritePresenterReport(bundleID, scene, handle, hostVC);
     MFStepOk(kMFStepVC);
 
     if (contentView == nil && hostVC == nil) {
-        [self fail:@"两条承载路线都失败"
-             detail:@"Route A2（自建 presenter）与 Route B（SpringBoard 宿主 VC）都没拿到可挂载的东西。\n"
-                    @"请看 /var/mobile/MF-presenter-report.txt —— 里面记录了每个类的方法表和 responds 矩阵。"];
+        [self fail:@"所有承载路线都失败"
+             detail:@"route 3/4（presenter）与 route 1（SpringBoard 宿主 VC）都没拿到可挂载的东西。\n"
+                    @"请看 /var/mobile/MF-presenter-report.txt —— 里面记录了每个类的方法表、"
+                    @"scene.settings 的真实取值，以及 presenter 的 isHosting。"];
         return;
     }
     if (limit < 5) { [self stopAtStep:5 limit:limit]; return; }
@@ -940,16 +1465,16 @@ static char kMFRowBundleIDKey;
         MFLog(@"[host] Route B setSceneResizesHostedContext:YES -> %@",
              resizeOK ? @"已设置" : @"未设置（宿主可能按整屏渲染）");
     } else {
-        // Route A2：resizesHostedContext 已在 P2 写进呈现上下文，这里只做确认。
-        MFLog(@"[host] Route A2 的 resizesHostedContext 已在 P2 写入呈现上下文");
+        // Route 3/4：resizesHostedContext 已在 P2 写进呈现上下文，这里只做确认。
+        MFLog(@"[host] Route %ld 的 resizesHostedContext 已在 P2 写入呈现上下文", (long)route);
     }
     MFStepOk(kMFStepResize);
 
     if (limit < 6) { [self stopAtStep:6 limit:limit]; return; }
 
     // ---------- S6：把承载视图挂进浮窗 ----------
-    // 【0.4.0 起】这里之后**不再**调 FBScene -activateWithTransitionContext:nil（0.3.0 的崩点）。
-    // 真要强制激活 scene，走 P4b（配置 forceActivate=true），且用非空上下文。
+    // 【0.4.0 起】这里之后**不再**调 FBScene -activateWithTransitionContext:nil（0.3.0 的崩点），
+    // 也不再有任何 forceActivate 实验（0.6.0 实测它会让 SpringBoard 在存活窗口内挂掉）。
     MFStepMark(kMFStepAttach);
     if (contentView != nil) {
         [panel attachContentView:contentView];
@@ -957,6 +1482,17 @@ static char kMFRowBundleIDKey;
         [panel attachContentViewController:hostVC];
     }
     MFStepOk(kMFStepAttach);
+
+    // ---------- P6：把 presenter / 图层宿主的真实状态写下来 ----------
+    // 这是判断"还黑不黑"的第一手证据，也是下一版唯一的依据：
+    //   isHosting=0                    -> presenter 没进 hosting（manager 来源不对 / scene 不可渲染）
+    //   isHosting=1 且 hostedLayers=0  -> presenter 在承载，但 scene 一个图层都没有（App 没在渲染）
+    //   isHosting=1 且 hostedLayers>0  -> 内容其实进来了，黑屏就只是尺寸/变换/层级问题
+    MFStepMark(kMFStepState);
+    id stateView = contentView;
+    if (stateView == nil) stateView = MFMsg(hostVC, NSSelectorFromString(@"view"));
+    MFLogPresenterState(@"P6", gMFPresenter, stateView);
+    MFStepOk(kMFStepState);
 
     [panel setStatusText:[NSString stringWithFormat:@"已承载 %@", bundleID]];
 
@@ -966,9 +1502,18 @@ static char kMFRowBundleIDKey;
     MFStepMark(kMFStepSettle);
     MFLog(@"[host] ========== done bid=%@ （20 秒后确认存活）==========", bundleID);
 
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.hostSeq != mySeq) return;
+        // 3 秒时再采一次状态：presenter 的 hosting 是**异步**建立的，
+        // 很多情况下挂载那一刻还不是 hosting，要等一轮 runloop / 一次 scene update。
+        MFLogPresenterState(@"P6+3s", gMFPresenter, stateView);
+    });
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self.hostSeq != mySeq) return;   // 期间又发起过承载 -> 不是本轮的事
+        MFLogPresenterState(@"P6+20s", gMFPresenter, stateView);
         MFStepOk(kMFStepSettle);
         MFAttemptClear();
         MFLogS(@"[gate] 承载存活 20 秒 -> 崩溃标记已清除（下次还能再试）");

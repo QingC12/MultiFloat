@@ -16,8 +16,18 @@
 //      现在所有行为开关一律用 **布尔/整数**；字符串只做展示。
 //   7. 【0.5.0 新增 · 又一个事故】两个布尔开关名字太像也会出事。
 //      0.4.0 真机：用户只把 hostEnabled 改成 true，漏了 enabled 总显示开关，
-//      于是 tweak 完全惰性、浮窗根本不出现。修法：默认 enabled=true（装上就显示外壳），
+//      于是 tweak 完全惰性、浮窗根本不出。修法：默认 enabled=true（装上就显示外壳），
 //      并在启动时自动修复 "enabled=false 且 hostEnabled=true" 这种自相矛盾。
+//   8. 【0.7.0 新增 · 只认公开可验证的实现】别再自己猜私有 API 的用法。
+//      0.6.0 用 `[[UIScenePresentationManager alloc] _initWithScene:scene]` 自造 presenter 管理器
+//      → 链路全通、不崩、但不渲染（presenter 进不了 hosting 状态，露出黑底）。
+//      唯一被公开源码验证过的写法（khanhduytran0/FrontBoardAppLauncher，LiveContainer 多任务同款）是
+//          FBScene *scene = ...;                       // 要么用已存在的，要么自己 createSceneWithDefinition:
+//          presenter = [scene.uiPresentationManager createPresenterWithIdentifier:sceneID];
+//          [presenter modifyPresentationContext:^(ctx){ ctx.appearanceStyle = 2; }];
+//          [presenter activate];
+//          [view addSubview:presenter.presentationView];
+//      **manager 必须来自 scene 自己**，不能自己 alloc。
 //
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H

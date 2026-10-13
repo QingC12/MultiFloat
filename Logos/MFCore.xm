@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.6.0";
+    return @"0.7.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -86,34 +86,44 @@ NSDictionary *MFLoadConfig(void) {
     return nil;
 }
 
-//  0.5.0 的默认配置：**装上就显示外壳，但绝不承载**。
-//    enabled    = true    —— 总显示开关（0.4.0 这里误设为 false，直接导致"改了 hostEnabled 却毫无反应"）
-//    hostEnabled= false   —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的宿主视图）
-//    hostStep   = 6       —— 承载链路最多走到第几步（1..6，测试用；默认走满）
-//    mode       = "shell" —— 纯展示用，**不再参与任何判断**（见 MFInternal.h 里 she'll 事故记录）
+//  0.7.0 的默认配置：
+//    enabled        = true  —— 总显示开关（装上就显示外壳）
+//    hostEnabled    = false —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的对象）
+//    hostRoute      = 3     —— 承载路线（0.7.0 默认改成 3，见下）
+//    forceForeground= true  —— 承载前把目标 scene 设成"前台可渲染"（P0 步）
+//    resizesHosted  = true  —— 让被承载的 scene 按浮窗尺寸渲染
+//    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
+//    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
-//  为什么 0.5.0 把 enabled 默认改成 true：
-//    0.4.0 的注释写着"防线 1 默认 hostEnabled=false：装上只显示外壳"，
-//    但代码里 enabled 也写成了 false —— 装上连外壳都不显示，与设计意图自相矛盾，
-//    用户改 hostEnabled 时也被这个隐形的总开关挡住（真机事故：浮窗完全不出现）。
-//    0.3.0 已真机证明"只显示外壳"是安全的（可拖可缩放，连续多轮 respring 无崩），
-//    所以总开关默认打开安全；真正危险的 hostEnabled 仍然默认关。
+//  为什么 0.7.0 把 hostRoute 默认从 2 改成 3：
+//    0.6.0 真机（归档(5)）：presenter 链 P1..P5 全通、拿到真正的 _UIScenePresentationView、
+//    20 秒存活、不崩 —— 但内容区**纯黑**。对照公开可用的实现
+//    （khanhduytran0/FrontBoardAppLauncher，LiveContainer 多任务同款源码）后发现，
+//    它拿 presenter 的**唯一**写法是
+//        [scene.uiPresentationManager createPresenterWithIdentifier:...]
+//    而我们 0.6.0 用的是自己 alloc 出来的 `_initWithScene:` manager ——
+//    那个 manager 没有挂在 scene 自己的 presenter owner 体系里，
+//    于是 presenter 永远进不了 "hosting" 状态（呈现上下文里
+//    backgroundColorWhileNotHosting 就是那层黑底）。
+//    Route 3 就是"改用 scene 自己的 manager"。Route 2 保留下来做 A/B 对照。
 void MFWriteDefaultConfigIfNeeded(void) {
     NSString *path = @"/var/mobile/MultiFloat.plist";
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return;
     NSDictionary *def = @{
-        @"enabled"        : @YES,                      // 总显示开关：装上就显示外壳
-        @"mode"           : @"shell",                  // 仅展示
-        @"hostEnabled"    : @NO,                       // 真承载：默认关
-        @"hostStep"       : @6,                        // 承载最多走到第几步
-        @"hostRoute"      : @2,                        // 承载路线：2=自建 presenter（默认）/ 1=SpringBoard 宿主 VC
-        @"forceActivate"  : @NO,                       // 默认关；只有 presenter 路线仍黑屏时才需要试
-        @"targetBundleID" : @"com.apple.mobilesafari",
-        @"showDelay"      : @12,
-        @"windowLevel"    : @1010,
+        @"enabled"         : @YES,                     // 总显示开关：装上就显示外壳
+        @"mode"            : @"shell",                 // 仅展示
+        @"hostEnabled"     : @NO,                      // 真承载：默认关
+        @"hostRoute"       : @3,                       // 3=接管已存在 scene（默认）/ 4=自建 scene / 2=旧版 / 1=SB 宿主 VC
+        @"forceForeground" : @YES,                     // P0：把 scene 设成前台可渲染
+        @"resizesHosted"   : @YES,                     // 让 scene 按浮窗尺寸渲染（presenter 缩放）
+        @"hostSceneFrame"  : @NO,                      // true = 改成直接改 scene.frame（原生分屏手感）
+        @"hostStep"        : @6,                       // 承载最多走到第几步
+        @"targetBundleID"  : @"com.apple.mobilesafari",
+        @"showDelay"       : @12,
+        @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -122,7 +132,8 @@ void MFWriteDefaultConfigIfNeeded(void) {
 void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
     if (cfg == nil) return;
     if (cfg[@"hostEnabled"] != nil && cfg[@"hostStep"] != nil &&
-        cfg[@"hostRoute"] != nil && cfg[@"forceActivate"] != nil) return;
+        cfg[@"hostRoute"] != nil && cfg[@"forceForeground"] != nil &&
+        cfg[@"resizesHosted"] != nil && cfg[@"hostSceneFrame"] != nil) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -133,10 +144,26 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"hostEnabled"] == nil) up[@"hostEnabled"] = @NO;
         if (up[@"hostStep"]    == nil) up[@"hostStep"]    = @6;
         if (up[@"mode"]        == nil) up[@"mode"]        = @"shell";
-        if (up[@"hostRoute"]   == nil) up[@"hostRoute"]   = @2;    // 0.6.0：默认走自建 presenter
-        if (up[@"forceActivate"] == nil) up[@"forceActivate"] = @NO;
+        if (up[@"hostRoute"]   == nil) up[@"hostRoute"]   = @3;
+
+        // 【0.7.0】0.6.0 自动补下的 hostRoute=2（自建 _initWithScene:）已被真机证明是黑屏的，
+        // 用户如果照旧装上来会以为"什么都没变"。这里直接升到 3，并写清楚原因。
+        BOOL bumped = NO;
+        id rv = up[@"hostRoute"];
+        if ([rv respondsToSelector:@selector(integerValue)] && [rv integerValue] == 2) {
+            up[@"hostRoute"] = @3;
+            bumped = YES;
+        }
+
+        if (up[@"forceForeground"] == nil) up[@"forceForeground"] = @YES;
+        if (up[@"resizesHosted"]   == nil) up[@"resizesHosted"]   = @YES;
+        if (up[@"hostSceneFrame"]  == nil) up[@"hostSceneFrame"]  = @NO;
+        // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
+        // 留着不删，代码里已经完全不读它。
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 补齐新版新键于 %@ ok=%d（hostEnabled / hostStep / hostRoute=2 / forceActivate=false）", path, (int)ok);
+        MFLog(@"[cfg] 补齐新版新键于 %@ ok=%d（hostRoute=%@ / forceForeground / resizesHosted / hostSceneFrame）%@",
+             path, (int)ok, up[@"hostRoute"],
+             bumped ? @"｜★ 0.6.0 的 hostRoute=2 已自动升级到 3（2 实测黑屏）" : @"");
         return;
     }
 }
