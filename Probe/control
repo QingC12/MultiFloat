@@ -1,8 +1,8 @@
 Package: com.example.mfprobe
 Name: MFProbe Diagnostic
-Version: 0.2.1
+Version: 0.3.0
 Architecture: iphoneos-arm64e
-Description: One-shot runtime diagnostic for MultiFloat (NOT the tweak). Read-only scan of SpringBoard: dumps real owners, method signatures (type encoding) and ivars of private scene/workspace APIs to /var/mobile. Install, collect the logs, then uninstall.
+Description: One-shot runtime diagnostic for MultiFloat (NOT the tweak). Read-only scan of SpringBoard: dumps real owners, method signatures (type encoding) and ivars of private scene/workspace APIs to /var/mobile. v0.3.0 no longer enumerates every runtime class (that caused a SpringBoard crash); it scans a bounded candidate set with per-class heartbeat so a crash is localised. Install, collect the logs, then uninstall.
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks
