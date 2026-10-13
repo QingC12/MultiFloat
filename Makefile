@@ -6,7 +6,36 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
-# 0.11.0 变更（修 0.10.0 的回归）：
+# 0.12.0 变更（修 0.10.0 / 0.11.0 的回归：切 App / 回桌面立刻黑屏）：
+#   - 用户原话（归档(12)）："v0.10.0 和 v0.11.0 存在问题，v0.9.1 版本好像是正常的，
+#     虽然屏幕会闪一下，但是切换应用时悬浮窗不会黑屏。"
+#     这是本轮最硬的一条数据 —— 它把"哪一版的行为才算对"直接钉死了。
+#   - 归档(12) 日志的因果链（两轮都复现）：
+#       Filza 轮：挂载时就带着 deact=33，1 秒后 layers 2 -> 0，此后写了十几次全灭；
+#       Safari 轮：按 Home 后 deact 变 32（此刻 cs=2 layers=2 hosted=2，画面还是好的），
+#                 约 1 秒后 layers 2 -> 0；随后**连着 81 次全量写**，layers 始终为 0。
+#     ⇒ 结论：**图层掉光 = 不可逆**。唯一有效的时机是"deact!=0 而图层还在"的那一秒。
+#   - 为什么 0.9.1 不掉图层：它的 MFHealthIsBad 把 deact!=0 / cs!=2 / idle 也算作"要动手"，
+#     所以那一秒里它已经把 deact 清回去了。0.10.0 把这一档降级成"软警告（永不动手）"，
+#     0.11.0 沿用 —— 于是只能等图层掉完再救，必然黑。
+#   - 为什么 0.9.1 会闪：它每一拍都写，而且写的是**全量**（含 setDisplayConfiguration:）；
+#     归档(10) 已测到那一帧黑正是 setDisplayConfiguration: 把 frame 打回整屏 + 随后的 setFrame:。
+#   - 0.12.0 = 把"预防档"加回来，但只写 idleModeEnabled + deactivationReasons 两个纯状态量，
+#     **不写 level / displayConfiguration / frame** ⇒ 没有任何几何变化，不该产生可见的一帧黑。
+#     目标：既不黑（像 0.9.1），也不闪（比 0.9.1 更好）。
+#   - 预防档参数：keepAlivePrevent=true / keepAlivePreventMs=250（远小于约 1 秒的死线）/
+#     keepAlivePreventHard=false（按不住时带上 setLevel:1 做 A/B）。
+#   - 顺带修的三处：
+#     ① 承载视图尺寸纠正从"差 0.5 点就掰"改成"容差 8% + 节流 500 ms"（>25% 时无视节流）。
+#        0.11.0 在 keepAliveMs=50 时每秒掰 20 次，等于跟 presenter 自己的布局对拉，
+#        日志被刷到 7 万字节 —— 也很可能就是 hosting 掉线的原因之一。
+#     ② MFSyncSceneGeometry 加**重入保护**：MF-crash-attribution 指向 crashedStep=P7-geom，
+#        而 MF-host-step.txt 里 P7-geom 在 S7-settle 之后连着出现 3 次；
+#        `v.frame = bounds` 会触发布局，布局回调里再进本函数就是递归 ⇒ 会崩。
+#     ③ 修一个误导性日志：dc= 打的是我自己格式化字符串的类名（__NSCFConstantString），
+#        跟 scene.displayConfiguration 毫无关系；现在改打 **dc 的来源类名**，
+#        这样才能看出 setDisplayConfiguration: 到底有没有被调用。
+#   - 0.11.0 变更（历史，修 0.10.0 的回归）：
 #   - 0.10.0 真机（归档(11)）：**这一版不稳定，悬浮窗大概率黑屏** —— 比 0.9.1 还差。
 #     日志事实：承载成功后约 1 秒内 hostedLayers/layers 掉到 0，然后**再也没回来** ——
 #       [keepalive] 真掉出（第 1/10/20/.../220 拍：layers=0 hosted=0 ...）

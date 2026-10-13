@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.11.0";
+    return @"0.12.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -138,6 +138,31 @@ NSDictionary *MFLoadConfig(void) {
 //                                     设成 >0 可以复现 0.10.0 的行为，仅用于对照实验。
 //    keepAliveFrameSync     = true ——是否在守护里纠正 scene.frame
 //                                     （只在真的漂了时写，且每秒最多查一次）。
+//  —— 以下 5 个键是【0.12.0 新增 / 本轮的重点】——
+//    keepAlivePrevent       = true ——【0.12.0 核心开关】是否启用**预防档**：
+//                                     当"图层还在、但 scene 已被去激活 / 进 idle / 掉出 ready"时，
+//                                     **主动**把 deactivationReasons/idleModeEnabled 写回去。
+//                                     归档(12) 证明这是唯一有效的时机：
+//                                       Filza 轮——挂载时带着 deact=33，1 秒后 layers 2 -> 0，再也回不来；
+//                                       Safari 轮——按 Home 后 deact 变 32，约 1 秒后 layers 2 -> 0，
+//                                                  随后**连着 81 次全量写全部无效**。
+//                                     而 0.9.1 把这一档算作"要动手"，所以它不掉图层
+//                                     （用户原话："v0.9.1 版本好像是正常的……切换应用时悬浮窗不会黑屏"）。
+//                                     设成 false 就等于退回 0.10.0/0.11.0 的行为（会黑），仅用于对照。
+//    keepAlivePreventMs     = 250  ——预防写的最小间隔（限流）。必须远小于"约 1 秒"的掉图层死线。
+//                                     0.9.1 是"每拍都写"（200 ms ⇒ 每秒 5 次），那是它闪屏的代价；
+//                                     0.12.0 只在真的写进去有意义时才写，默认 250 ms 够用。
+//    keepAlivePreventHard   = false ——预防写要不要额外带上 `setLevel:1`。
+//                                     **默认 false 是关键**：预防档刻意**不碰任何几何**
+//                                     （不写 setLevel / setDisplayConfiguration: / setFrame:），
+//                                     因为归档(10) 测到那一帧黑正是 `setDisplayConfiguration:`
+//                                     把 frame 打回整屏 + 随后的 `setFrame:` 造成的。
+//                                     万一"只清 idle/deact"按不住，再打开它做 A/B。
+//    keepAliveViewFrameMs   = 500  ——承载视图尺寸纠正的节流间隔。
+//                                     0.11.0 是"差 0.5 点就掰"，在 50 ms 周期下每秒掰 20 次，
+//                                     等于跟 presenter 自己的布局对拉（归档(12) 日志被刷了 7 万字节）。
+//    keepAliveViewFrameTol  = 0.08 ——承载视图尺寸的容差（比例）。偏差小于它就不管
+//                                     （那是正常布局抖动）；偏差 >25% 时无视节流立刻掰回来。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
@@ -188,8 +213,19 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveBackoffAfter"  : @50,               // 【0.11.0 新增】连续多少拍没救回来开始退避
         @"keepAliveBackoffMaxMs"  : @2000,             // 【0.11.0 新增】退避后的写入间隔上限
         @"keepAliveFrameSync"     : @YES,              // 【0.10.0 新增】是否纠正漂掉的 scene.frame
+        @"keepAlivePrevent"       : @YES,              // 【0.12.0 核心】**预防档**：图层还在但正在被
+                                                       //   去激活时，主动把 idle+deact 写回去。
+                                                       //   归档(12)：这是唯一有效的时机 —— 图层
+                                                       //   掉光之后就不可逆了（81 次全量写全灭）。
+        @"keepAlivePreventMs"     : @250,              // 【0.12.0 新增】预防写的限流间隔
+        @"keepAlivePreventHard"   : @NO,               // 【0.12.0 新增】预防写是否带 setLevel:1。
+                                                       //   默认 NO：预防档**不碰任何几何**，因为
+                                                       //   归档(10) 测到那一帧黑就是 displayConfiguration
+                                                       //   + frame 造成的。按不住再打开做 A/B。
+        @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
+        @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @12,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @13,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
@@ -222,8 +258,11 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAliveGraceMs"] == nil || cfg[@"keepAliveEscalateAfter"] == nil ||
                         cfg[@"keepAliveGiveUpAfter"] == nil || cfg[@"keepAliveFrameSync"] == nil ||
                         cfg[@"keepAliveHardWrite"] == nil || cfg[@"keepAliveBackoffAfter"] == nil ||
-                        cfg[@"keepAliveBackoffMaxMs"] == nil);
-    if (cur >= 12 && !missingKeys) return;
+                        cfg[@"keepAliveBackoffMaxMs"] == nil ||
+                        cfg[@"keepAlivePrevent"] == nil || cfg[@"keepAlivePreventMs"] == nil ||
+                        cfg[@"keepAlivePreventHard"] == nil ||
+                        cfg[@"keepAliveViewFrameMs"] == nil || cfg[@"keepAliveViewFrameTol"] == nil);
+    if (cur >= 13 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -254,6 +293,11 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAliveBackoffAfter"]  == nil) up[@"keepAliveBackoffAfter"]  = @50;    // 0.11.0 新增
         if (up[@"keepAliveBackoffMaxMs"]  == nil) up[@"keepAliveBackoffMaxMs"]  = @2000;  // 0.11.0 新增
         if (up[@"keepAliveFrameSync"]     == nil) up[@"keepAliveFrameSync"]     = @YES;
+        if (up[@"keepAlivePrevent"]       == nil) up[@"keepAlivePrevent"]       = @YES;  // 0.12.0 核心
+        if (up[@"keepAlivePreventMs"]     == nil) up[@"keepAlivePreventMs"]     = @250;  // 0.12.0 新增
+        if (up[@"keepAlivePreventHard"]   == nil) up[@"keepAlivePreventHard"]   = @NO;   // 0.12.0 新增
+        if (up[@"keepAliveViewFrameMs"]   == nil) up[@"keepAliveViewFrameMs"]   = @500;  // 0.12.0 新增
+        if (up[@"keepAliveViewFrameTol"]  == nil) up[@"keepAliveViewFrameTol"]  = @0.08; // 0.12.0 新增
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -361,11 +405,38 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @12;
         }
 
+        // ---- 0.12 -> 0.13：加回"预防档"（0.9.1 之所以不掉图层的那个机制）----
+        // 归档(12) 真机证据（用户原话 + 日志双向印证）：
+        //   "v0.10.0 和 v0.11.0 存在问题，v0.9.1 版本好像是正常的，
+        //    虽然屏幕会闪一下，但是切换应用时悬浮窗不会黑屏。"
+        //   日志：Filza 轮挂载时就带着 deact=33，1 秒后 layers 2 -> 0；
+        //         Safari 轮按 Home 后 deact 变 32，约 1 秒后 layers 2 -> 0，
+        //         此后连着 81 次"全量写"全部无效。
+        //   ⇒ 图层一旦掉光就是不可逆的；唯一有效的时机是"deact!=0 而图层还在"的那一秒。
+        //     0.9.1 把这一档算作"要动手"，所以它不掉图层；
+        //     0.10.0/0.11.0 拿它当"软警告（不动手）"，所以必然黑。
+        //   0.12.0 加回这一档，但只写 idle+deact（不碰几何），所以不该再有 0.9.1 的那一闪。
+        if (cur < 13) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=13：新增 keepAlivePrevent / keepAlivePreventMs /"
+                  @" keepAlivePreventHard / keepAliveViewFrameMs / keepAliveViewFrameTol"
+                  @"（默认 true / 250 / false / 500 / 0.08）");
+            MFLogS(@"[cfg]   ★ 0.12.0 新增「预防档」：图层还在但 scene 正在被去激活时，"
+                  @"趁它没掉先把 idleModeEnabled / deactivationReasons 写回去。");
+            MFLogS(@"[cfg]     归档(12) 证明图层掉光之后不可逆（81 次全量写全灭）=> 必须**提前**动手。");
+            MFLogS(@"[cfg]     预防写刻意不写 level / displayConfiguration / frame —— 没有任何几何变化，"
+                  @"所以不会产生 0.9.1 那种可见的一帧黑。");
+            MFLogS(@"[cfg]     若仍然会黑（说明只清 deact 按不住），把 keepAlivePreventHard 设 true 做 A/B。");
+            MFLogS(@"[cfg]     承载视图尺寸纠正也加了容差(8%)与节流(500 ms)：0.11.0 是每秒掰 20 次，"
+                  @"等于在跟 presenter 自己的布局对拉。");
+            up[@"cfgVersion"] = @13;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
              up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
-             up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"]);
+             up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
+             up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"]);
         return;
     }
 }

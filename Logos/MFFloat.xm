@@ -724,21 +724,47 @@ static CGRect MFRectProp(id obj, NSString *selName, BOOL *has) {
 /// ⇒ 这就解释了用户的原话："把 keepAliveMs 改成 100 或 50，闪烁会加快"：
 ///    闪的频率 = 我们写 settings 的频率 = 1 / keepAliveMs。
 ///
-/// 所以判据收紧成**唯一一条**：只有"一个图层都没有"才算黑。
-///   layers<=0 或 presenter 宿主 hosted<=0 —— 那块表面什么都没有，这就是黑屏本身。
-/// deact / idle 降级为"软警告"：只写日志，**永远不动手**
-/// （keepAliveSoft 打开只是把这类波动也记进日志，用于观察，不会写任何 settings）。
+/// 【0.10.0 的结论】判据收紧成"只有 layers<=0 或 hosted<=0 才算黑"。
+///
+/// 【0.12.0 的修正 —— 归档(12)】这条收紧**过头**了，而且方向错了：
+///   用户原话："v0.10.0 和 v0.11.0 存在问题，v0.9.1 版本好像是正常的，
+///             虽然屏幕会闪一下，但是切换应用时悬浮窗不会黑屏。"
+///   归档(12) 的因果链非常干净（Filza 轮与 Safari 轮都复现）：
+///     ① 挂载后 / 按 Home 之后，先出现 `deact=32`（或 33）——
+///        此刻 `cs=2 layers=2 hosted=2`，**画面还是好的**；
+///     ② 约 **1 秒后**才 `cs=0 layers=0`（Filza 轮更极端：挂载时就带着 deact=33，
+///        1 秒后图层掉光）；
+///     ③ 掉完之后**写什么都救不回来** —— Safari 轮里连着写了 81 次"全量写"
+///        （含 level + displayConfiguration + frame），`layers` 始终是 0。
+///   ⇒ 结论一：**图层一旦掉光就是不可逆的。**唯一有效的时机是
+///     "deact!=0 而图层还在"的那一秒。
+///     0.9.1 正是把 `deact!=0 / cs!=2` 也算作"要动手"，所以它不掉图层；
+///     0.10.0/0.11.0 把这一档降级成"只记日志"，于是只能等图层掉完再救 —— 必然黑。
+///   ⇒ 结论二：加回这一档时**必须把代价压到最低**。
+///     `MFDropPrevent` 只写两个纯状态量（`idleModeEnabled` / `deactivationReasons`），
+///     **不写 level、不写 displayConfiguration、不写 frame** —— 没有任何几何变化，
+///     从原理上就不该产生可见的那一帧黑（归档(10) 测到的重排元凶正是
+///     `setDisplayConfiguration:` 把 frame 打回整屏 + 随后的 `setFrame:`）。
 typedef NS_ENUM(NSInteger, MFDropKind) {
     MFDropNone     = 0,   // 健康
-    MFDropAdvisory = 1,   // 软警告：被去激活 / 进了 idle，但画面还在（**不许动手**）
-    MFDropReal     = 2,   // 真黑：没有图层可承载（**只有这一种允许写 settings**）
+    MFDropAdvisory = 1,   // 软警告：只记日志，**永不动手**（keepAliveSoft 打开才用，纯观察）
+    MFDropPrevent  = 2,   // 【0.12.0】图层还在，但 scene 正在被去激活 / 进 idle / 掉出 ready
+                          //   ⇒ **必须预防性动手**（趁图层没掉，先把它按住）
+    MFDropReal     = 3,   // 真黑：图层没了（不可逆，只能全量写搏一下）
 };
 
 static MFDropKind MFJudgeDrop(MFHealth h, NSInteger hosted, NSDictionary *cfg) {
+    // 直接表征症状：那块表面上一个图层都没有。
     if (h.layers <= 0 || hosted == 0) return MFDropReal;
 
-    BOOL soft = (h.hasDeact && h.deact != 0) || (h.hasIdle && h.idle);
-    if (soft && MFConfigBool(cfg, @"keepAliveSoft", NO)) return MFDropAdvisory;
+    // 【0.12.0 核心】图层还在，但 scene 已经被"去激活 / 进 idle / 掉出 ready"。
+    // 这就是"掉图层的最后一秒"：归档(12) 实测 deact 变 32 之后约 1 秒，layers 就 2 -> 0。
+    // 0.9.1 把这一档算作"要动手"，所以它不掉图层（代价是写得勤 = 会闪）。
+    BOOL soft = (h.hasDeact && h.deact != 0) || (h.hasIdle && h.idle) || (h.hasCs && h.cs != 2);
+    if (!soft) return MFDropNone;
+
+    if (MFConfigBool(cfg, @"keepAlivePrevent", YES)) return MFDropPrevent;
+    if (MFConfigBool(cfg, @"keepAliveSoft",    NO))  return MFDropAdvisory;  // 只观察，用于 A/B
     return MFDropNone;
 }
 
@@ -815,6 +841,12 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
     CGSize want = gMFDesiredContentSize;
     BOOL  wantFrame = gMFDesiredContentValid && want.width > 1.0 && want.height > 1.0;
 
+    // 【0.12.0】把 dc 的来源提到 block 外面：一是别在 settings block 里调 UIScreen，
+    // 二是要能把"它到底有没有值"写进日志 —— 0.11.0 那行 `dc=__NSCFConstantString`
+    // 是个假信息（它打的是 MFKV 返回的**格式化字符串**的类名，跟 displayConfiguration 毫无关系）。
+    id dcSrc = nil;
+    if (doEsc) dcSrc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
+
     void (^blk)(id) = ^(id st) {
         if (st == nil) return;
         if (doFg)    MFMvBool(st, @"setForeground:", YES);
@@ -822,8 +854,7 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         if (doDeact) MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
         if (doEsc) {
             MFMvDouble(st, @"setLevel:", 1.0);
-            id dc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
-            if (dc != nil) MFMvObj(st, @"setDisplayConfiguration:", dc);
+            if (dcSrc != nil) MFMvObj(st, @"setDisplayConfiguration:", dcSrc);
         }
         // frame **必须最后设**：setDisplayConfiguration: 会把它打回整屏
         if (wantFrame) MFMvRect(st, @"setFrame:", CGRectMake(0, 0, want.width, want.height));
@@ -845,16 +876,66 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         id after = MFMsg(scene, NSSelectorFromString(@"settings"));
         BOOL hasFrame = NO;
         CGRect f = MFRectProp(after, @"frame", &hasFrame);
-        // 【0.11.0】顺便把 displayConfiguration 回读一次：归档(11)/(12) 要靠它判断
-        // "全量写到底有没有把 level + displayConfiguration 真的写进去"（这是能不能救回来的关键）。
-        id dcv = MFKV(after, @"displayConfiguration");
-        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f dc=%@ cs=%ld layers=%ld frame=%@",
+        // 【0.12.0】这里改成打印 **dc 的来源**（见上）。0.11.0 打的 `dc=__NSCFConstantString`
+        // 掩盖了真正关键的事实："setDisplayConfiguration: 到底有没有被调用过"。
+        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f dc源=%@ cs=%ld layers=%ld frame=%@",
               summary,
               MFDProp(after, NSSelectorFromString(@"level")),
-              dcv ? NSStringFromClass([dcv class]) : @"nil",
+              dcSrc ? NSStringFromClass([dcSrc class]) : @"nil（setDisplayConfiguration: 未被调用）",
               (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
               (long)MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers"),
               hasFrame ? NSStringFromCGRect(f) : @"-");
+    }
+    return summary;
+}
+
+/// 【0.12.0 新增】**预防性写** —— 在"图层还在、但 scene 正在被去激活"的那一秒把它按住。
+///
+/// 为什么单独做成一个函数、而不是复用 MFWriteSceneSettings：
+///   两者的代价差一个数量级，混在一起就没法既救得回来又不闪。
+///   · 真黑时（layers 已经 0）只能"全量写"：level + displayConfiguration + idle + deact + frame，
+///     其中 `setDisplayConfiguration:` 会把 frame 打回整屏 430x932，随后的 `setFrame:` 再改一次
+///     ⇒ 一次写换来两次重排，必有一帧黑。但那时已经黑了，无所谓。
+///   · 预防时（图层还在）**绝不能碰几何**：只写 `idleModeEnabled` / `deactivationReasons`
+///     两个纯状态量 —— 它们不影响任何尺寸/层级，所以理论上不会产生可见的那一帧黑。
+///     这正是 0.9.1 与 0.10.0 之间的那块拼图：
+///       0.9.1 = 预防 + 全量（不掉图层，但每次都闪）；
+///       0.10.0/0.11.0 = 不预防 + 全量（不闪，但直接掉图层 = 永久黑）；
+///       0.12.0 = **预防 + 只写状态量**（目标：不掉图层，也不闪）。
+///
+/// `keepAlivePreventHard=true` 时额外带上 `setLevel:1`（仍然不碰 displayConfiguration/frame），
+/// 用于万一"只清 deact"按不住时的 A/B。
+static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, BOOL verbose) {
+    if (scene == nil) return @"scene=nil";
+
+    SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
+    if (![scene respondsToSelector:upd]) {
+        MFLogS(@"[pres] !! scene 没有 updateSettingsWithBlock:，跳过预防写");
+        return @"no-updateSettingsWithBlock";
+    }
+
+    BOOL hard = MFConfigBool(cfg, @"keepAlivePreventHard", NO);
+
+    void (^blk)(id) = ^(id st) {
+        if (st == nil) return;
+        MFMvBool(st, @"setIdleModeEnabled:", NO);
+        MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
+        if (hard) MFMvDouble(st, @"setLevel:", 1.0);
+        // 刻意不写：setDisplayConfiguration: / setFrame:
+    };
+
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
+    } @catch (NSException *e) {
+        MFLog(@"[pres] 预防写抛异常: %@", e.reason);
+        return @"exception";
+    }
+
+    NSString *summary = [NSString stringWithFormat:@"预防(idle+deact%@)", hard ? @"+level" : @""];
+    if (verbose) {
+        MFHealth a = MFReadHealth(scene);
+        MFLog(@"[pres] 已写 settings（%@）-> cs=%ld layers=%ld deact=%llu idle=%d",
+              summary, (long)a.cs, (long)a.layers, a.deact, (int)a.idle);
     }
     return summary;
 }
@@ -942,8 +1023,21 @@ static void MFSetSceneFrame(id scene, CGRect frame) {
 ///   presenter 建 presentationView 时可能还没吃到新的 frame，于是视图尺寸会"晚一步"。
 ///   所以：承载前一次（让 presenter 建视图时就是对的）＋ 挂载后 3 秒再一次（纠正异步布局），
 ///   用户拖 ◢ 缩放之后再调一次（保持比例）。
+static BOOL gMFSyncGeomBusy = NO;
+
 static void MFSyncSceneGeometry(id scene, id view, CGRect bounds) {
     if (scene == nil && view == nil) return;
+
+    // 【0.12.0】重入保护。归档(12) 的 MF-crash-attribution 指向 `crashedStep=P7-geom`，
+    // 而 MF-host-step.txt 里 P7-geom 在 `S7-settle` 之后连着出现 3 次。
+    // `v.frame = bounds` 会触发布局，布局回调里若再进本函数就是递归 ——
+    // 在 SpringBoard 里递归 = 直接崩（这也解释了日志里"上一轮承载留下的崩溃标记仍在"，
+    // 以及随后 8 秒无法重挂）。
+    if (gMFSyncGeomBusy) {
+        MFLogS(@"[pres] P7-geom 重入 -> 跳过本次（防递归崩）");
+        return;
+    }
+    gMFSyncGeomBusy = YES;
 
     MFStepMark(kMFStepGeom);
     // 【0.10.0】先登记目标尺寸，再让 scene.frame 与承载视图都对齐到它。
@@ -957,6 +1051,7 @@ static void MFSyncSceneGeometry(id scene, id view, CGRect bounds) {
               NSStringFromCGRect(v.frame));
     }
     MFStepOk(kMFStepGeom);
+    gMFSyncGeomBusy = NO;
 }
 
 static id MFCreatePresenterForScene(id pm, NSString *ident) {
@@ -1219,9 +1314,13 @@ static NSInteger gMFKeepAliveNextHeartbeat = 0;
 static NSInteger gMFKeepAliveNextFrameCheck = 0;
 static NSInteger gMFKeepAliveDownTicks = 0;       // 连续"真黑"了几拍（0 = 当前不黑）
 static NSInteger gMFKeepAliveWritesInDrop = 0;    // 本次掉出已经写了几次 settings
-static NSInteger gMFKeepAliveAdvisoryTicks = 0;   // 连续"软警告"了几拍
+static NSInteger gMFKeepAliveAdvisoryTicks = 0;   // 连续"软警告"了几拍（只观察那一档）
 static NSTimeInterval gMFKeepAliveStartTime = 0;
 static NSTimeInterval gMFKeepAliveLastWriteTime = 0;
+static NSInteger gMFKeepAlivePreventTicks = 0;      // 【0.12.0】连续进"预防档"了几拍
+static NSInteger gMFKeepAlivePreventWrites = 0;     // 【0.12.0】本次预防档累计写了几次 settings
+static NSTimeInterval gMFKeepAliveLastPreventTime = 0;  // 【0.12.0】上次预防写的时间（限流）
+static NSTimeInterval gMFKeepAliveLastViewFix = 0;      // 【0.12.0】上次掰承载视图的时间（限流）
 
 static NSInteger MFKeepAliveMsPerTick(void) {
     NSInteger ms = [gMFKeepAliveConfig[@"keepAliveMs"] integerValue];
@@ -1274,6 +1373,10 @@ static void MFStopSceneKeepAlive(NSString *why) {
     gMFKeepAliveNextFrameCheck = 0;
     gMFKeepAliveStartTime = 0;
     gMFKeepAliveLastWriteTime = 0;
+    gMFKeepAlivePreventTicks = 0;
+    gMFKeepAlivePreventWrites = 0;
+    gMFKeepAliveLastPreventTime = 0;
+    gMFKeepAliveLastViewFix = 0;
 }
 
 /// 只在"尺寸真的漂了"时，把 scene.frame 纠回内容区尺寸（要写 settings，所以有节流）。
@@ -1298,15 +1401,46 @@ static void MFKeepAliveFixFrameIfNeeded(id scene, BOOL verbose) {
 /// 归档(10) 里 `_UIScenePresentationView` 在 presenter 掉 hosting 时被系统改成整屏 430x932
 /// （P6+20s: view frame={{0,0},{430,932}}，而面板内容区只有 274x478），这才是比例崩的源头；
 /// 修它**不需要**碰 scene settings，也就不会引发重排。
+/// 【0.12.0 加了容差 + 节流 —— 归档(12) 的教训】
+/// 0.11.0 是"差 0.5 点就掰回来"。在 keepAliveMs=50 时这就是每秒 20 次，
+/// 而承载视图当时正在**动画里**（日志里 271x346 / 291x371 / 284x356 … 一串中间值），
+/// 等于我们跟 presenter 自己的布局在对拉：日志被刷掉 7 万字节，
+/// 而且很可能就是把 hosting 搞掉的原因之一。现在：
+///   · 偏差小于 keepAliveViewFrameTol（默认 8%）不管 —— 那是正常的布局抖动；
+///   · 两次掰之间至少隔 keepAliveViewFrameMs（默认 500 ms）；
+///   · 只有"偏差很大"（>25%，例如被改成整屏 430x932）才不受节流限制，立刻掰回来。
 static void MFKeepAliveFixViewFrameIfNeeded(void) {
     if (!gMFDesiredContentValid) return;
     if (![gMFCurrentContentView isKindOfClass:[UIView class]]) return;
     UIView *v = (UIView *)gMFCurrentContentView;
     CGSize want = gMFDesiredContentSize;
-    if (fabs(v.bounds.size.width - want.width) < 0.5 &&
-        fabs(v.bounds.size.height - want.height) < 0.5) return;
-    MFLog(@"[keepalive] 承载视图尺寸被系统改过（%.0fx%.0f -> %.0fx%.0f）-> 按回内容区（只动视图，不写 settings）",
-          v.bounds.size.width, v.bounds.size.height, want.width, want.height);
+    if (want.width < 1.0 || want.height < 1.0) return;
+
+    double dw = fabs(v.bounds.size.width  - want.width)  / want.width;
+    double dh = fabs(v.bounds.size.height - want.height) / want.height;
+    if (dw < 0.01 && dh < 0.01) return;
+
+    double tol = 0.08;
+    id tv = gMFKeepAliveConfig[@"keepAliveViewFrameTol"];
+    if ([tv respondsToSelector:@selector(doubleValue)]) tol = [tv doubleValue];
+    if (tol < 0.01) tol = 0.01;
+
+    BOOL severe = (dw > 0.25 || dh > 0.25);
+    if (!severe && !(dw > tol || dh > tol)) return;   // 正常的布局抖动，不管
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (!severe) {
+        NSInteger minMs = MFConfigInt(gMFKeepAliveConfig, @"keepAliveViewFrameMs", 500);
+        if (gMFKeepAliveLastViewFix > 0 &&
+            (now - gMFKeepAliveLastViewFix) * 1000.0 < (double)minMs) {
+            return;   // 限流（严重偏差除外）
+        }
+    }
+    gMFKeepAliveLastViewFix = now;
+
+    MFLog(@"[keepalive] 承载视图尺寸被系统改过（%.0fx%.0f -> %.0fx%.0f，偏差 %.0f%%%@）-> 按回内容区（只动视图，不写 settings）",
+          v.bounds.size.width, v.bounds.size.height, want.width, want.height,
+          MAX(dw, dh) * 100.0, severe ? @"，严重" : @"");
     v.frame = CGRectMake(0, 0, want.width, want.height);
 }
 
@@ -1379,9 +1513,17 @@ static void MFKeepAliveTick(void) {
                   (long)gMFKeepAliveDownTicks, (long)(gMFKeepAliveDownTicks * ms),
                   (long)gMFKeepAliveWritesInDrop);
         }
+        // 【0.12.0】预防档结束 —— 本轮最该看的一行：
+        // "被去激活了 N 拍、写了 M 次状态量、图层始终没掉" = 预防成功（用户什么都感觉不到）。
+        if (gMFKeepAlivePreventTicks > 0) {
+            MFLog(@"[keepalive] 预防结束：连续 %ld 拍被去激活/idle，写了 %ld 次状态量，图层始终没掉 ✔",
+                  (long)gMFKeepAlivePreventTicks, (long)gMFKeepAlivePreventWrites);
+        }
         gMFKeepAliveDownTicks = 0;
         gMFKeepAliveWritesInDrop = 0;
         gMFKeepAliveAdvisoryTicks = 0;
+        gMFKeepAlivePreventTicks = 0;
+        gMFKeepAlivePreventWrites = 0;
 
         // 视图层纠正：便宜、不写 settings，顺手把比例守住
         MFKeepAliveFixViewFrameIfNeeded();
@@ -1400,9 +1542,47 @@ static void MFKeepAliveTick(void) {
         return;
     }
 
-    // ---------------- 软警告：被去激活 / 进了 idle，但画面还在 ----------------
-    // 【0.10.0 关键】这一类**什么都不做**。归档(10) 证明它占了 deact 波动里的绝大多数，
-    // 而一动手就会换来一帧黑（用户看到的"闪"）。
+    // ---------------- 预防：图层还在，但正在被去激活（0.12.0 核心）----------------
+    if (kind == MFDropPrevent) {
+        gMFKeepAliveAdvisoryTicks = 0;
+        gMFKeepAlivePreventTicks += 1;
+
+        // 宽限期同样适用：presenter 刚建 hosting 那一两百毫秒里 deact 波动是正常的。
+        NSInteger graceMs = MFConfigInt(cfg, @"keepAliveGraceMs", 600);
+        if (gMFKeepAliveStartTime > 0 &&
+            (now - gMFKeepAliveStartTime) * 1000.0 < (double)graceMs) {
+            return;
+        }
+
+        // 限流：预防写的目的是"在图层掉光之前把它按住"，不需要每拍都写
+        // （排掉 0.9.1 那种"每拍一次 = 每秒闪 5 次"的代价）。
+        NSInteger preventMs = MFConfigInt(cfg, @"keepAlivePreventMs", 250);
+        if (gMFKeepAliveLastPreventTime > 0 &&
+            (now - gMFKeepAliveLastPreventTime) * 1000.0 < (double)preventMs) {
+            return;
+        }
+
+        BOOL verbose = (gMFKeepAlivePreventTicks == 1) || (gMFKeepAlivePreventTicks % 20 == 0);
+        if (verbose) {
+            MFLog(@"[keepalive] 预防性拉回（第 %ld 拍：deact=%llu idle=%d cs=%ld layers=%ld hosted=%ld）"
+                  @"—— 图层还在，趁它没掉先按住",
+                  (long)gMFKeepAlivePreventTicks, h.deact, (int)h.idle,
+                  (long)h.cs, (long)h.layers, (long)hosted);
+        }
+        NSString *pdid = MFWritePreventiveSettings(scene, cfg, verbose);
+        gMFKeepAliveLastPreventTime = now;
+        gMFKeepAlivePreventWrites += 1;
+        if (verbose) {
+            MFLog(@"[keepalive] 预防写[%@] 完成（本次累计 %ld 次）", pdid, (long)gMFKeepAlivePreventWrites);
+        }
+        gMFKeepAliveLastSig = [MFKeepAliveSignature(scene, gMFPresenter) copy];
+        return;
+    }
+
+    // ---------------- 软警告（只观察，永不动手）----------------
+    // 【0.10.0 引入 / 0.12.0 降级为纯观察档】只有把 keepAlivePrevent 关掉、
+    // 同时打开 keepAliveSoft 时才会走到这里 —— 用于 A/B 对照"什么都不做会怎样"
+    // （0.10.0/0.11.0 的默认行为就是走到这里，结果就是永久黑屏）。
     if (kind == MFDropAdvisory) {
         gMFKeepAliveAdvisoryTicks += 1;
         if (gMFKeepAliveAdvisoryTicks == 1 || (gMFKeepAliveAdvisoryTicks % 20 == 0)) {
@@ -1412,7 +1592,9 @@ static void MFKeepAliveTick(void) {
         return;
     }
 
-    // ---------------- 真黑：没有图层了（只有这一种允许动手）----------------
+    // ---------------- 真黑：图层已经没了的**补救**（预防没赶上，多半没救了）----------------
+    // 【0.12.0】为什么明知不可逆还要写：① 有些机型/时机下它能被 level+displayConfiguration 拉回来；
+    // ② 日志里"写了 M 次都拉不回来"本身就是证据。真正解决问题的在上面那一档（预防）。
     gMFKeepAliveAdvisoryTicks = 0;
     gMFKeepAliveDownTicks += 1;
     BOOL verbose = (gMFKeepAliveDownTicks == 1) || (gMFKeepAliveDownTicks % 10 == 0);
@@ -1534,6 +1716,10 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveDownTicks = 0;
     gMFKeepAliveWritesInDrop = 0;
     gMFKeepAliveAdvisoryTicks = 0;
+    gMFKeepAlivePreventTicks = 0;
+    gMFKeepAlivePreventWrites = 0;
+    gMFKeepAliveLastPreventTime = 0;
+    gMFKeepAliveLastViewFix = 0;
     gMFKeepAliveNextHeartbeat = (NSInteger)(10000.0 / ms);
     gMFKeepAliveNextFrameCheck = (NSInteger)(1000.0 / ms);
     gMFKeepAliveStartTime = [NSDate timeIntervalSinceReferenceDate];
@@ -1545,10 +1731,12 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
     gMFKeepAliveTimer = t;
 
-    MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 只把「一个图层都没有」当黑 / "
-          @"软警告动手=%d / 真黑全量写=%d / 宽限=%ld ms / 写入间隔=%ld ms / 不退避上限=%ld ms）",
+    MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 预防档=%d @ %ld ms"
+          @"（趁图层没掉，只写 idle+deact，**不碰几何**）/ 真黑全量写=%d / "
+          @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
           ms, bundleID ?: @"?",
-          (int)MFConfigBool(cfg, @"keepAliveSoft", NO),
+          (int)MFConfigBool(cfg, @"keepAlivePrevent", YES),
+          (long)MFConfigInt(cfg, @"keepAlivePreventMs", 250),
           (int)MFConfigBool(cfg, @"keepAliveHardWrite", YES),
           (long)MFConfigInt(cfg, @"keepAliveGraceMs", 600),
           (long)MFConfigInt(cfg, @"keepAliveMinWriteMs", 300),
