@@ -1,48 +1,31 @@
 #import <Foundation/Foundation.h>
 #import <unistd.h>
+#import <fcntl.h>
+#import <stdio.h>
+#import <string.h>
+#import <time.h>
 #import "../Bridge/MFBridge.h"
 
-// Phase 0 bridge only. No private framework object is accessed here.
-// [VERIFY] Replace these no-op functions with the verified Swift bridge after
-// Theos Swift integration and target iOS ABI are confirmed.
+// Phase 0 桥接桩：此文件不访问任何私有框架对象。
+// [VERIFY] Theos Swift 集成与目标 ABI 确认后，再用已验证的 Swift 桥接替换。
 
-// 注入存活日志：设备端唯一可观测证据，用于确认 dylib 已被 SpringBoard 加载。
-// 只保留最近 40 行，避免日志无限增长。仅使用类方法，兼容 ARC / MRC。
-static void MFAppendLoadLog(NSString *line) {
-    @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dir = @"/var/mobile/Library/Logs";
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
-        NSString *path = [dir stringByAppendingPathComponent:@"MultiFloat.log"];
-
-        NSString *existing = [NSString stringWithContentsOfFile:path
-                                                       encoding:NSUTF8StringEncoding
-                                                          error:NULL];
-        NSMutableArray *lines = [NSMutableArray arrayWithArray:
-            (existing.length > 0) ? [existing componentsSeparatedByString:@"\n"] : [NSArray array]];
-        while (lines.count > 40) {
-            [lines removeObjectAtIndex:0];
-        }
-        [lines addObject:line];
-        NSString *joined = [lines componentsJoinedByString:@"\n"];
-        [joined writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-
-        // 同步一份到 Filza / 文件 App 容易取到的位置
-        NSString *mediaDir = @"/var/mobile/Media/MultiFloatProbe";
-        [fm createDirectoryAtPath:mediaDir withIntermediateDirectories:YES attributes:nil error:NULL];
-        [joined writeToFile:[mediaDir stringByAppendingPathComponent:@"MultiFloat.log"]
-                   atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    } @catch (NSException *e) {
-        NSLog(@"[MultiFloat] load log failed: %@", e);
-    }
+// 注入存活证据：唯一能在设备端确认 dylib 已被 SpringBoard 加载的手段。
+// 用纯 POSIX 写入（不依赖 ObjC/自动释放池），把 %ctor 阶段的崩溃风险降到最低。
+// 日志落在 /var/mobile/MultiFloat.log，Filza 直接可见。
+static void MFWriteLoadLog(void) {
+    int fd = open("/var/mobile/MultiFloat.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+                     "t=%ld pid=%d bundle=com.apple.springboard MultiFloat 0.2.0 loaded\n",
+                     (long)time(NULL), getpid());
+    if (n > 0) { ssize_t w = write(fd, buf, (size_t)n); (void)w; }
+    close(fd);
 }
 
 void MFCoreInitialize(void) {
     // TODO VERIFY SWIFT BRIDGE INITIALIZATION
-    MFAppendLoadLog([NSString stringWithFormat:
-        @"[MultiFloat 0.1.1] MFCoreInitialize OK pid=%d bundle=%@",
-        getpid(),
-        [[NSBundle mainBundle] bundleIdentifier]]);
+    MFWriteLoadLog();
 }
 
 void MFCoreNotifyEvent(NSString *eventName) {

@@ -2,53 +2,51 @@
 
 iOS 越狱多浮窗 / 分屏插件（Phase 0 骨架）。
 
-- 目标平台：iOS 17.3.1，arm64 / arm64e，rootless（var/jb）
+- 目标设备：**iPhone 15 Pro Max（A17，arm64e）**
+- 目标系统：**iOS 17.3.1**
+- 越狱环境：**roothide（工具 Relaxin）**
 - 注入进程：SpringBoard
 - 架构：Logos 薄层（进程入口 / 事件转发）+ Swift Core（业务逻辑）
-- 构建：Theos（本仓库 CI 自动产出 DEB）
+- 构建：roothide/theos + GitHub Actions（本地无 macOS，CI 唯一编译途径）
+
+## 打包约定（勿随意更改）
+
+| 项 | 值 | 原因 |
+|---|---|---|
+| `ARCHS` | `arm64e` | 设备为 A17（arm64e），不再产出 arm64 切片 |
+| `THEOS_PACKAGE_SCHEME` | `roothide` | 文件按 roothide 布局，deb 架构 `iphoneos-arm64e` |
+| Theos 来源 | `roothide/theos` | 上游 theos 不支持 roothide scheme |
+| 签名 | Procursus `ldid`（ad-hoc） | 占位签名（`.unsigned`）在 roothide 上会崩 SpringBoard |
+| 日志位置 | `/var/mobile/` | Filza 直接可见，不受 roothide 路径重定向影响 |
 
 ## 目录结构
 
 ```
-Makefile                      Theos tweak 构建入口（Phase 0 骨架）
-control                       DEB 打包元数据
+Makefile                      Theos 构建入口（arm64e / roothide）
+control                       DEB 元数据（Architecture: iphoneos-arm64e）
 MultiFloat.plist              Substrate/ElleKit 加载过滤（com.apple.springboard）
 Bridge/                       Logos <-> Swift 桥接面（不暴露私有类型）
-  MFBridge.h
-  MultiFloat-Bridging-Header.h
 Logos/                        Logos 薄层
   SpringBoardHooks.xm         %ctor 入口（私有 Hook 全部 [VERIFY] 挂起）
-  HookBridge.xm               桥接桩实现
-Resources/
-  com.example.multifloat.plist 偏好默认值（项目自有域，不复用 Stheno/TrollOpen）
-Swift/                        Swift Core
-  MultiFloatCore.swift        事件入口与依赖装配
-  WindowManager.swift         浮窗生命周期操作
-  FloatingWindow.swift        浮窗模型
-  SceneManager.swift          Scene 事务适配层（协议隔离私有 API）
-  LayoutEngine.swift          几何布局
-  GestureController.swift     手势归一化
-  StateMachine.swift          窗口状态机
-  AppRegistry.swift           应用准入
-  Preferences.swift           偏好（com.example.multifloat）
-.github/workflows/build-deb.yml  CI：push 自动编译并上传 DEB
+  HookBridge.xm               注入存活日志（写入 /var/mobile/MultiFloat.log）
+Resources/                    偏好默认值（com.example.multifloat，自有域）
+Swift/                        Swift Core（窗口/场景/布局/状态机/偏好）
+scripts/verify_deb.py         CI 强校验：架构 / roothide 布局 / ad-hoc 签名
+.github/workflows/build-deb.yml  CI：push 自动编译 + 校验 + 上传 DEB
 Probe/                        运行期探针（独立 Theos 工程，只读采样）
-  Makefile
-  control
-  MultiFloatProbe.plist       过滤：仅 com.apple.springboard
-  Probe.xm                    枚举 selector 归属 / 方法签名 / ivar → 写日志
+  Makefile  control  MultiFloatProbe.plist  Probe.xm
 ```
 
 ## 构建
 
-无需 macOS：推送即由 GitHub Actions（macOS runner）安装 Theos + iOS SDK
-后执行 `make package`，DEB 作为 artifact 上传。
+推送到 `main` 即由 GitHub Actions 完成编译、校验与打包，DEB 作为 artifact 上传。
 
-本地构建（需要 macOS + Theos）：
+本地构建（需 macOS + roothide/theos + ldid）：
 
 ```sh
-make package
+make package THEOS_PACKAGE_SCHEME=roothide
 # 产物：packages/*.deb
+python3 scripts/verify_deb.py packages/*.deb
 ```
 
 ## 证据纪律
@@ -63,17 +61,18 @@ make package
 
 ## 运行期探针（MultiFloatProbe）
 
-本地无 macOS 与 IDA 的情况下，用设备自身的运行期真值补齐 `[VERIFY]` 项：
+本地无 macOS/IDA 时，用设备自身的运行期真值补齐 `[VERIFY]` 项：
 
-- 注入 SpringBoard 后延迟 4 秒采样，**不 Hook 任何方法、不修改对象状态**
-- 输出到 `/var/mobile/Library/Logs/`（同时同步一份到 `/var/mobile/Media/MultiFloatProbe/`）：
-  - `MultiFloatProbe-summary.log` — 环境实况 + **13 个已知 selector 的真实归属与 type encoding**（全类扫描）+ 候选类继承链与 ivar
-  - `MultiFloatProbe-methods.log` — 候选类完整/过滤方法列表（含 type encoding）+ 名称含 Scene/Split/Floating 的全类清单
-  - `MultiFloatProbe-error.log` — 仅在探针异常时产生
-- 主工程在 `%ctor` 时向 `MultiFloat.log` 写一行注入记录，用于确认 dylib 已被加载
+- 注入 SpringBoard 后延迟 12 秒采样，**不 Hook、不改对象状态**
+- `%ctor` 先写纯 POSIX 心跳 `/var/mobile/MultiFloatProbe-heartbeat.log`，
+  采样分 4 段且每段落盘 → 即使崩溃也能定位阶段、已产出数据不丢
+- 输出到 `/var/mobile/`：
+  - `MultiFloatProbe-summary.log` — 环境实况 + **13 个 selector 的真实定义类与 type encoding**
+  - `MultiFloatProbe-methods.log` — 候选类方法/ivar 明细
+  - `MultiFloatProbe-heartbeat.log` — 阶段面包屑
 
 ## 当前状态
 
-Phase 0 收尾（工程骨架 + 设计文档）。Phase 1 环境验证：
-本仓库 CI 首次构建即为验证环境，重点确认 Theos Swift 工具链集成
-（Bridging Header / module-name）与 Hook 后端二选一（substrate / ellekit）。
+Phase 0 收尾（骨架 + 设计文档），已按 roothide / arm64e 校正打包链路。
+下一步：用探针取得的真值把 selector 从 `[VERIFY]` 升级为 `[CONFIRMED]`，
+再实现 `MultiFloatSceneAdapter` 与第一个真实 Hook。

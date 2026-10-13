@@ -1,8 +1,8 @@
 Package: com.example.multifloat
 Name: MultiFloat
-Version: 0.1.1
-Architecture: iphoneos-arm64
-Description: Multi-floating window jailbreak tweak skeleton
+Version: 0.2.0
+Architecture: iphoneos-arm64e
+Description: Multi-floating window jailbreak tweak skeleton (roothide / arm64e)
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks
