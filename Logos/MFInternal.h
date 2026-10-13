@@ -28,6 +28,19 @@
 //          [presenter activate];
 //          [view addSubview:presenter.presentationView];
 //      **manager 必须来自 scene 自己**，不能自己 alloc。
+//   9. 【0.8.0 新增 · 第三次安全模式的教训：我们已经有的东西，必须先看再建】
+//      归档(7) 真机：route 4 在**同一个 SpringBoard 进程**里对**同一个 scene identity**
+//      调了第二次 `createSceneWithDefinition:` ⇒ FBSceneManager 断言 ⇒ SpringBoard 挂 ⇒ 安全模式
+//      （崩溃归因 `crashedStep=P4-scene`，MF-host-step-prev.txt 恰好停在 `>>> P4-scene`）。
+//      同一轮里另一个同源问题：同一个 presenter identifier 被 create 第二次 ⇒
+//      抛 "already in use" ⇒ 旧代码静默退回已知纯黑的宿主 VC ⇒ "重试一次画面就黑了"。
+//      ⇒ 规则：凡是要"新建"一个运行时对象（scene / presenter / manager），
+//        先问三个问题：① 我手里是不是已经有一个？② 系统里是不是已经有一个同 key 的？
+//        ③ 要销毁它需要什么参数（**绝不能喂 nil** —— 0.3.0 的崩点就是这么来的）。
+//      另外记录一条几何结论（省得再走弯路）：
+//        `_UIScenePresentationView` 的自然尺寸 = `scene.settings.frame`。
+//        想让浮窗里的画面比例正确，就得让 **scene.frame == 浮窗内容区尺寸**；
+//        只设 `resizesHostedContext=YES` 是不够的（那只是让 App 跟着重新布局）。
 //
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H

@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.7.0";
+    return @"0.8.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -86,12 +86,18 @@ NSDictionary *MFLoadConfig(void) {
     return nil;
 }
 
-//  0.7.0 的默认配置：
+//  0.8.0 的默认配置（相对 0.7.0 改了两处默认值，都是为了归档(7) 的两个真机缺陷）：
 //    enabled        = true  —— 总显示开关（装上就显示外壳）
 //    hostEnabled    = false —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的对象）
-//    hostRoute      = 3     —— 承载路线（0.7.0 默认改成 3，见下）
+//    hostRoute      = 3     —— 承载路线（3=接管已存在 scene，实测唯一"出画面且不崩"的路）
 //    forceForeground= true  —— 承载前把目标 scene 设成"前台可渲染"（P0 步）
-//    resizesHosted  = true  —— 让被承载的 scene 按浮窗尺寸渲染
+//    resizesHosted  = true  —— 让被承载的 scene 按浮窗尺寸渲染（App 跟着重新布局）
+//    hostSceneFrame = true  ——【默认 false -> true】把 scene.frame 也设成浮窗内容区尺寸。
+//                              presentationView 的自然尺寸就等于 scene.frame，不设的话
+//                              整屏 scene(430x932, 宽高比 0.461) 塞进内容区(267x336.6, 0.793)
+//                              必然拉伸变形 —— 这就是归档(7)「route 3 出画面但比例不对」的根因。
+//    allowRouteB    = false ——【新增】presenter 失败时是否退回 SBDeviceApplicationSceneViewController。
+//                              它是已被两次真机验证的**纯黑**宿主，挂着只会把失败伪装成成功。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
@@ -113,27 +119,41 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"enabled"         : @YES,                     // 总显示开关：装上就显示外壳
         @"mode"            : @"shell",                 // 仅展示
         @"hostEnabled"     : @NO,                      // 真承载：默认关
-        @"hostRoute"       : @3,                       // 3=接管已存在 scene（默认）/ 4=自建 scene / 2=旧版 / 1=SB 宿主 VC
+        @"hostRoute"       : @3,                       // 3=接管已存在 scene（默认）/ 4=自建 scene（危险）/ 2 / 1
         @"forceForeground" : @YES,                     // P0：把 scene 设成前台可渲染
-        @"resizesHosted"   : @YES,                     // 让 scene 按浮窗尺寸渲染（presenter 缩放）
-        @"hostSceneFrame"  : @NO,                      // true = 改成直接改 scene.frame（原生分屏手感）
+        @"resizesHosted"   : @YES,                     // 让 scene 按浮窗尺寸渲染（App 跟着重新布局）
+        @"hostSceneFrame"  : @YES,                     // 【0.8.0 默认改成 YES】把 scene.frame 设成浮窗内容区尺寸
+                                                       //   —— 这是"画面比例正确"的必要条件：presentationView
+                                                       //   的自然尺寸就等于 scene.frame，两者宽高比必须一致
+        @"allowRouteB"     : @NO,                      // 【0.8.0 新增】presenter 失败时是否退回那个已知纯黑的宿主 VC
         @"hostStep"        : @6,                       // 承载最多走到第几步
+        @"cfgVersion"      : @8,                       // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3 / hostSceneFrame=true）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
 /// 与其让用户用 Filza 手打新键名（键盘自动更正随时会把键值改坏），
 /// 不如我们把这几个键原地补上，用户只需要把 false 改成 true。
+///
+/// 【0.8.0】改成"按 cfgVersion 做一次迁移"，而不是"缺键就补"：
+/// 因为 0.8.0 要动的不是"缺的键"，而是**用户已经设过的值**——
+///   hostRoute     4 -> 3   （4 在 0.7.0 真机上把 SpringBoard 干挂了 → 安全模式）
+///   hostSceneFrame false -> true（false 会让 route 3 的画面比例不对）
+/// 用 cfgVersion 记一笔，这两种修正**只做一次**，之后用户想改回 4/false 不会被反复覆盖。
 void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
     if (cfg == nil) return;
-    if (cfg[@"hostEnabled"] != nil && cfg[@"hostStep"] != nil &&
-        cfg[@"hostRoute"] != nil && cfg[@"forceForeground"] != nil &&
-        cfg[@"resizesHosted"] != nil && cfg[@"hostSceneFrame"] != nil) return;
+
+    NSInteger cur = MFConfigInt(cfg, @"cfgVersion", 0);
+    BOOL missingKeys = (cfg[@"hostEnabled"] == nil || cfg[@"hostStep"] == nil ||
+                        cfg[@"hostRoute"] == nil || cfg[@"forceForeground"] == nil ||
+                        cfg[@"resizesHosted"] == nil || cfg[@"hostSceneFrame"] == nil ||
+                        cfg[@"allowRouteB"] == nil);
+    if (cur >= 8 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -145,25 +165,45 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"hostStep"]    == nil) up[@"hostStep"]    = @6;
         if (up[@"mode"]        == nil) up[@"mode"]        = @"shell";
         if (up[@"hostRoute"]   == nil) up[@"hostRoute"]   = @3;
-
-        // 【0.7.0】0.6.0 自动补下的 hostRoute=2（自建 _initWithScene:）已被真机证明是黑屏的，
-        // 用户如果照旧装上来会以为"什么都没变"。这里直接升到 3，并写清楚原因。
-        BOOL bumped = NO;
-        id rv = up[@"hostRoute"];
-        if ([rv respondsToSelector:@selector(integerValue)] && [rv integerValue] == 2) {
-            up[@"hostRoute"] = @3;
-            bumped = YES;
-        }
-
         if (up[@"forceForeground"] == nil) up[@"forceForeground"] = @YES;
         if (up[@"resizesHosted"]   == nil) up[@"resizesHosted"]   = @YES;
-        if (up[@"hostSceneFrame"]  == nil) up[@"hostSceneFrame"]  = @NO;
+        if (up[@"hostSceneFrame"]  == nil) up[@"hostSceneFrame"]  = @YES;
+        if (up[@"allowRouteB"]     == nil) up[@"allowRouteB"]     = @NO;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
+
+        if (cur < 8) {
+            id rv = up[@"hostRoute"];
+            NSInteger route = [rv respondsToSelector:@selector(integerValue)] ? [rv integerValue] : 3;
+
+            // 0.6.0 自动补的 hostRoute=2（自建 _initWithScene:）实测黑屏 -> 升 3
+            if (route == 2) {
+                up[@"hostRoute"] = @3;
+                route = 3;
+                MFLogS(@"[cfg] ★ 迁移：hostRoute 2 -> 3（2 实测黑屏）");
+            }
+            // 0.7.0 的 hostRoute=4（自建 scene）在真机上对**同一个 identity** 建了第二次，
+            // FBSceneManager 断言 -> SpringBoard 崩 -> 安全模式。默认降回 3；
+            // 想继续做 4 的对照实验，改回来即可（本次迁移只做一次）。
+            if (route == 4) {
+                up[@"hostRoute"] = @3;
+                MFLogRawC("[cfg] ★ 迁移：hostRoute 4 -> 3\n"
+                          "[cfg]   原因：4 会在同一 identity 上重复建 scene，实测把 SpringBoard 干挂（安全模式）\n"
+                          "[cfg]   0.8.0 已给 4 加了“只建一次 + 复用”的保护；想继续拿它做对照实验，\n"
+                          "[cfg]   把本文件里的 hostRoute 改回 4 即可（这条迁移不会再执行第二次）。\n");
+            }
+            // 0.7.0 的 hostSceneFrame=false 会让 route 3 的画面比例不对 -> 强制打开
+            BOOL hsf = MFConfigBool(up, @"hostSceneFrame", NO);
+            if (!hsf) {
+                up[@"hostSceneFrame"] = @YES;
+                MFLogS(@"[cfg] ★ 迁移：hostSceneFrame false -> true（不开的话画面比例会不对）");
+            }
+            up[@"cfgVersion"] = @8;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 补齐新版新键于 %@ ok=%d（hostRoute=%@ / forceForeground / resizesHosted / hostSceneFrame）%@",
-             path, (int)ok, up[@"hostRoute"],
-             bumped ? @"｜★ 0.6.0 的 hostRoute=2 已自动升级到 3（2 实测黑屏）" : @"");
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=8 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / allowRouteB=%@）",
+             path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"], up[@"allowRouteB"]);
         return;
     }
 }

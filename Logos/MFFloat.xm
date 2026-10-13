@@ -125,6 +125,38 @@
 //
 //  另外：本版仍然【一个 hook 都不装】。
 //
+//  ============ 0.8.0 修的是什么（真机结果：归档(7)）============
+//  0.7.0 真机：**第一次真的出画面了**。这次是三个具体缺陷，不是方向错。
+//
+//  (1) route 3 画面比例不对 —— 根因：presentationView 的自然尺寸 = scene.settings.frame。
+//      我们用的真实 scene 是 430x932（整屏，宽高比 0.46），而浮窗内容区是 267x336.6
+//      （宽高比 0.79）；presenter 把 0.46 的画面塞进 0.79 的视图 => 拉伸/错位。
+//      对照证据：route 4 之所以比例正常，正是因为它建 scene 时就把 frame 设成了
+//      contentArea.bounds（日志 P6: scene frame 与 view frame 完全相等）。
+//      => 0.8.0 把 hostSceneFrame 默认改成 YES：**承载前先把 scene.frame 设成内容区尺寸**，
+//         让宽高比天然一致（这才是原生分屏的做法）；挂载后再同步一次（异步布局会拖后腿），
+//         用户拖 ◢ 缩放后也会重新同步。
+//
+//  (2) route 4 触发安全模式 —— 根因：**同一个 scene identity 被 createSceneWithDefinition:
+//      建了第二次**。崩溃归因 crashedStep=P4-scene，MF-host-step-prev.txt 恰好停在
+//      `>>> P4-scene`；而同一个 SpringBoard pid(19006) 在 t=291 已经用
+//      identity=sceneID:com.apple.mobilesafari-multifloat 建过一次并成功了。
+//      FBSceneManager 对重复 identity 直接断言 => SpringBoard 挂 => 安全模式。
+//      => 0.8.0：自有 scene **缓存复用**（同一个 App 这辈子只建一次，之后只是重新呈现）；
+//         换 App 时先用 destroyScene:withTransitionContext:（配 FBScene -_createTransitionContext
+//         造的非空上下文）销毁旧的；建之前先查 sceneWithIdentifier:，已存在就**接管**而不是新建。
+//         每个进程每个 App 硬上限 1 次新建。
+//
+//  (3) presenter "already in use" 被静默降级成黑屏 —— 日志里每次重试都出现
+//          createPresenter 抛异常: Cannot create a presenter with this identifier as it's already in use.
+//      旧代码一失败就退回 Route B（SBDeviceApplicationSceneViewController），
+//      而 Route B 是已知纯黑 —— 于是"重试 = 画面变黑"。用户看到的就是这个。
+//      => 0.8.0：presenter 同 scene + 同 identifier 且未 invalidated 时**复用**（必要时 activate），
+//         换目标时才 deactivate + invalidate 再重建；presenter 失败**不再静默退 Route B**，
+//         而是明确报错（除非配置 allowRouteB=true 显式开启）。
+//
+//  另外：本版仍然【一个 hook 都不装】。
+//
 #import "MFInternal.h"
 
 // ============ 承载链路步骤名（顺序即执行顺序）============
@@ -148,12 +180,28 @@ static NSString *const kMFStepP0      = @"P0-scene";   // 把 scene settings 拉
 static NSString *const kMFStepOwn     = @"P4-scene";   // Route 4：自己造一个 scene
 static NSString *const kMFStepState   = @"P6-state";   // 挂载后 dump presenter / layer 状态
 
+// ============ 0.8.0 新增的步骤名 ============
+static NSString *const kMFStepReuse   = @"P3a-reuse";  // presenter 复用（不再重复 createPresenter）
+static NSString *const kMFStepVoid    = @"P3c-void";   // 销毁上一个 presenter（deactivate+invalidate）
+static NSString *const kMFStepDel     = @"P4a-del";    // Route 4：销毁上一个自有 scene
+static NSString *const kMFStepGeom    = @"P7-geom";    // 把 scene.frame 同步成浮窗内容区尺寸
+
 // 0.6.0：ARC 下必须把"我们真正持有的"对象放进静态 strong 变量。
 // 否则局部变量一出作用域就被释放 —— 那个 presenter/宿主 VC 一死，浮窗里立刻变黑。
 static id gMFPM        = nil;   // UIScenePresentationManager
 static id gMFPresenter = nil;   // _UIScenePresenter
 static id gMFHostVC    = nil;   // Route B 的宿主 VC
 static id gMFOwnScene  = nil;   // Route 4 自己造出来的 FBScene（必须持有，否则立刻失效）
+
+// 0.8.0：把"我持有的这些东西属于谁"记下来。
+// 没有这三个变量，就会出现"同一个 identity 被建两次"（route 4 崩 SpringBoard）
+// 和"同一个 identifier 的 presenter 被建两次"（抛异常后静默变黑屏）两个真机事故。
+static NSString *gMFOwnSceneBundleID   = nil;   // gMFOwnScene 是给哪个 App 建的
+static NSString *gMFOwnSceneIdentity   = nil;   // gMFOwnScene 的 FBSSceneIdentity
+static NSString *gMFPresenterIdentifier = nil;  // gMFPresenter 的 identifier
+static id        gMFPresenterScene      = nil;  // gMFPresenter 挂在哪个 scene 上
+static id        gMFCurrentScene        = nil;  // 本轮承载的目标 scene（供缩放时重新同步几何）
+static id        gMFCurrentContentView  = nil;  // 本轮挂上去的承载视图
 
 // 启动时由 HookBridge 灌入"上一轮崩在哪一步"（nil = 上一轮没崩）
 static NSString *gMFBootCrashStep = nil;
@@ -474,6 +522,71 @@ static NSInteger MFKVCount(id obj, NSString *key) {
     } @catch (NSException *e) { return -1; }
 }
 
+#pragma mark ========== 0.8.0：对象生命周期（复用 / 销毁）==========
+
+// 这一节存在的唯一原因，是归档(7) 里的两个真机事故：
+//   A) route 4 对同一个 identity 建了第二次 scene -> FBSceneManager 断言 -> SpringBoard 挂 -> 安全模式
+//   B) 同一个 identifier 的 presenter 建了第二次 -> 抛 "already in use" -> 旧代码静默退 Route B（黑屏）
+// 共同点都是"我们忘了自己手里已经有一个"。所以先把销毁/复用做干净，再谈功能。
+
+/// 把当前持有的 presenter 收干净：先 deactivate 再 invalidate。
+/// 只在"换承载目标"时调用；同一个 scene + 同一个 identifier 一律走复用（见 MFPresentScene）。
+static void MFTeardownPresenter(void) {
+    id pres = gMFPresenter;
+    gMFPresenter = nil;
+    gMFPresenterIdentifier = nil;
+    gMFPresenterScene = nil;
+    if (pres == nil) return;
+
+    MFStepMark(kMFStepVoid);
+    @try {
+        MFMsg(pres, NSSelectorFromString(@"deactivate"));
+        MFMsg(pres, NSSelectorFromString(@"invalidate"));
+        MFLogS(@"[pres] 旧 presenter 已 deactivate + invalidate");
+    } @catch (NSException *e) {
+        MFLog(@"[pres] 销毁旧 presenter 抛异常: %@", e.reason);
+    }
+    MFStepOk(kMFStepVoid);
+}
+
+/// 销毁 route 4 自己造的那个 scene。
+/// 一定带**非空** transition context —— 0.3.0 就是把 nil 喂给
+/// activateWithTransitionContext: 崩的，同一个坑绝不踩第二次。
+/// 拿不到上下文就干脆不销毁：宁可后面新建失败，也不能崩 SpringBoard。
+static void MFTeardownOwnScene(void) {
+    id s = gMFOwnScene;
+    gMFOwnScene = nil;
+    gMFOwnSceneBundleID = nil;
+    gMFOwnSceneIdentity = nil;
+    if (s == nil) return;
+
+    MFStepMark(kMFStepDel);
+    @try {
+        id ctx = MFMsg(s, NSSelectorFromString(@"_createTransitionContext"));
+        if (ctx == nil) {
+            MFLogS(@"[pres] 拿不到 transition context -> 不做销毁（绝不能喂 nil）");
+        } else {
+            id mgr = MFMsg(MFCls(@"FBSceneManager"), NSSelectorFromString(@"sharedInstance"));
+            SEL del = NSSelectorFromString(@"destroyScene:withTransitionContext:");
+            if (mgr != nil && [mgr respondsToSelector:del]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, del, s, ctx);
+                MFLog(@"[pres] 已 destroyScene 旧自有 scene（ctx=%@）", NSStringFromClass([ctx class]));
+            } else {
+                MFLogS(@"[pres] FBSceneManager 没有 destroyScene:withTransitionContext:（跳过销毁）");
+            }
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[pres] destroyScene 抛异常: %@", e.reason);
+    }
+    MFStepOk(kMFStepDel);
+}
+
+/// 当前持有的自有 scene 还活着吗（FBScene.isValid）。
+static BOOL MFOwnSceneIsAlive(void) {
+    if (gMFOwnScene == nil) return NO;
+    return MFBoolProp(gMFOwnScene, NSSelectorFromString(@"isValid"));
+}
+
 #pragma mark ========== 0.7.0：P0 —— 让 scene 变成"可渲染" ==========
 
 /// 把目标 scene 的 settings 拉成"前台 + 在该屏 + 竖屏"。
@@ -532,11 +645,15 @@ static void MFForceSceneRenderable(id scene) {
 #pragma mark ========== 0.7.0：presenter 主链（Route 3 / Route 4 共用）==========
 
 /// 把 scene 的渲染尺寸直接改成浮窗内容区大小。
-/// 与 resizesHostedContext 是**两种不同的做法**，任选其一即可：
-///   - resizesHostedContext=YES（P2，默认）：不动 scene 设置，由 presenter 把宿主内容缩放进浮窗
-///   - 本函数：直接把 scene 的 frame 设成浮窗尺寸，让 App 自己按这个尺寸重新布局
-/// 公开实现（FrontBoardAppLauncher）用的是后者；万一前者不出画面/尺寸不对，
-/// 把配置 hostSceneFrame 设成 true 就能切到后者（原生分屏的手感）。
+///
+/// 【0.8.0：这一条从"可选"变成了"必需"】
+/// 0.7.0 真机（归档(7)）里 route 3 出了画面但**比例不对**，根因就在这里：
+///   presentationView 的自然尺寸 = scene.settings.frame。
+///   真实 App 的 scene 是整屏 430x932（宽高比 0.461），而浮窗内容区是 267x336.6（宽高比 0.793）。
+///   presenter 把 0.461 的内容往 0.793 的视图里塞 => 拉伸变形。
+/// 对照证据：同一次真机测试里 route 4 的比例是**对的**，因为它建 scene 时就把 frame
+/// 设成了 contentArea.bounds（日志里 P6 的 scene.frame 与 view.frame 逐位相等）。
+/// => 所以 route 3 也必须这么做：先把 scene.frame 改成内容区尺寸，宽高比天然一致。
 static void MFSetSceneFrame(id scene, CGRect frame) {
     if (scene == nil) return;
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
@@ -548,10 +665,32 @@ static void MFSetSceneFrame(id scene, CGRect frame) {
     };
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
-        MFLog(@"[pres] 已把 scene.frame 设成 %@（hostSceneFrame=true）", NSStringFromCGRect(frame));
+        MFLog(@"[pres] 已把 scene.frame 设成 %@", NSStringFromCGRect(frame));
     } @catch (NSException *e) {
         MFLog(@"[pres] 设 scene.frame 抛异常: %@", e.reason);
     }
+}
+
+/// 【0.8.0 新增】把"scene 的渲染尺寸"和"呈现视图的尺寸"一起对齐到浮窗内容区。
+///
+/// 为什么要成一个步骤 + 反复调用：
+///   updateSettingsWithBlock: 是**异步**的（日志里 P0 后 foreground 仍是 0，要到 P6 才变 1），
+///   presenter 建 presentationView 时可能还没吃到新的 frame，于是视图尺寸会"晚一步"。
+///   所以：承载前一次（让 presenter 建视图时就是对的）＋ 挂载后 3 秒再一次（纠正异步布局），
+///   用户拖 ◢ 缩放之后再调一次（保持比例）。
+static void MFSyncSceneGeometry(id scene, id view, CGRect bounds) {
+    if (scene == nil && view == nil) return;
+
+    MFStepMark(kMFStepGeom);
+    if (scene != nil) MFSetSceneFrame(scene, bounds);
+    if ([view isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)view;
+        // 不覆盖 autoresizing（presenter 自己会调），但把当前帧对齐，并在日志里留下证据。
+        v.frame = bounds;
+        MFLog(@"[pres] 承载视图已对齐内容区 frame=%@（scene.frame 同步为同一尺寸）",
+              NSStringFromCGRect(v.frame));
+    }
+    MFStepOk(kMFStepGeom);
 }
 
 static id MFCreatePresenterForScene(id pm, NSString *ident) {
@@ -624,13 +763,34 @@ static UIView *MFPresentScene(id scene, NSString *sceneID, NSDictionary *config,
          (int)MFBoolProp(defCtx, NSSelectorFromString(@"resizesHostedContext")));
     MFStepOk(kMFStepCtx);
 
-    // ---- P3：建 presenter ----
+    // ---- P3：建 presenter（0.8.0：同 scene + 同 identifier 一律复用）----
     MFStepMark(kMFStepPres);
-    id pres = MFCreatePresenterForScene(pm, sceneID);
+    id pres = nil;
+
+    // 复用判定：手里的 presenter 没被 invalidate、挂在同一个 scene 上、identifier 也一致。
+    // 为什么必须复用 —— 归档(7) 日志里的原话：
+    //   createPresenter 抛异常: Cannot create a presenter with this identifier as it's already in use.
+    // 旧代码一失败就静默退回 Route B（SBDeviceApplicationSceneViewController，已知纯黑），
+    // 于是"再点一次应用名"= 画面变黑。用户看到的正是这个现象，不是渲染坏了。
+    if (gMFPresenter != nil &&
+        gMFPresenterScene == scene &&
+        [gMFPresenterIdentifier isEqualToString:sceneID] &&
+        !MFBoolProp(gMFPresenter, NSSelectorFromString(@"isInvalidated"))) {
+        MFStepMark(kMFStepReuse);
+        pres = gMFPresenter;
+        MFLogS(@"[pres] 复用已有 presenter（同 scene + 同 identifier，不重复 create）");
+        MFStepOk(kMFStepReuse);
+    } else {
+        MFTeardownPresenter();   // 换目标：先收干净，否则新的那次一定抛 already in use
+        pres = MFCreatePresenterForScene(pm, sceneID);
+    }
+
     MFLog(@"[pres] presenter=%@", pres ? NSStringFromClass([pres class]) : @"nil");
     MFStepOk(kMFStepPres);
     if (pres == nil) return nil;
     gMFPresenter = pres;
+    gMFPresenterIdentifier = [sceneID copy];
+    gMFPresenterScene = scene;
 
     // ---- P3b：presenter 自己的呈现上下文（照抄 FrontBoardAppLauncher 的 appearanceStyle=2）----
     SEL presModify = NSSelectorFromString(@"modifyPresentationContext:");
@@ -716,13 +876,39 @@ static void MFLogPresenterState(NSString *tag, id pres, id view) {
 
 #pragma mark ========== 0.7.0：Route 4 —— 自建 scene ==========
 
-/// 完全照搬 khanhduytran0/FrontBoardAppLauncher 的 scene 构造：
-///   FBSMutableSceneDefinition（新 identity + 目标 App 的进程身份）
-///   + UIMutableApplicationSceneSettings（foreground=YES / frame / level / displayConfiguration）
-///   + UIMutableApplicationSceneClientSettings
-///   → [[FBSceneManager sharedInstance] createSceneWithDefinition:initialParameters:]
-/// 拿到的是一个**全新的**、生来就是"前台可渲染"的 scene。
-static id MFCreateOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect frame) {
+/// 【0.8.0 重写】Route 4 的自有 scene 获取。
+///
+/// 0.7.0 这里是"每次调用都 createSceneWithDefinition: 建一个新的"，
+/// 而 identity 是固定的 `...-multifloat`。真机（归档(7)）后果：
+/// 同一个 SpringBoard pid(19006) 在 t=291 建过一次并成功，t=316 又建第二次
+/// ⇒ FBSceneManager 对重复 identity 断言 ⇒ SpringBoard 挂 ⇒ 安全模式
+/// （崩溃归因 crashedStep=P4-scene，MF-host-step-prev.txt 恰好停在 `>>> P4-scene`）。
+///
+/// 所以本函数的三条铁律：
+///   1. 同一个 App **只建一次** —— 之后一律复用（scene 还活着就重新呈现）。
+///   2. 建之前先 sceneWithIdentifier: 查一遍，已有同 identity 的 scene 就**接管**，绝不新建第二个。
+///   3. 每个进程每个 App 硬上限 1 次新建（计数器），触顶只报错、绝不硬来。
+static id MFAcquireOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect frame) {
+    static NSMutableDictionary<NSString *, NSNumber *> *gCreateCount = nil;
+    if (gCreateCount == nil) gCreateCount = [NSMutableDictionary dictionary];
+
+    // ---- 第 0 步：复用 ----
+    if (MFOwnSceneIsAlive()) {
+        if ([gMFOwnSceneBundleID isEqualToString:bundleID]) {
+            MFStepMark(kMFStepOwn);
+            MFLogS(@"[pres] Route4 复用自有 scene（同一个 App，绝不重复 createSceneWithDefinition）");
+            MFStepOk(kMFStepOwn);
+            return gMFOwnScene;
+        }
+        MFLog(@"[pres] Route4 换 App（%@ -> %@），先销毁旧自有 scene", gMFOwnSceneBundleID, bundleID);
+        MFTeardownOwnScene();
+    } else if (gMFOwnScene != nil) {
+        MFLogS(@"[pres] Route4 旧自有 scene 已失效，丢弃引用");
+        gMFOwnScene = nil;
+        gMFOwnSceneBundleID = nil;
+        gMFOwnSceneIdentity = nil;
+    }
+
     id mgrCls = MFCls(@"FBSceneManager");
     id defCls = MFCls(@"FBSMutableSceneDefinition");
     id idnCls = MFCls(@"FBSSceneIdentity");
@@ -741,8 +927,37 @@ static id MFCreateOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect f
         return nil;
     }
 
-    // ---- 定义 ----
     MFStepMark(kMFStepOwn);
+    id mgr = MFMsg(mgrCls, NSSelectorFromString(@"sharedInstance"));
+
+    // ---- 第 1 步：已存在的同 identity scene 直接接管（关键保命步骤）----
+    SEL lookup = NSSelectorFromString(@"sceneWithIdentifier:");
+    if (mgr != nil && [mgr respondsToSelector:lookup]) {
+        @try {
+            id exist = ((id (*)(id, SEL, id))objc_msgSend)(mgr, lookup, sceneID);
+            if (exist != nil) {
+                MFLogS(@"[pres] Route4 发现同 identity 的已存在 scene -> 直接接管，不新建");
+                gMFOwnScene = exist;
+                gMFOwnSceneBundleID = [bundleID copy];
+                gMFOwnSceneIdentity = [sceneID copy];
+                MFStepOk(kMFStepOwn);
+                return exist;
+            }
+        } @catch (NSException *e) {
+            MFLog(@"[pres] sceneWithIdentifier: 抛异常: %@", e.reason);
+        }
+    }
+
+    // ---- 第 2 步：硬上限 —— 每个进程每个 App 最多新建 1 次 ----
+    NSNumber *used = gCreateCount[bundleID];
+    if (used != nil && used.integerValue >= 1) {
+        MFLog(@"[pres] !! %@ 本进程已建过一次自有 scene（硬上限 1）-> 拒绝再建（防 SpringBoard 崩）",
+              bundleID);
+        MFStepOk(kMFStepOwn);
+        return nil;
+    }
+
+    // ---- 第 3 步：定义 ----
     id procIdentity = MFMvObj(rbsCls, @"identityForEmbeddedApplicationIdentifier:", bundleID);
     id def = MFMsg(defCls, NSSelectorFromString(@"definition"));
     if (def == nil) { MFStepOk(kMFStepOwn); MFLogS(@"[pres] Route4 定义创建失败"); return nil; }
@@ -764,7 +979,7 @@ static id MFCreateOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect f
     MFMvBool(st,   @"setCanShowAlerts:", YES);
     MFMvBool(st,   @"setStatusBarDisabled:", YES);
     MFMvLong(st,   @"setInterfaceOrientation:", (long)UIInterfaceOrientationPortrait);
-    MFMvRect(st,   @"setFrame:", frame);
+    MFMvRect(st,   @"setFrame:", frame);   // ← 画面比例正确的关键：建的时候就用内容区尺寸
     MFMvObj(st,    @"setPersistenceIdentifier:", sceneID);
     id dc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
     if (dc != nil) MFMvObj(st, @"setDisplayConfiguration:", dc);
@@ -776,12 +991,17 @@ static id MFCreateOwnSceneForApp(NSString *bundleID, NSString *sceneID, CGRect f
     MFMvObj(params, @"setClientSettings:", cs);
 
     // ---- 建 scene ----
-    id mgr = MFMsg(mgrCls, NSSelectorFromString(@"sharedInstance"));
+    gCreateCount[bundleID] = @((used != nil ? used.integerValue : 0) + 1);
     id scene = MFMvObj2(mgr, @"createSceneWithDefinition:initialParameters:", def, params);
     MFStepOk(kMFStepOwn);
-    MFLog(@"[pres] Route4 createSceneWithDefinition -> %@（mgr=%@）",
+    MFLog(@"[pres] Route4 createSceneWithDefinition -> %@（mgr=%@，本进程第 %@ 次）",
           scene ? NSStringFromClass([scene class]) : @"nil",
-          mgr ? NSStringFromClass([mgr class]) : @"nil");
+          mgr ? NSStringFromClass([mgr class]) : @"nil", gCreateCount[bundleID]);
+    if (scene != nil) {
+        gMFOwnScene = scene;
+        gMFOwnSceneBundleID = [bundleID copy];
+        gMFOwnSceneIdentity = [sceneID copy];
+    }
     return scene;
 }
 
@@ -872,11 +1092,16 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
         [s appendFormat:@"  view.hostContainerView._hostViews         = %ld\n", (long)MFKVCount(host, @"_hostViews")];
     }
 
-    [s appendFormat:@"\n==== 我们持有的对象（静态 strong）====\npm=%@\npresenter=%@\nhostVC=%@\nownScene=%@\n",
+    [s appendFormat:@"\n==== 我们持有的对象（静态 strong）====\npm=%@\npresenter=%@\nhostVC=%@\nownScene=%@\n"
+                       @"presenter.identifier=%@\npresenter 挂在的 scene=%@\nownScene 属于=%@\nownScene identity=%@\n",
      gMFPM ? NSStringFromClass([gMFPM class]) : @"nil",
      gMFPresenter ? NSStringFromClass([gMFPresenter class]) : @"nil",
      gMFHostVC ? NSStringFromClass([gMFHostVC class]) : @"nil",
-     gMFOwnScene ? NSStringFromClass([gMFOwnScene class]) : @"nil"];
+     gMFOwnScene ? NSStringFromClass([gMFOwnScene class]) : @"nil",
+     gMFPresenterIdentifier ?: @"nil",
+     gMFPresenterScene ? NSStringFromClass([gMFPresenterScene class]) : @"nil",
+     gMFOwnSceneBundleID ?: @"nil",
+     gMFOwnSceneIdentity ?: @"nil"];
 
     NSString *p = @"/var/mobile/MF-presenter-report.txt";
     BOOL ok = [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
@@ -896,6 +1121,8 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 + (instancetype)shared;
 - (void)startWithConfig:(NSDictionary *)config;
 - (void)hostBundleID:(NSString *)bundleID;
+/// 【0.8.0】浮窗被拖拽缩放后，把 scene 的渲染尺寸同步成新的内容区尺寸（保持画面比例）
+- (void)syncContentGeometry;
 - (void)refreshAppList;
 @end
 
@@ -1049,6 +1276,12 @@ static char kMFRowBundleIDKey;
     if (f.origin.y + f.size.height > screen.size.height) f.size.height = screen.size.height - f.origin.y;
     win.frame = f;
     [g setTranslation:CGPointZero inView:win];
+
+    // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
+    // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
+    if (g.state == UIGestureRecognizerStateEnded) {
+        [[MFFloatManager shared] syncContentGeometry];
+    }
 }
 
 #pragma mark 内容
@@ -1259,11 +1492,12 @@ static char kMFRowBundleIDKey;
     // 直接再点一次应用名就生效，**不用 respring**，也就不会丢掉想承载的那个 scene。
     NSDictionary *freshCfg = MFLoadConfig();
     if (freshCfg != nil) self.config = freshCfg;
-    MFLog(@"[cfg] 本次生效配置：hostRoute=%ld forceForeground=%d resizesHosted=%d hostSceneFrame=%d hostStep=%ld",
+    MFLog(@"[cfg] 本次生效配置：hostRoute=%ld forceForeground=%d resizesHosted=%d hostSceneFrame=%d allowRouteB=%d hostStep=%ld",
           (long)MFConfigInt(self.config, @"hostRoute", 3),
           (int)MFConfigBool(self.config, @"forceForeground", YES),
           (int)MFConfigBool(self.config, @"resizesHosted", YES),
-          (int)MFConfigBool(self.config, @"hostSceneFrame", NO),
+          (int)MFConfigBool(self.config, @"hostSceneFrame", YES),
+          (int)MFConfigBool(self.config, @"allowRouteB", NO),
           (long)MFConfigInt(self.config, @"hostStep", 6));
 
     // ---------- 闸门 1：行为开关一律用布尔，绝不用字符串 ----------
@@ -1387,7 +1621,18 @@ static char kMFRowBundleIDKey;
     id hostVC = nil;
     id targetScene = scene;
 
-    // ---------- P0：让 scene 变成"可渲染"（route 3/4 才需要）----------
+    // ---------- 0.8.0：换承载目标时先把手里的东西收干净 ----------
+    // 若手里还握着**别的 App** 的 presenter，必须先销毁：否则新的那次 createPresenter 会抛
+    //   "Cannot create a presenter with this identifier as it's already in use."
+    // 而旧代码一失败就静默退回 Route B（已知纯黑）=> 用户看到"再点一次画面就黑了"。
+    NSString *targetViewID = [NSString stringWithFormat:@"MultiFloat-%@", bundleID];
+    if (gMFPresenter != nil && ![gMFPresenterIdentifier isEqualToString:targetViewID]) {
+        MFLog(@"[host] 承载目标变了（%@ -> %@），先销毁旧 presenter",
+              gMFPresenterIdentifier ?: @"nil", targetViewID);
+        MFTeardownPresenter();
+    }
+
+    // ---------- P0：让 scene 变成"可渲染"（只有 route 3 需要）----------
     // route=4 自己造的 scene 生来就是 foreground=YES，不用再拉。
     if (route == 3) {
         if (MFConfigBool(self.config, @"forceForeground", YES)) {
@@ -1399,31 +1644,37 @@ static char kMFRowBundleIDKey;
         }
     }
 
-    // 可选：直接把 scene 的 frame 设成浮窗内容区尺寸（与 resizesHostedContext 二选一）
-    if ((route == 3 || route == 4) && MFConfigBool(self.config, @"hostSceneFrame", NO)) {
-        MFStepMark(kMFStepP0);
-        MFSetSceneFrame(targetScene, panel.contentArea.bounds);
-        MFStepOk(kMFStepP0);
+    // ---------- Route 4：拿到属于我们的 scene（0.8.0：复用优先，绝不建第二个）----------
+    if (route == 4) {
+        NSString *ownID = [NSString stringWithFormat:@"%@-multifloat", bundleID];
+        MFLogS(@"[host] Route 4 是危险实验路线（0.7.0 曾因重复 identity 崩 SpringBoard 进安全模式）");
+        MFLogS(@"[host] 本进程每个 App 只允许新建 1 次自有 scene，其余一律复用/接管");
+        id ownScene = MFAcquireOwnSceneForApp(bundleID, ownID, panel.contentArea.bounds);
+        if (ownScene != nil) {
+            targetScene = ownScene;
+            MFLogS(@"[host] Route 4 拿到自有 scene，改用它作为承载目标");
+        } else {
+            MFLogS(@"[host] Route 4 拿不到自有 scene -> 退回 route 3（接管已存在的 scene）");
+            route = 3;
+        }
     }
 
-    // ---------- Route 4：先造一个属于我们的 scene ----------
-    if (route == 4) {
-        NSString *ownID = [NSString stringWithFormat:@"sceneID:%@-multifloat", bundleID];
-        id ownScene = MFCreateOwnSceneForApp(bundleID, ownID, panel.contentArea.bounds);
-        if (ownScene != nil) {
-            gMFOwnScene = ownScene;
-            targetScene = ownScene;
-            MFLogS(@"[host] Route 4 已造出属于我们的 scene，改用它作为承载目标");
-        } else {
-            MFLogS(@"[host] Route 4 造 scene 失败 -> 退回 route 3（接管已存在的 scene）");
-        }
+    // ---------- 0.8.0：把渲染尺寸对齐成浮窗内容区（画面比例正确的关键）----------
+    // 【0.7.0 把这一步放在"可选"位置是错的】
+    // presentationView 的自然尺寸 = scene.settings.frame。真实 App 的 scene 是整屏 430x932
+    // （宽高比 0.461），而浮窗内容区是 267x336.6（宽高比 0.793）—— 塞进去必然拉伸变形。
+    // 这正是归档(7) 里「route 3 出了画面但比例不对」的原因。
+    // route 4 的 scene 在**创建**时就用内容区尺寸，这里再同步一次是为了"复用旧 scene + 窗口被改过尺寸"
+    // 的情况（复用时 frame 可能已经过期）。
+    if ((route == 3 || route == 4) && MFConfigBool(self.config, @"hostSceneFrame", YES)) {
+        MFSyncSceneGeometry(targetScene, nil, panel.contentArea.bounds);
+    } else if (route == 3 || route == 4) {
+        MFLogS(@"[pres] hostSceneFrame=false -> 不改 scene.frame（画面比例可能不对，仅用于对照实验）");
     }
 
     if (route == 3 || route == 4) {
         NSString *pmSource = @"?";
-        contentView = MFPresentScene(targetScene,
-                                     [NSString stringWithFormat:@"MultiFloat-%@", bundleID],
-                                     self.config, &pmSource);
+        contentView = MFPresentScene(targetScene, targetViewID, self.config, &pmSource);
         MFLog(@"[host] Route %ld 结果 -> %@（manager 来源：%@）",
               (long)route, contentView ? @"拿到呈现视图" : @"失败", pmSource);
     } else if (route == 2) {
@@ -1431,19 +1682,29 @@ static char kMFRowBundleIDKey;
         MFLog(@"[host] Route 2(旧 A2) -> %@", contentView ? @"拿到呈现视图" : @"失败");
     }
 
-    if (contentView == nil) {
+    // ---------- 兜底 Route B：0.8.0 起默认**不做** ----------
+    // SBDeviceApplicationSceneViewController 是已被两次真机验证的**纯黑**宿主，
+    // 把它挂上去只会把"失败"伪装成"成功"，让人以为画面在渲染。
+    // 需要做 A/B 对照时把配置 allowRouteB 设成 <true/>。
+    if (contentView == nil && MFConfigBool(self.config, @"allowRouteB", NO)) {
         hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
-        MFLog(@"[host] 兜底 Route B newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
+        MFLog(@"[host] 兜底 Route B newSceneViewController=%@（allowRouteB=true 才走）",
+              hostVC ? NSStringFromClass([hostVC class]) : @"nil");
         gMFHostVC = hostVC;   // 静态 strong 持有，否则出作用域就释放 -> 黑屏
+    } else if (contentView == nil) {
+        MFLogS(@"[host] presenter 路线失败，且 allowRouteB=false -> 不挂那个已知纯黑的宿主 VC");
     }
     MFWritePresenterReport(bundleID, scene, handle, hostVC);
     MFStepOk(kMFStepVC);
 
     if (contentView == nil && hostVC == nil) {
-        [self fail:@"所有承载路线都失败"
-             detail:@"route 3/4（presenter）与 route 1（SpringBoard 宿主 VC）都没拿到可挂载的东西。\n"
+        [self fail:@"承载视图没拿到"
+             detail:@"presenter 路线（route 3/4）没拿到可挂载的呈现视图。\n"
+                    @"（route 1 的 SpringBoard 宿主 VC 自 0.8.0 起默认不再兜底 —— "
+                    @"它是已知的纯黑宿主，挂上去只会把失败伪装成成功。\n"
+                    @"要做 A/B 对照请把配置 allowRouteB 设成 <true/>。）\n\n"
                     @"请看 /var/mobile/MF-presenter-report.txt —— 里面记录了每个类的方法表、"
-                    @"scene.settings 的真实取值，以及 presenter 的 isHosting。"];
+                    @"scene.settings 的真实取值、以及 presenter 的 isHosting。"];
         return;
     }
     if (limit < 5) { [self stopAtStep:5 limit:limit]; return; }
@@ -1465,8 +1726,15 @@ static char kMFRowBundleIDKey;
         MFLog(@"[host] Route B setSceneResizesHostedContext:YES -> %@",
              resizeOK ? @"已设置" : @"未设置（宿主可能按整屏渲染）");
     } else {
-        // Route 3/4：resizesHostedContext 已在 P2 写进呈现上下文，这里只做确认。
-        MFLog(@"[host] Route %ld 的 resizesHostedContext 已在 P2 写入呈现上下文", (long)route);
+        // Route 3/4：resizesHostedContext 已在 P2 写进呈现上下文。
+        // 0.8.0 补充：真正让比例正确的是"scene.frame = 内容区尺寸"（route 3 在上面已做，
+        // route 4 建 scene 时就是内容区尺寸），resizesHostedContext 只负责让 App 跟着重新布局。
+        id sy = MFMsg(gMFPresenter, NSSelectorFromString(@"scene"));
+        id st = MFMsg(sy, NSSelectorFromString(@"settings"));
+        MFLog(@"[host] Route %ld 几何确认：scene.frame=%@ resizesHostedContext=%@",
+              (long)route, MFKV(st, @"frame"),
+              MFKV(MFMsg(gMFPresenter, NSSelectorFromString(@"presentationContext")),
+                   @"resizesHostedContext"));
     }
     MFStepOk(kMFStepResize);
 
@@ -1482,6 +1750,10 @@ static char kMFRowBundleIDKey;
         [panel attachContentViewController:hostVC];
     }
     MFStepOk(kMFStepAttach);
+
+    // 记住这一轮的目标 scene / 承载视图，供用户拖 ◢ 缩放时重新同步几何
+    gMFCurrentScene = targetScene;
+    gMFCurrentContentView = contentView ?: MFMsg(hostVC, NSSelectorFromString(@"view"));
 
     // ---------- P6：把 presenter / 图层宿主的真实状态写下来 ----------
     // 这是判断"还黑不黑"的第一手证据，也是下一版唯一的依据：
@@ -1507,6 +1779,12 @@ static char kMFRowBundleIDKey;
         if (self.hostSeq != mySeq) return;
         // 3 秒时再采一次状态：presenter 的 hosting 是**异步**建立的，
         // 很多情况下挂载那一刻还不是 hosting，要等一轮 runloop / 一次 scene update。
+        // 【0.8.0】顺便把几何再对齐一次 —— updateSettingsWithBlock: 是异步的，
+        // 而 presenter 建 presentationView 时可能还没吃到新的 frame（日志里 P0 后 foreground
+        // 仍是 0，要到 P6 才变 1，就是同一个异步窗口）。
+        if (MFConfigBool(self.config, @"hostSceneFrame", YES)) {
+            MFSyncSceneGeometry(gMFCurrentScene, gMFCurrentContentView, panel.contentArea.bounds);
+        }
         MFLogPresenterState(@"P6+3s", gMFPresenter, stateView);
     });
 
@@ -1518,6 +1796,17 @@ static char kMFRowBundleIDKey;
         MFAttemptClear();
         MFLogS(@"[gate] 承载存活 20 秒 -> 崩溃标记已清除（下次还能再试）");
     });
+}
+
+/// 【0.8.0】用户拖右下角 ◢ 缩放浮窗后，把 scene 的渲染尺寸一起改掉。
+/// 不做的话浮窗变宽变矮，画面还是老的宽高比 —— 就是"比例不对"的另一个来源。
+- (void)syncContentGeometry {
+    if (gMFCurrentScene == nil) return;
+    if (!MFConfigBool(self.config, @"hostSceneFrame", YES)) return;
+    MFFloatPanel *panel = self.panel;
+    if (panel == nil) return;
+    MFLogS(@"[ui] 浮窗尺寸变化 -> 同步 scene.frame（保持画面比例）");
+    MFSyncSceneGeometry(gMFCurrentScene, gMFCurrentContentView, panel.contentArea.bounds);
 }
 
 - (void)fail:(NSString *)message detail:(NSString *)detail {

@@ -6,6 +6,22 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.8.0 变更：
+#   - 0.7.0 真机（归档(7)）：**第一次真的出画面了**（route 3 出画面但比例不对；route 4 出画面但崩）
+#   - 缺陷 1 画面比例：presentationView 的自然尺寸 = scene.settings.frame；
+#     真实 App 的 scene 是整屏 430x932（宽高比 0.461），浮窗内容区是 267x336.6（0.793）=> 拉伸变形。
+#     route 4 比例正常正是因为它建 scene 时就把 frame 设成了 contentArea.bounds。
+#     => hostSceneFrame 默认 YES：承载前把 scene.frame 设成内容区尺寸，挂载后 3 秒再同步一次
+#        （updateSettingsWithBlock: 是异步的），用户拖 ◢ 缩放后再同步一次。新增步骤 P7-geom。
+#   - 缺陷 2 安全模式：route 4 对**同一个 identity** 第二次 createSceneWithDefinition =>
+#     FBSceneManager 断言 => SpringBoard 挂（归因 crashedStep=P4-scene，同 pid 19006）。
+#     => 自有 scene 一律经 MFAcquireOwnSceneForApp 获取：同 App 复用 / sceneWithIdentifier: 接管 /
+#        换 App 先 destroyScene:withTransitionContext:（配非空 _createTransitionContext）/
+#        每进程每 App 硬上限 1 次新建。新增步骤 P4a-del。
+#   - 缺陷 3 静默黑屏：二次 createPresenter 抛 "already in use" 后旧代码静默退 Route B（已知纯黑），
+#     "重试 = 画面变黑"。=> presenter 同 scene+identifier 复用，换目标时 deactivate+invalidate
+#     再重建；presenter 失败不再兜底 Route B（除非 allowRouteB=true）。新增步骤 P3a-reuse / P3c-void。
+#   - 配置迁移到 cfgVersion=8（只做一次）：hostRoute 4 -> 3、hostSceneFrame false -> true。
 # 0.7.0 变更：
 #   - 0.6.0 真机：presenter 链 P1..P5 全通、拿到真 _UIScenePresentationView、不崩 —— 但内容区纯黑
 #   - 根因：0.6.0 用 [[UIScenePresentationManager alloc] _initWithScene:] 自造 manager，
