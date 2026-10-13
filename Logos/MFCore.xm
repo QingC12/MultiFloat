@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.16.0";
+    return @"0.17.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -88,7 +88,7 @@ NSDictionary *MFLoadConfig(void) {
 
 //  0.9.0 的默认配置（相对 0.8.0 新增三项，全部围绕归档(8) 的"切到别的 App 就黑屏"）：
 //    enabled        = true  —— 总显示开关（装上就显示外壳）
-//    hostEnabled    = false —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的对象）
+//    hostEnabled    = true  ——【0.17.0 默认改 YES】真承载开关（用户要求，省去每次手动开；
 //    hostRoute      = 3     —— 承载路线（3=接管已存在 scene，实测唯一"出画面且不崩"的路）
 //    forceForeground= true  —— 承载前把目标 scene 设成"前台可渲染"（P0 步）
 //    resizesHosted  = true  —— 让被承载的 scene 按浮窗尺寸渲染（App 跟着重新布局）
@@ -206,7 +206,9 @@ void MFWriteDefaultConfigIfNeeded(void) {
     NSDictionary *def = @{
         @"enabled"         : @YES,                     // 总显示开关：装上就显示外壳
         @"mode"            : @"shell",                 // 仅展示
-        @"hostEnabled"     : @NO,                      // 真承载：默认关
+        @"hostEnabled"     : @YES,                      // 真承载：【0.17.0 默认改 YES】用户明确要求
+                                                        // （每天都要手动开一次太麻烦；危险动作
+                                                        // 仍需用户点应用名显式触发，不违反铁律 4）
         @"hostRoute"       : @3,                       // 3=接管已存在 scene（默认）/ 4=自建 scene（危险）/ 2 / 1
         @"forceForeground" : @YES,                     // P0：把 scene 设成前台可渲染
         @"resizesHosted"   : @YES,                     // 让 scene 按浮窗尺寸渲染（App 跟着重新布局）
@@ -253,13 +255,14 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   （归档(14) 里用户开了 hard ⇒ hard 恒为真 ⇒
                                                        //   每拍都「有差量」⇒ 每拍写一次 = 每拍闪一次）。
         // ---- 【0.13.0 新增】预防档的"差量写"开关（只发真的不一样的那几项）----
-        @"keepAlivePreventForeground" : @YES,          //   **核心**：发 setForeground:YES。
-                                                       //   【0.15.0 语义升级】从"差量项"改成"保活项"：
-                                                       //   本机 FBScene.foreground 读不到（KVC 抛异常）
-                                                       //   ⇒ 差量检测永远失效（归档(15) 全场 fg=n(0)，
-                                                       //   预防档从没发过 fg）⇒ 读不到就按"可能已掉"
-                                                       //   处理，每拍保活发一次（写完回读兜底，
-                                                       //   "读不到"不计败）；读得到的机器仍走真差量。
+        @"keepAlivePreventForeground" : @NO,           //   【0.17.0 默认改 NO】预防档不再发 setForeground:YES。
+                                                       //   实证（归档(15)(16)(17) 三轮）：本机 fg 读不到 ⇒
+                                                       //   fg 保活 = 每个预防回合必写一帧（每次
+                                                       //   updateSettingsWithBlock = 一次重提交 = 一帧闪），
+                                                       //   而真黑次数一轮没降（92→93）⇒ 零收益纯成本。
+                                                       //   救命的 fg 在**真黑档 L1**（keepAliveForeground=YES），
+                                                       //   与本键无关 —— 黑屏修复原理不受影响。
+                                                       //   读得到 fg 的机器想要预防保活可改回 YES。
         @"keepAlivePreventIdle"       : @YES,          //   清 idleModeEnabled（差量）
         @"keepAlivePreventDeact"      : @YES,          //   清 deactivationReasons（差量）
         @"keepAlivePreventLevel"      : @YES,          //   补 setLevel:1（只在 level != 1 时发）
@@ -292,15 +295,15 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @17,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @18,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / "
-          @"keepAlive=true@200ms / 预防档=差量写含 setForeground: / keepAliveForeground=true / "
-          @"deact 熔断=5 / 真黑分级恢复=true / 预防冷却=2000ms）",
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=true / hostRoute=3 / hostSceneFrame=true / "
+          @"keepAlive=true@200ms / 预防档=差量写（fg 保活默认关）/ keepAliveForeground=true / "
+          @"deact 熔断=5 / 真黑分级恢复=带生效确认窗 / 预防冷却=2000ms）",
           path, (int)ok);
 }
 
@@ -340,7 +343,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAliveTieredRestore"] == nil ||
                         cfg[@"keepAliveSnapshot"] == nil ||
                         cfg[@"keepAlivePreventCooldownMs"] == nil);
-    if (cur >= 17 && !missingKeys) return;
+    if (cur >= 18 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -595,6 +598,22 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             MFLogS(@"[cfg]     ③ 新增 keepAliveSnapshot=YES：内容区垫最后一帧快照，"
                   @"掉图层时露出定格画面；掉图层的 200~400ms 由 L1 拉回，视觉上几乎无感");
             up[@"cfgVersion"] = @17;
+        }
+        // ---- 0.17.0：fg 保活退场 + hostEnabled 默认开 ----
+        // 实证（归档(15)(16)(17) 三轮）：fg 保活 = 每个预防回合必写一帧
+        //（每次 updateSettingsWithBlock = 一次重提交 = 一帧"内容闪"），
+        // 真黑次数一轮没降（92→93）⇒ 零收益纯成本。救命的 fg 在真黑档 L1，
+        // 不受影响。一次性迁移：用户之后手动改回 YES 不会被反复覆盖。
+        if (cur < 18) {
+            id pv = up[@"keepAlivePreventForeground"];
+            BOOL wasOn = [pv respondsToSelector:@selector(boolValue)] ? [pv boolValue] : NO;
+            up[@"keepAlivePreventForeground"] = @NO;
+            if (up[@"hostEnabled"] == nil) up[@"hostEnabled"] = @YES;   // 缺键补默认（0.17.0 起 YES）
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=18：① 预防档 fg 保活关闭"
+                  @"（三轮实证零收益、每回合白付一帧闪；真黑档 L1 的 fg 保留）"
+                  @"② hostEnabled 默认 YES（用户要求；原值 was %@）",
+                  wasOn ? @"YES" : @"NO");
+            up[@"cfgVersion"] = @18;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];

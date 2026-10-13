@@ -273,6 +273,14 @@ static NSInteger gMFRestoreTier1Hits = 0;   // L1 就救回来的次数（越接
 static NSInteger gMFRestoreTier2Hits = 0;   // 升到 L2 才救回来的次数
 static NSInteger gMFRestoreTier3Hits = 0;   // 升到 L3 才救回来的次数
 
+// 【0.17.0】tier 升级的"生效确认窗"：写完 L_n 后至少隔 2 拍才允许升 L_{n+1}。
+// 为什么必须有：L1 写完的恢复是**异步**的（updateSettingsWithBlock ⇒ cs 2→0→1→2
+// 要 400~800ms），写完下一拍采样 layers 仍是 0 ≠ L1 无效。
+// 归档(17)：逐拍升级把"异步恢复中"误判成"无效" ⇒ L2×16 + L3×11 = 27 次几何写
+//（上轮仅 1 次）⇒ 每次"内容变白再显示"。升档门槛同时从 2/3 提到 3/5。
+static NSInteger gMFTierWriteDownTick = -1;  // 上一次写 tier 时的 downTicks（-1 = 新回合）
+static NSInteger gMFTierLastWritten   = 0;   // 上一次实际写出的 tier（0 = 本回合还没写过）
+
 // 【0.9.0】scene 守护（keep-alive）用到的状态。
 // 声明放在这里而不是"函数旁边"，因为在它下面出现的 MFLogPresenterState 也要读它们。
 static NSTimer *gMFKeepAliveTimer = nil;        // 守护定时器
@@ -1086,21 +1094,13 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
     }
 
     // ---------- 1) 先算差量（纯读，不写）----------
-    // 【0.15.0 关键改动】`foreground` 从"差量项"改成"保活项"。
-    // 归档(15) 钉死的事实链：
-    //   ① 本机 `FBScene.foreground` **读不到**（KVC 抛 NSUndefinedKeyException，
-    //      全场 fg=n(0)、可读性 FBScene.foreground=NO）
-    //      ⇒ 差量检测永远失效 ⇒ 预防档**从没发过 setForeground:YES**；
-    //   ② 全场 23 次真黑（切换时 layers 掉 1~2 拍 = 用户看到的"闪一下"，
-    //      切走一次、切回一次）全部由真黑档 L1 里**无条件**写的 fg=1 拉回
-    //      —— 救场的其实一直是 fg，只是每次都晚 200~400ms（必须等 layers 掉光才出手）；
-    //   ③ 45/48 次真黑发生在 deact=0 时 ⇒ 系统的去激活跟 deact 位无关，
-    //      掉的是渲染资格（前台身份）⇒ 0.14.0 熔断 deact 是对的。
-    // ⇒ 读不到 fg 时按"可能已掉"处理：每拍保活发一次 setForeground:YES
-    //   （纯状态量、不碰几何；写完回读验证兜底，但"读不到"不再计败，见下面第 3 步）。
-    //   读得到 fg 的机器仍然走真差量：fg=1 就不写，零浪费。
+    // 【0.17.0 关键改动】预防档 fg 保活**默认关**（keepAlivePreventForeground 默认 NO）。
+    // 三轮实证（归档(15)(16)(17)）：本机 fg 读不到 ⇒ 保活 = 每个预防回合必写一帧
+    //（每次 updateSettingsWithBlock = 一次重提交 = 一帧"内容闪"），而真黑次数
+    // 一轮没降（92→93）⇒ 零收益纯成本。救命的 fg 在真黑档 L1（keepAliveForeground），
+    // 与本键无关。读得到 fg 的机器想要预防保活可手动改回 YES。
     BOOL doFg = NO;
-    if (MFConfigBool(cfg, @"keepAlivePreventForeground", YES) && gMFFgUsable) {
+    if (MFConfigBool(cfg, @"keepAlivePreventForeground", NO) && gMFFgUsable) {
         doFg = h.hasSceneFg ? !h.sceneFg : YES;
     }
 
@@ -1921,6 +1921,8 @@ static void MFKeepAliveTick(void) {
         gMFKeepAliveAdvisoryTicks = 0;
         gMFKeepAlivePreventTicks = 0;
         gMFKeepAlivePreventWrites = 0;
+        gMFTierWriteDownTick = -1;    // 【0.17.0】新回合：生效确认窗归零
+        gMFTierLastWritten = 0;
 
         // 视图层纠正：便宜、不写 settings，顺手把比例守住
         MFKeepAliveFixViewFrameIfNeeded();
@@ -2114,13 +2116,23 @@ static void MFKeepAliveTick(void) {
     // ⇒ 从最温和的 L1 试起，哪级救回来就停在哪级。多数情况下 L1 就够，几何根本不用动，也就不闪。
     BOOL hardWrite = MFConfigBool(cfg, @"keepAliveHardWrite", YES);
     BOOL tiered    = MFConfigBool(cfg, @"keepAliveTieredRestore", YES);
-    NSInteger tier = 3;
+    NSInteger tier;
     if (!hardWrite) {
         tier = 1;                                  // 对照实验：永远只写状态量（≈ 0.10.0 的"最小写"）
-    } else if (tiered) {
-        tier = (gMFKeepAliveDownTicks >= 3) ? 3
-             : (gMFKeepAliveDownTicks >= 2) ? 2 : 1;
+    } else if (!tiered) {
+        tier = 3;                                  // 关掉分级 = 回到 0.13.0 恒全量写
+    } else if (gMFTierLastWritten > 0 && gMFTierWriteDownTick > 0 &&
+               gMFKeepAliveDownTicks > gMFTierWriteDownTick &&
+               gMFKeepAliveDownTicks - gMFTierWriteDownTick < 2) {
+        // 【0.17.0】生效确认窗内：沿用上次档位，**不升级**。
+        // 上一次写完才过了 1 拍 —— 恢复是异步的，现在升档只会白送一次几何重排。
+        tier = gMFTierLastWritten;
+    } else {
+        tier = (gMFKeepAliveDownTicks >= 5) ? 3
+             : (gMFKeepAliveDownTicks >= 3) ? 2 : 1;
     }
+    gMFTierWriteDownTick = gMFKeepAliveDownTicks;
+    gMFTierLastWritten   = tier;
     NSString *did = MFWriteSceneSettings(scene, cfg, tier, YES);
     gMFLastRestoreTier = tier;
     if (tier <= 1)      gMFRestoreTier1Hits += 1;
@@ -2168,6 +2180,8 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveLastPreventTime = 0;
     gMFKeepAliveLastViewFix = 0;
     gMFViewHoldUntil = 0;
+    gMFTierWriteDownTick = -1;    // 【0.17.0】
+    gMFTierLastWritten = 0;
     gMFKeepAliveNextHeartbeat = (NSInteger)(10000.0 / ms);
     gMFKeepAliveNextFrameCheck = (NSInteger)(1000.0 / ms);
     gMFKeepAliveStartTime = [NSDate timeIntervalSinceReferenceDate];
