@@ -59,6 +59,26 @@
 //      (c) enabled=false 时的日志直接点明"只改 hostEnabled 没用"。
 //  承载链路（S1..S7）本身与 0.4.0 完全一致，没有改动。
 //
+//  ============ 0.6.0 修的是什么 ============
+//  0.5.0 真机结果（归档(4)）：浮窗出来了、S1..S7 全走完、20 秒存活、**没崩**，
+//  但点 Safari 之后内容区**纯黑**。日志里唯一异常是
+//      [host] sceneIfExists=FBScene active=1 contentState=0
+//  原因：Route B 的 SBDeviceApplicationSceneViewController 是给 SpringBoard 自己的
+//  布局系统用的，光把它的 view 挂进我们的窗口，**里面没有渲染用的 presenter** ⇒ 黑底。
+//
+//  而 Stheno / TrollOpen 用的都不是它，是
+//      UIScenePresentationManager  →  _UIScenePresenter  →  presentationView
+//  MFProbe v0.5.0 段 9 的真机方法表已确认这条路在 17.3.1 上全都在：
+//      UIScenePresentationManager -_initWithScene:                        @24@0:8@16   ← 可自建
+//      UIScenePresentationManager -createPresenterWithIdentifier:          @24@0:8@16
+//      UIScenePresentationManager -createPresenterWithIdentifier:priority: @32@0:8@16q24
+//      UIScenePresentationManager -defaultPresentationContext              @16@0:8
+//      UIScenePresentationManager -modifyDefaultPresentationContext:       v24@0:8@?16
+//      _UIScenePresenter          -presentationView / -activate / -deactivate / -invalidate
+//  所以 0.6.0 新增 **Route A2** 并把它设为默认（hostRoute=2），Route B 保留为兜底（hostRoute=1）。
+//  同时新增 forceActivate（默认关）：只有 A2 仍黑屏时才需要强制激活 scene，
+//  且用的是 FBScene -_createTransitionContext 造出来的**非空**上下文（不走 0.3.0 的 nil 老路）。
+//
 //  另外：本版仍然【一个 hook 都不装】。
 //
 #import "MFInternal.h"
@@ -71,6 +91,20 @@ static NSString *const kMFStepVC      = @"S4-hostvc";
 static NSString *const kMFStepResize  = @"S5-resize";
 static NSString *const kMFStepAttach  = @"S6-attach";
 static NSString *const kMFStepSettle  = @"S7-settle";
+
+// ============ Route A2（自建 presenter）的步骤名 ============
+static NSString *const kMFStepPm      = @"P1-pm";
+static NSString *const kMFStepCtx     = @"P2-ctx";
+static NSString *const kMFStepPres    = @"P3-pres";
+static NSString *const kMFStepAct     = @"P4-act";
+static NSString *const kMFStepForce   = @"P4b-force";
+static NSString *const kMFStepPView   = @"P5-view";
+
+// 0.6.0：ARC 下必须把"我们真正持有的"对象放进静态 strong 变量。
+// 否则局部变量一出作用域就被释放 —— 那个 presenter/宿主 VC 一死，浮窗里立刻变黑。
+static id gMFPM        = nil;   // UIScenePresentationManager
+static id gMFPresenter = nil;   // _UIScenePresenter
+static id gMFHostVC    = nil;   // Route B 的宿主 VC
 
 // 启动时由 HookBridge 灌入"上一轮崩在哪一步"（nil = 上一轮没崩）
 static NSString *gMFBootCrashStep = nil;
@@ -186,6 +220,204 @@ static id MFFindHandleBySceneScan(NSString *bundleID) {
     return nil;
 }
 
+#pragma mark ========== Route A2：自建 presenter（0.6.0）==========
+
+/// 自建 UIScenePresentationManager：[UIScenePresentationManager alloc] → -_initWithScene:scene
+/// 故意把 _initWithScene: 的返回值当 void：它按初始化器惯例返回 self，
+/// 这样 alloc 的 +1 所有权刚好由 ARC 接管；随后对象存进静态 strong 变量长期存活。
+static id MFCreatePresentationManager(id scene) {
+    if (scene == nil) return nil;
+
+    Class cls = objc_getClass("UIScenePresentationManager");
+    if (cls == Nil) {
+        MFLog(@"[pres] !! 本机没有 UIScenePresentationManager 类");
+        return nil;
+    }
+    SEL initSel = NSSelectorFromString(@"_initWithScene:");
+    if (![cls instancesRespondToSelector:initSel]) {
+        MFLog(@"[pres] !! UIScenePresentationManager 没有 _initWithScene:，无法自建");
+        return nil;
+    }
+
+    id pm = ((id (*)(id, SEL))objc_msgSend)((id)cls, NSSelectorFromString(@"alloc"));
+    ((void (*)(id, SEL, id))objc_msgSend)(pm, initSel, scene);
+    return pm;
+}
+
+/// Route A2 主流程。成功返回可直接挂进浮窗的 UIView；失败返回 nil（调用方退回 Route B）。
+static UIView *MFTryPresenterRoute(id scene, NSDictionary *config) {
+    if (scene == nil) return nil;
+
+    // ---- P1：自建 presentation manager ----
+    MFStepMark(kMFStepPm);
+    id pm = MFCreatePresentationManager(scene);
+    MFLog(@"[pres] UIScenePresentationManager=%@", pm ? NSStringFromClass([pm class]) : @"nil");
+    MFStepOk(kMFStepPm);
+    if (pm == nil) return nil;
+    gMFPM = pm;
+
+    // ---- P2：把 resizesHostedContext 写进默认呈现上下文（命门）----
+    // 不设它，宿主 scene 仍按整屏尺寸渲染，浮窗里必然错位或黑屏。
+    MFStepMark(kMFStepCtx);
+    SEL modifySel = NSSelectorFromString(@"modifyDefaultPresentationContext:");
+    if ([pm respondsToSelector:modifySel]) {
+        @try {
+            void (^blk)(id) = ^(id mc) {
+                SEL s = NSSelectorFromString(@"setResizesHostedContext:");
+                if ([mc respondsToSelector:s]) {
+                    ((void (*)(id, SEL, BOOL))objc_msgSend)(mc, s, YES);
+                    MFLog(@"[pres] 已在 %@ 上设 resizesHostedContext=YES", NSStringFromClass([mc class]));
+                } else {
+                    MFLog(@"[pres] %@ 没有 setResizesHostedContext:", NSStringFromClass([mc class]));
+                }
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(pm, modifySel, (id)blk);
+        } @catch (NSException *e) {
+            MFLog(@"[pres] modifyDefaultPresentationContext 抛异常: %@", e.reason);
+        }
+    } else {
+        MFLog(@"[pres] manager 没有 modifyDefaultPresentationContext:（跳过）");
+    }
+    id defCtx = MFMsg(pm, NSSelectorFromString(@"defaultPresentationContext"));
+    MFLog(@"[pres] defaultPresentationContext=%@ resizesHostedContext=%d",
+         defCtx ? NSStringFromClass([defCtx class]) : @"nil",
+         (int)MFBoolProp(defCtx, NSSelectorFromString(@"resizesHostedContext")));
+    MFStepOk(kMFStepCtx);
+
+    // ---- P3：建 presenter ----
+    MFStepMark(kMFStepPres);
+    id pres = nil;
+    SEL mk2 = NSSelectorFromString(@"createPresenterWithIdentifier:priority:");
+    SEL mk1 = NSSelectorFromString(@"createPresenterWithIdentifier:");
+    @try {
+        if ([pm respondsToSelector:mk2]) {
+            pres = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(pm, mk2, @"MultiFloat", (NSInteger)0);
+        } else if ([pm respondsToSelector:mk1]) {
+            pres = ((id (*)(id, SEL, id))objc_msgSend)(pm, mk1, @"MultiFloat");
+        } else {
+            MFLog(@"[pres] manager 两个 createPresenter 都没有");
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[pres] createPresenter 抛异常: %@", e.reason);
+    }
+    MFLog(@"[pres] presenter=%@", pres ? NSStringFromClass([pres class]) : @"nil");
+    MFStepOk(kMFStepPres);
+    if (pres == nil) return nil;
+    gMFPresenter = pres;
+
+    // ---- P4：activate ----
+    MFStepMark(kMFStepAct);
+    SEL actSel = NSSelectorFromString(@"activate");
+    if ([pres respondsToSelector:actSel]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(pres, actSel);
+        } @catch (NSException *e) {
+            MFLog(@"[pres] activate 抛异常: %@", e.reason);
+        }
+    } else {
+        MFLog(@"[pres] presenter 没有 activate（不致命，继续取视图）");
+    }
+    MFStepOk(kMFStepAct);
+
+    // ---- P4b（可选，默认关）：强制激活那个 FBScene ----
+    // 0.3.0 崩在 activateWithTransitionContext:nil。日志显示 scene 本来 active=1，一般不需要；
+    // 真要试请把配置 forceActivate 设成 <true/> —— 这里用的是 FBScene -_createTransitionContext
+    // 造出来的**非空**上下文，不走 0.3.0 的 nil 老路。
+    MFStepMark(kMFStepForce);
+    if (MFConfigBool(config, @"forceActivate", NO)) {
+        if (MFBoolProp(scene, NSSelectorFromString(@"isActive"))) {
+            MFLog(@"[pres] forceActivate=true 但 scene 已 active，跳过");
+        } else {
+            id ctx = MFMsg(scene, NSSelectorFromString(@"_createTransitionContext"));
+            MFLog(@"[pres] _createTransitionContext=%@", ctx ? NSStringFromClass([ctx class]) : @"nil");
+            SEL act2 = NSSelectorFromString(@"activateWithTransitionContext:");
+            if (ctx != nil && [scene respondsToSelector:act2]) {
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(scene, act2, ctx);
+                    MFLogS(@"[pres] activateWithTransitionContext 已发送（非空上下文）");
+                } @catch (NSException *e) {
+                    MFLog(@"[pres] activateWithTransitionContext 抛异常: %@", e.reason);
+                }
+            }
+        }
+    } else {
+        MFLog(@"[pres] forceActivate=false（默认；只有 A2 仍黑屏时才需要设 true）");
+    }
+    MFStepOk(kMFStepForce);
+
+    // ---- P5：取呈现视图 ----
+    MFStepMark(kMFStepPView);
+    id v = MFMsg(pres, NSSelectorFromString(@"presentationView"));
+    MFLog(@"[pres] presentationView=%@ frame=%@",
+         v ? NSStringFromClass([v class]) : @"nil",
+         [v isKindOfClass:[UIView class]] ? NSStringFromCGRect(((UIView *)v).frame) : @"-");
+    MFStepOk(kMFStepPView);
+
+    return [v isKindOfClass:[UIView class]] ? (UIView *)v : nil;
+}
+
+/// 能力报告：把关键类的"自有方法表"和目标对象的 responds 矩阵写到
+/// /var/mobile/MF-presenter-report.txt。**纯读元数据**（class_copyMethodList / respondsToSelector），不发危险消息。
+static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id hostVC) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"=== MultiFloat %@ presenter 能力报告 ===\n", MFVersionString()];
+    [s appendFormat:@"bid=%@ t=%ld pid=%d\n\n", bundleID ?: @"?", (long)time(NULL), (int)getpid()];
+
+    NSArray *classes = @[ @"UIScenePresentationManager", @"_UIScenePresenter", @"_UIScenePresenterOwner",
+                          @"UIScenePresentationContext", @"UIMutableScenePresentationContext",
+                          @"_UIScenePresentationView", @"_UISceneLayerHostView",
+                          @"_UISceneLayerHostContainerView", @"UIApplicationSceneDeactivationManager",
+                          @"SBDeviceApplicationSceneViewController" ];
+    for (NSString *cn in classes) {
+        Class c = objc_getClass(cn.UTF8String);
+        [s appendFormat:@"---- %@ : %@\n", cn, c ? @"存在" : @"不存在"];
+        if (c == Nil) continue;
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        unsigned int lim = (n < 120) ? n : 120;
+        for (unsigned int i = 0; i < lim; i++) {
+            [s appendFormat:@"   - %s  %s\n", sel_getName(method_getName(ms[i])), method_getTypeEncoding(ms[i])];
+        }
+        if (ms != NULL) free(ms);
+        [s appendFormat:@"   （自有方法 %u 个，列出 %u 个）\n", n, lim];
+    }
+
+    void (^dump)(NSString *, id) = ^(NSString *label, id obj) {
+        if (obj == nil) {
+            [s appendFormat:@"\n==== %@ : nil\n", label];
+            return;
+        }
+        [s appendFormat:@"\n==== %@ : %@\n", label, NSStringFromClass([obj class])];
+        const char *sels[] = {
+            "contentState", "isActive", "isValid", "uiPresentationManager",
+            "_createTransitionContext", "settings", "uiSettings", "display",
+            "activate", "activateWithTransitionContext:", "deactivateWithTransitionContext:",
+            "scene", "sceneHandle", "view", "presentationView", "resizesHostedContext",
+            "setResizesHostedContext:", "setDisplayMode:", "displayMode", "setHostedContext:",
+            "newSceneViewWithReferenceSize:contentOrientation:containerOrientation:hostRequester:",
+            "application", "bundleIdentifier", "identifier", "setForeground:", "isForeground",
+            "modifyPresentationContext:", "presentationContext", "deactivate", "invalidate",
+            "setHidden:", "addSubview:"
+        };
+        for (unsigned k = 0; k < sizeof(sels) / sizeof(sels[0]); k++) {
+            BOOL ok = [obj respondsToSelector:NSSelectorFromString([NSString stringWithUTF8String:sels[k]])];
+            [s appendFormat:@"   %-30s %@\n", sels[k], ok ? @"YES" : @"-"];
+        }
+    };
+    dump(@"scene", scene);
+    dump(@"handle", handle);
+    dump(@"hostVC(Route B)", hostVC);
+
+    [s appendFormat:@"\n==== 我们持有的对象（静态 strong）====\npm=%@\npresenter=%@\nhostVC=%@\n",
+     gMFPM ? NSStringFromClass([gMFPM class]) : @"nil",
+     gMFPresenter ? NSStringFromClass([gMFPresenter class]) : @"nil",
+     gMFHostVC ? NSStringFromClass([gMFHostVC class]) : @"nil"];
+
+    NSString *p = @"/var/mobile/MF-presenter-report.txt";
+    BOOL ok = [s writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    MFLog(@"[pres] 能力报告已写 %@ ok=%d（%lu 字节）", p, (int)ok, (unsigned long)s.length);
+}
+
 #pragma mark ========== 类声明 ==========
 
 @class MFFloatPanel;
@@ -213,6 +445,8 @@ static id MFFindHandleBySceneScan(NSString *bundleID) {
 - (void)showMessage:(NSString *)message detail:(NSString *)detail;
 - (void)showAppList:(NSArray<NSArray<NSString *> *> *)items;
 - (void)attachContentViewController:(UIViewController *)vc;
+/// 0.6.0：直接把一个 UIView 挂进内容区（Route A2 的 presentationView 走这里）
+- (void)attachContentView:(UIView *)view;
 @end
 
 /// 应用列表行 → bundleID 的关联对象 key
@@ -375,6 +609,17 @@ static char kMFRowBundleIDKey;
     [self.contentArea addSubview:vc.view];
     [vc didMoveToParentViewController:self];
     MFLog(@"[ui] 已挂载承载视图 %@", NSStringFromClass([vc class]));
+}
+
+- (void)attachContentView:(UIView *)view {
+    [self attachContentViewController:nil];   // 清掉旧的承载内容
+    if (view == nil) return;
+
+    view.frame = self.contentArea.bounds;
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.contentArea addSubview:view];
+    MFLog(@"[ui] 已挂载承载视图(view) %@ frame=%@",
+         NSStringFromClass([view class]), NSStringFromCGRect(view.frame));
 }
 
 - (void)showMessage:(NSString *)message detail:(NSString *)detail {
@@ -644,45 +889,73 @@ static char kMFRowBundleIDKey;
     }
     if (limit < 4) { [self stopAtStep:4 limit:limit]; return; }
 
-    // ---------- S4：建宿主 VC ----------
+    // ---------- S4：取"呈现载体"（0.6.0 起有两条路）----------
+    //   hostRoute=2（默认）Route A2：自建 UIScenePresentationManager → _UIScenePresenter → presentationView
+    //                       —— Stheno / TrollOpen 用的就是这条
+    //   hostRoute=1        Route B ：借 SpringBoard 的 SBDeviceApplicationSceneViewController
+    //                       —— 0.5.0 实测：不崩，但内容区**纯黑**（那个 VC 缺 SB 自己的 presenter 就只是黑底）
     MFStepMark(kMFStepVC);
-    id hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
-    MFLog(@"[host] newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
+
+    NSInteger route = MFConfigInt(self.config, @"hostRoute", 2);
+    if (route != 1 && route != 2) route = 2;
+    MFLog(@"[host] hostRoute=%ld（2=自建 presenter / 1=SpringBoard 宿主 VC）", (long)route);
+
+    UIView *contentView = nil;
+    id hostVC = nil;
+
+    if (route == 2) {
+        contentView = MFTryPresenterRoute(scene, self.config);
+        MFLog(@"[host] Route A2(presenter) -> %@", contentView ? @"拿到呈现视图" : @"失败，退回 Route B");
+    }
+    if (contentView == nil) {
+        hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
+        MFLog(@"[host] newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
+        gMFHostVC = hostVC;   // 静态 strong 持有，否则出作用域就释放 -> 黑屏
+    }
+    MFWritePresenterReport(bundleID, scene, handle, hostVC);
     MFStepOk(kMFStepVC);
 
-    if (hostVC == nil) {
-        [self fail:@"newSceneViewController 返回 nil"
-             detail:@"SpringBoard 拒绝了宿主视图创建。"];
+    if (contentView == nil && hostVC == nil) {
+        [self fail:@"两条承载路线都失败"
+             detail:@"Route A2（自建 presenter）与 Route B（SpringBoard 宿主 VC）都没拿到可挂载的东西。\n"
+                    @"请看 /var/mobile/MF-presenter-report.txt —— 里面记录了每个类的方法表和 responds 矩阵。"];
         return;
     }
     if (limit < 5) { [self stopAtStep:5 limit:limit]; return; }
 
-    // ---------- S5：setSceneResizesHostedContext:YES ----------
-    // 这是让"浮窗里的 scene 按浮窗尺寸渲染"的关键；不设的话宿主会按整屏渲染，画面必然错位。
+    // ---------- S5：让宿主按浮窗尺寸渲染 ----------
     MFStepMark(kMFStepResize);
-    SEL resizeSel = NSSelectorFromString(@"setSceneResizesHostedContext:");
-    BOOL resizeOK = NO;
-    if ([hostVC respondsToSelector:resizeSel]) {
-        @try {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(hostVC, resizeSel, YES);
-            resizeOK = YES;
-        } @catch (NSException *e) {
-            MFLog(@"[host] setSceneResizesHostedContext 抛异常: %@", e.reason);
+    if (hostVC != nil) {
+        // Route B：在宿主 VC 上设；不设的话 scene 按整屏渲染，画面必然错位。
+        SEL resizeSel = NSSelectorFromString(@"setSceneResizesHostedContext:");
+        BOOL resizeOK = NO;
+        if ([hostVC respondsToSelector:resizeSel]) {
+            @try {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(hostVC, resizeSel, YES);
+                resizeOK = YES;
+            } @catch (NSException *e) {
+                MFLog(@"[host] setSceneResizesHostedContext 抛异常: %@", e.reason);
+            }
         }
+        MFLog(@"[host] Route B setSceneResizesHostedContext:YES -> %@",
+             resizeOK ? @"已设置" : @"未设置（宿主可能按整屏渲染）");
+    } else {
+        // Route A2：resizesHostedContext 已在 P2 写进呈现上下文，这里只做确认。
+        MFLog(@"[host] Route A2 的 resizesHostedContext 已在 P2 写入呈现上下文");
     }
-    MFLog(@"[host] setSceneResizesHostedContext:YES -> %@",
-         resizeOK ? @"已设置" : @"未设置（宿主可能按整屏渲染，画面会错位）");
     MFStepOk(kMFStepResize);
 
     if (limit < 6) { [self stopAtStep:6 limit:limit]; return; }
 
-    // ---------- S6：把宿主视图挂进浮窗 ----------
-    // 【0.4.0 关键删减】0.3.0 在这里之后调用了
-    //     objc_msgSend(scene, @selector(activateWithTransitionContext:), nil)
-    // 然后就崩了。FBScene 确实有这个方法（v24@0:8@16），但喂 nil 上下文极可能就是死因；
-    // 而且日志里 scene 本来 active=1，根本不需要我们再激活。所以本版彻底不调它。
+    // ---------- S6：把承载视图挂进浮窗 ----------
+    // 【0.4.0 起】这里之后**不再**调 FBScene -activateWithTransitionContext:nil（0.3.0 的崩点）。
+    // 真要强制激活 scene，走 P4b（配置 forceActivate=true），且用非空上下文。
     MFStepMark(kMFStepAttach);
-    [panel attachContentViewController:hostVC];
+    if (contentView != nil) {
+        [panel attachContentView:contentView];
+    } else {
+        [panel attachContentViewController:hostVC];
+    }
     MFStepOk(kMFStepAttach);
 
     [panel setStatusText:[NSString stringWithFormat:@"已承载 %@", bundleID]];

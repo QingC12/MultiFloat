@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.5.0";
+    return @"0.6.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -106,6 +106,8 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"mode"           : @"shell",                  // 仅展示
         @"hostEnabled"    : @NO,                       // 真承载：默认关
         @"hostStep"       : @6,                        // 承载最多走到第几步
+        @"hostRoute"      : @2,                        // 承载路线：2=自建 presenter（默认）/ 1=SpringBoard 宿主 VC
+        @"forceActivate"  : @NO,                       // 默认关；只有 presenter 路线仍黑屏时才需要试
         @"targetBundleID" : @"com.apple.mobilesafari",
         @"showDelay"      : @12,
         @"windowLevel"    : @1010,
@@ -119,7 +121,8 @@ void MFWriteDefaultConfigIfNeeded(void) {
 /// 不如我们把这几个键原地补上，用户只需要把 false 改成 true。
 void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
     if (cfg == nil) return;
-    if (cfg[@"hostEnabled"] != nil && cfg[@"hostStep"] != nil) return;
+    if (cfg[@"hostEnabled"] != nil && cfg[@"hostStep"] != nil &&
+        cfg[@"hostRoute"] != nil && cfg[@"forceActivate"] != nil) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -130,8 +133,10 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"hostEnabled"] == nil) up[@"hostEnabled"] = @NO;
         if (up[@"hostStep"]    == nil) up[@"hostStep"]    = @6;
         if (up[@"mode"]        == nil) up[@"mode"]        = @"shell";
+        if (up[@"hostRoute"]   == nil) up[@"hostRoute"]   = @2;    // 0.6.0：默认走自建 presenter
+        if (up[@"forceActivate"] == nil) up[@"forceActivate"] = @NO;
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 补齐 0.4.0 新键于 %@ ok=%d（hostEnabled=false / hostStep=6）", path, (int)ok);
+        MFLog(@"[cfg] 补齐新版新键于 %@ ok=%d（hostEnabled / hostStep / hostRoute=2 / forceActivate=false）", path, (int)ok);
         return;
     }
 }
@@ -240,23 +245,32 @@ NSString *MFStepRotateAndAnalyze(void) {
         NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (text == nil) text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
 
-        NSString *pending = nil;      // 最后一个还没配对的 >>> 步名
+        // 0.6.0：改成**栈式**配对。因为 Route A2 的 P1..P5 是嵌在 S4 里面执行的，
+        // 旧版"遇到配对就置 nil"的写法会在 P5 配对后把 S4 也一起忘掉；
+        // 栈式则始终保留"还没闭合的最内层步骤"，崩点归因依然准确。
+        NSMutableArray<NSString *> *stack = [NSMutableArray array];
         for (NSString *raw in [text componentsSeparatedByString:@"\n"]) {
             NSString *line = [raw stringByTrimmingCharactersInSet:
                               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (line.length == 0) continue;
-            // 形如 ">>> S4-vc t=… pid=…"
+            // 形如 ">>> S4-hostvc t=… pid=…"
             NSArray<NSString *> *parts = [line componentsSeparatedByString:@" "];
             if (parts.count < 2) continue;
             NSString *head = parts[0];
             NSString *tag  = parts[1];
             if ([head isEqualToString:@">>>"]) {
-                pending = tag;
-            } else if ([head isEqualToString:@"<<<"] && pending != nil && [tag isEqualToString:pending]) {
-                pending = nil;
+                [stack addObject:tag];
+            } else if ([head isEqualToString:@"<<"]) {
+                // 从栈顶往下找第一个同名项闭合（支持嵌套）
+                for (NSInteger i = (NSInteger)stack.count - 1; i >= 0; i--) {
+                    if ([stack[(NSUInteger)i] isEqualToString:tag]) {
+                        [stack removeObjectAtIndex:(NSUInteger)i];
+                        break;
+                    }
+                }
             }
         }
-        crashed = pending;
+        crashed = stack.lastObject;
     }
 
     // 无论有没有结论，都把这一轮日志留档，然后开新的一轮
