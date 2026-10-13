@@ -1,8 +1,8 @@
-Package: com.example.multifloatprobe
-Name: MultiFloatProbe
-Version: 0.2.0
+Package: com.example.mfprobe
+Name: MFProbe Diagnostic
+Version: 0.2.1
 Architecture: iphoneos-arm64e
-Description: Runtime probe for MultiFloat - dumps private API ownership, signatures and ivars to /var/mobile
+Description: One-shot runtime diagnostic for MultiFloat (NOT the tweak). Read-only scan of SpringBoard: dumps real owners, method signatures (type encoding) and ivars of private scene/workspace APIs to /var/mobile. Install, collect the logs, then uninstall.
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks

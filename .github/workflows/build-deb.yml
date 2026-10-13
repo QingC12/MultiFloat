@@ -93,10 +93,10 @@ jobs:
           path: packages/*.deb
           if-no-files-found: error
 
-      - name: Upload MultiFloatProbe DEB
+      - name: Upload MFProbe diagnostic DEB
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MultiFloatProbe-deb
+          name: MFProbe-Diagnostic-deb
           path: Probe/packages/*.deb
           if-no-files-found: error

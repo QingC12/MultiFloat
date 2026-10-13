@@ -1,8 +1,8 @@
 Package: com.example.multifloat
 Name: MultiFloat
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64e
-Description: Multi-floating window jailbreak tweak skeleton (roothide / arm64e)
+Description: Multi-floating window / split-view jailbreak tweak for iOS 17 (roothide / arm64e). Current build: skeleton + injection liveness log only, no user-visible feature yet.
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks
