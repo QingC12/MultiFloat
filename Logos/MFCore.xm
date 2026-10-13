@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.12.0";
+    return @"0.13.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -109,9 +109,18 @@ NSDictionary *MFLoadConfig(void) {
 //                              deact=32/33 出现 20+ 次而其中绝大多数 layers/hosted 完好（画面是好的），
 //                              0.9.1 拿它当判据 → 每拍都写 settings → 每写一次就闪一次。
 //                              打开它只是为了把 deact/idle 的波动记进日志观察，**不会写任何 settings**。
-//    keepAliveForeground = false ——本机（iOS 17.3.1）settings 上**根本没有**
-//                              setForeground: / foreground（responds 守卫静默跳过）。
-//                              它现在只作为日志字段；开关留着以防别的机型上真有。
+//    keepAliveForeground = true ——【0.13.0 改 false -> true，本轮最关键的一处】
+//                              **0.10.0 起它默认 NO 是一个错误，而且是三轮回归的总根源。**
+//                              当年那句注释（"本机 settings 上根本没有 setForeground:"）
+//                              是**问错了对象**得出的：它只问了 `FBScene` 的
+//                              respondsToSelector（=NO），而归档(13) 的存在性矩阵问 settings 时
+//                              得到的是 `foreground (getter) = -`、**`setForeground: (setter) = YES`**
+//                              —— 它是个"只写"的前台开关。
+//                              0.9.1 因为 `forceAll=YES` 而每拍都发这一项，所以它不掉图层；
+//                              0.10.0/0.11.0/0.12.0 从不发 ⇒ App 被挂起
+//                              （归档(13) 报告：`taskState: Suspended; visibility: Background`）
+//                              ⇒ 图层永久消失，写什么都救不回来。
+//                              设成 false 可以复现 0.10.0~0.12.0 的黑屏，仅用于对照实验。
 //    keepAliveIdle  = true  ——真黑时是否清 idleModeEnabled=NO。
 //    keepAliveDeact = true  ——真黑时是否清 deactivationReasons=0。
 //    keepAliveHardWrite = true ——【0.11.0 新增】真黑时是否走**全量写**
@@ -152,12 +161,26 @@ NSDictionary *MFLoadConfig(void) {
 //    keepAlivePreventMs     = 250  ——预防写的最小间隔（限流）。必须远小于"约 1 秒"的掉图层死线。
 //                                     0.9.1 是"每拍都写"（200 ms ⇒ 每秒 5 次），那是它闪屏的代价；
 //                                     0.12.0 只在真的写进去有意义时才写，默认 250 ms 够用。
-//    keepAlivePreventHard   = false ——预防写要不要额外带上 `setLevel:1`。
-//                                     **默认 false 是关键**：预防档刻意**不碰任何几何**
-//                                     （不写 setLevel / setDisplayConfiguration: / setFrame:），
+//    keepAlivePreventHard   = false ——预防写要不要额外走"0.9.1 的完整版"
+//                                     （再叠加 setDisplayConfiguration: + setFrame:）。
+//                                     **默认 false 是关键**：预防档刻意**不碰任何几何**，
 //                                     因为归档(10) 测到那一帧黑正是 `setDisplayConfiguration:`
 //                                     把 frame 打回整屏 + 随后的 `setFrame:` 造成的。
-//                                     万一"只清 idle/deact"按不住，再打开它做 A/B。
+//                                     万一"差量写"仍按不住，再打开它做 A/B（会闪，但最猛）。
+//  —— 以下 6 个键是【0.13.0 新增 / 本轮的重点】——
+//    keepAlivePreventForeground = true ——【0.13.0 核心】预防档要不要发 `setForeground:YES`。
+//                                     **它就是 0.9.1 与 0.10.0+ 之间唯一有效的差别**（见上）。
+//                                     实现上不是"每拍都发"：先在 FBScene 上读 `foreground`，
+//                                     只有读出来是 0 才写；写完还会读回验证，
+//                                     连续 3 次写完仍是 0 就判定"本机这个 setter 是空转"并停止再写
+//                                     （避免每拍写一次 = 每拍闪一次，那是 0.9.1 的老毛病）。
+//    keepAlivePreventIdle       = true ——预防档是否把 idleModeEnabled 清零（差量写）。 
+//    keepAlivePreventDeact      = true ——预防档是否把 deactivationReasons 清零（差量写）。
+//    keepAlivePreventLevel      = true ——预防档是否补 `setLevel:1`（差量写：只在 level != 1 时发）。
+//    keepAlivePreventBackoffAfter  = 40   ——连续多少拍还在预防档之后开始退避（间隔翻倍）。
+//    keepAlivePreventBackoffMaxMs  = 2000 ——预防退避的间隔上限。
+//                                    真黑档是"永不放弃、只降频"，预防档同理：
+//                                    一直按不住说明系统就是要它后台，那就少写几次，别把 CPU 和电量烧掉。
 //    keepAliveViewFrameMs   = 500  ——承载视图尺寸纠正的节流间隔。
 //                                     0.11.0 是"差 0.5 点就掰"，在 50 ms 周期下每秒掰 20 次，
 //                                     等于跟 presenter 自己的布局对拉（归档(12) 日志被刷了 7 万字节）。
@@ -194,8 +217,12 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAlive"       : @YES,                     // 【0.9.0 新增】承载成功后守护 scene（切 App 不再黑屏）
         @"keepAliveMs"     : @200,                     // 【0.9.1 改】守护周期（毫秒）1000 -> 200：
                                                        //   闪屏时长 ≈ 一个守护周期（归档(9) 实测），砍到 1/5
-        @"keepAliveForeground" : @NO,                  // 【0.9.1 改】默认 YES -> NO：
-                                                       //   本机没有 setForeground:，这一项一直是空转
+        @"keepAliveForeground" : @YES,                 // 【0.13.0 改 NO -> YES】**本轮最关键的一处**。
+                                                       //   0.10.0~0.12.0 一直默认 NO，依据是一句
+                                                       //   问错对象的注释（只问了 FBScene，而
+                                                       //   setForeground: 其实在 settings 上存在）。
+                                                       //   结果 App 被挂起、图层永久消失。
+                                                       //   false = 复现 0.10.0~0.12.0 的黑屏，仅用于对照。
         @"keepAliveIdle"   : @YES,                     // 真掉出时清 idleModeEnabled
         @"keepAliveDeact"  : @YES,                     // 真掉出时清 deactivationReasons=0
         @"keepAliveLevel"  : @NO,                      // 【0.11.0 起废弃】代码不再读取；保留键只为兼容旧配置
@@ -218,20 +245,31 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   归档(12)：这是唯一有效的时机 —— 图层
                                                        //   掉光之后就不可逆了（81 次全量写全灭）。
         @"keepAlivePreventMs"     : @250,              // 【0.12.0 新增】预防写的限流间隔
-        @"keepAlivePreventHard"   : @NO,               // 【0.12.0 新增】预防写是否带 setLevel:1。
-                                                       //   默认 NO：预防档**不碰任何几何**，因为
-                                                       //   归档(10) 测到那一帧黑就是 displayConfiguration
-                                                       //   + frame 造成的。按不住再打开做 A/B。
+        @"keepAlivePreventHard"   : @NO,               // 【0.12.0 新增 / 0.13.0 语义收窄】走"0.9.1 的完整版"：
+                                                       //   再叠加 displayConfiguration + frame（会闪但最猛）。
+                                                       //   默认 NO：预防档**不碰任何几何**，因为归档(10)
+                                                       //   测到那一帧黑就是 displayConfiguration + frame 造成的。
+        // ---- 【0.13.0 新增】预防档的"差量写"开关（只发真的不一样的那几项）----
+        @"keepAlivePreventForeground" : @YES,          //   **核心**：发 setForeground:YES。
+                                                       //   先在 FBScene 上读 foreground，只有是 0 才写；
+                                                       //   写完读回验证，连续 3 次无效就停手（防每拍闪）。
+        @"keepAlivePreventIdle"       : @YES,          //   清 idleModeEnabled（差量）
+        @"keepAlivePreventDeact"      : @YES,          //   清 deactivationReasons（差量）
+        @"keepAlivePreventLevel"      : @YES,          //   补 setLevel:1（只在 level != 1 时发）
+        @"keepAlivePreventBackoffAfter" : @40,         //   连续多少拍还在预防档之后开始退避
+        @"keepAlivePreventBackoffMaxMs" : @2000,       //   预防退避的间隔上限（永不放弃，只降频）
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @13,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @14,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / 只把「没有图层」当黑 / keepAliveSoft=false / 真黑全量写=true）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / "
+          @"keepAlive=true@200ms / 预防档=差量写含 setForeground: / keepAliveForeground=true / 真黑全量写=true）",
+          path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -261,8 +299,12 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAliveBackoffMaxMs"] == nil ||
                         cfg[@"keepAlivePrevent"] == nil || cfg[@"keepAlivePreventMs"] == nil ||
                         cfg[@"keepAlivePreventHard"] == nil ||
-                        cfg[@"keepAliveViewFrameMs"] == nil || cfg[@"keepAliveViewFrameTol"] == nil);
-    if (cur >= 13 && !missingKeys) return;
+                        cfg[@"keepAliveViewFrameMs"] == nil || cfg[@"keepAliveViewFrameTol"] == nil ||
+                        cfg[@"keepAlivePreventForeground"] == nil || cfg[@"keepAlivePreventIdle"] == nil ||
+                        cfg[@"keepAlivePreventDeact"] == nil || cfg[@"keepAlivePreventLevel"] == nil ||
+                        cfg[@"keepAlivePreventBackoffAfter"] == nil ||
+                        cfg[@"keepAlivePreventBackoffMaxMs"] == nil);
+    if (cur >= 14 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -280,7 +322,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"allowRouteB"]     == nil) up[@"allowRouteB"]     = @NO;
         if (up[@"keepAlive"]       == nil) up[@"keepAlive"]       = @YES;
         if (up[@"keepAliveMs"]     == nil) up[@"keepAliveMs"]     = @200;   // 0.9.1 新默认
-        if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @NO;  // 0.9.1 新默认
+        if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @YES; // 0.13.0 新默认
         if (up[@"keepAliveIdle"]   == nil) up[@"keepAliveIdle"]   = @YES;
         if (up[@"keepAliveDeact"]  == nil) up[@"keepAliveDeact"]  = @YES;
         if (up[@"keepAliveLevel"]  == nil) up[@"keepAliveLevel"]  = @NO;   // 0.10.0 新默认
@@ -298,6 +340,13 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAlivePreventHard"]   == nil) up[@"keepAlivePreventHard"]   = @NO;   // 0.12.0 新增
         if (up[@"keepAliveViewFrameMs"]   == nil) up[@"keepAliveViewFrameMs"]   = @500;  // 0.12.0 新增
         if (up[@"keepAliveViewFrameTol"]  == nil) up[@"keepAliveViewFrameTol"]  = @0.08; // 0.12.0 新增
+        // ---- 0.13.0 预防档"差量写"的六个键 ----
+        if (up[@"keepAlivePreventForeground"] == nil) up[@"keepAlivePreventForeground"] = @YES; // 0.13.0 核心
+        if (up[@"keepAlivePreventIdle"]       == nil) up[@"keepAlivePreventIdle"]       = @YES;
+        if (up[@"keepAlivePreventDeact"]      == nil) up[@"keepAlivePreventDeact"]      = @YES;
+        if (up[@"keepAlivePreventLevel"]      == nil) up[@"keepAlivePreventLevel"]      = @YES;
+        if (up[@"keepAlivePreventBackoffAfter"] == nil) up[@"keepAlivePreventBackoffAfter"] = @40;
+        if (up[@"keepAlivePreventBackoffMaxMs"] == nil) up[@"keepAlivePreventBackoffMaxMs"] = @2000;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -340,21 +389,21 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @9;
         }
 
-        // ---- 0.9 -> 0.10：修正两项"实测空转 / 误导"的默认值 + 新增两个分项开关 ----
+        // ---- 0.9 -> 0.10：修正一项误导的默认值 + 新增两个分项开关 ----
         // 归档(9) 真机证据：
-        //   ① settings 上没有 setForeground:（responds 静默跳过）=> keepAliveForeground 一直是空转；
-        //   ② 闪屏时长 ≈ 一个守护周期 => keepAliveMs=1000 就是"闪一下"的长度本身。
+        //   ① 闪屏时长 ≈ 一个守护周期 => keepAliveMs=1000 就是"闪一下"的长度本身；
+        //   ② 当年还顺手把 keepAliveForeground 关掉了，理由是"本机没有 setForeground:（空转）"。
+        //      **那条理由后来被归档(13) 推翻了**（它只问了 FBScene，没问 settings），
+        //      所以 0.13.0 起**不再**在这里关它（见下面 cur<14 那一段：反而要打开）。
         if (cur < 10) {
             // 只改"还停在旧默认值"的；用户自己调过的原样尊重。
             if (MFConfigInt(up, @"keepAliveMs", 1000) == 1000) {
                 up[@"keepAliveMs"] = @200;
                 MFLogS(@"[cfg] ★ 迁移：keepAliveMs 1000 -> 200（闪屏 ≈ 一个守护周期，直接砍到 1/5）");
             }
-            if (MFConfigBool(up, @"keepAliveForeground", YES)) {
-                up[@"keepAliveForeground"] = @NO;
-                MFLogS(@"[cfg] ★ 迁移：keepAliveForeground true -> false（本机没有 setForeground:，一直是空转）");
-            }
             MFLogS(@"[cfg] ★ 迁移到 cfgVersion=10：新增 keepAliveDeact / keepAliveLevel（默认 true / true）");
+            MFLogS(@"[cfg]   ※ 0.13.0 说明：0.9->0.10 时曾把 keepAliveForeground 关成 false，理由是"
+                  @"「本机没有 setForeground:」——那个判断是错的（问错了对象），现在它默认 true。");
             up[@"cfgVersion"] = @10;
         }
 
@@ -431,12 +480,41 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @13;
         }
 
+        // ---- 0.13 -> 0.14：把 0.10.0 误删的那个开关**装回去** ----
+        // 归档(13) 真机证据（用户原话："切换应用时悬浮窗依旧黑屏"，0.12.0）：
+        //   · 日志：`deact 0->32`（画面还好）→ 我们的预防写发出去了 → 同一秒 `cs 2->0`
+        //     → 下一拍 `layers 2->0`，之后再没回来；
+        //   · 能力报告：`目标 App processState = taskState: Suspended; visibility: Background`
+        //     —— **App 进程被挂起了**。被挂起的进程不可能出图，写多少 settings 都没用。
+        //   把 0.9.1 与 0.10.0+ 的写操作对齐，只剩**一项**差别：
+        //     0.9.1 因为 forceAll=YES，每拍都发 `setForeground:YES`；0.10.0 起默认 NO（从不发）。
+        //   而那句"本机没有 setForeground:"的依据是**问错了对象**：
+        //     只问了 FBScene 的 respondsToSelector（=NO），没问 settings ——
+        //     归档(13) 的存在性矩阵明确给出 `setForeground: settings=YES`（只写型的前台开关）。
+        if (cur < 14) {
+            // 只改"还停在旧默认 NO"的；用户自己调过 true 的原样尊重。
+            if (!MFConfigBool(up, @"keepAliveForeground", NO)) {
+                up[@"keepAliveForeground"] = @YES;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveForeground false -> true"
+                      @"（0.10.0 起它默认 NO 是三轮回归的总根源：scene 失去前台身份 -> App 被挂起 -> 图层永久消失）");
+            }
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=14：预防档改成**差量写**，并新增"
+                  @" keepAlivePreventForeground / keepAlivePreventIdle / keepAlivePreventDeact /"
+                  @" keepAlivePreventLevel / keepAlivePreventBackoffAfter / keepAlivePreventBackoffMaxMs"
+                  @"（默认 true / true / true / true / 40 / 2000）");
+            MFLogS(@"[cfg]   ★ 0.13.0 的两条原则：① 预防档必须发 setForeground:YES（0.9.1 与 0.10.0+ 之间唯一有效的差别）；");
+            MFLogS(@"[cfg]     ② 只写**差量** —— 先把当前值读出来，只有真的不一样才发；一项差量都没有就连 block 都不调（零写入 = 零重排 = 零闪）。");
+            MFLogS(@"[cfg]   ★ 写完还会回读 FBScene.foreground 验证；连续 3 次无效就停手，避免「每拍写一次 = 每拍闪一次」。");
+            up[@"cfgVersion"] = @14;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
              up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
              up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
-             up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"]);
+             up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"],
+             up[@"keepAliveForeground"], up[@"keepAlivePreventForeground"]);
         return;
     }
 }

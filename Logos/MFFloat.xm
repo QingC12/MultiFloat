@@ -226,6 +226,22 @@ static id             gMFFrameMemoScene = nil;
 static CGRect         gMFFrameMemoRect  = {{0, 0}, {0, 0}};
 static NSTimeInterval gMFFrameMemoTime  = 0;
 
+// 【0.13.0 新增】两件"别再自欺欺人"的事：
+//
+// ① 可变 settings 上的 setter 到底存不存在 —— 只探一次就写进日志。
+//    归档(13) 那个存在性矩阵探的是 `scene.settings`（**不可变**对象），所以
+//    `setIdleModeEnabled:` / `setDeactivationReasons:` 报 `-`，而它们在
+//    `UIMutableApplicationSceneSettings` 上明明是有的（类 dump 里能看到）。
+//    探错对象 = 结论全错。以后只在 `updateSettingsWithBlock:` 的 block 参数上探 —— 那
+//    才是我们真正写入的那个对象。
+static BOOL gMFProbedMutableSetters = NO;
+
+// ② `setForeground:` 到底**管不管用** —— 写完读回 `FBScene.foreground` 验证。
+//    如果连着几次写完读回仍然是 0，说明本机这个 setter 是空的，就**停止再试**，
+//    否则每拍写一次 = 每拍闪一次（就是 0.9.1 的老毛病）。每次重新承载时重置。
+static BOOL      gMFFgUsable = YES;
+static NSInteger gMFFgFailStreak = 0;
+
 // 【0.9.0】scene 守护（keep-alive）用到的状态。
 // 声明放在这里而不是"函数旁边"，因为在它下面出现的 MFLogPresenterState 也要读它们。
 static NSTimer *gMFKeepAliveTimer = nil;        // 守护定时器
@@ -659,6 +675,44 @@ static unsigned long long MFULLPropEx(id obj, NSString *selName, BOOL *has) {
     @catch (NSException *e) { return 0; }
 }
 
+// ========== 【0.13.0】属性读取封装（必须定义在 MFReadHealth 之前）==========
+
+/// 【0.13.0 新增】读 double 返回的属性（`settings.level` 就是 double）。
+static double MFDPropEx(id obj, NSString *selName, BOOL *has) {
+    SEL s = NSSelectorFromString(selName);
+    if (obj == nil || ![obj respondsToSelector:s]) { if (has) *has = NO; return 0.0; }
+    if (has) *has = YES;
+    @try { return ((double (*)(id, SEL))objc_msgSend)(obj, s); }
+    @catch (NSException *e) { return 0.0; }
+}
+
+/// 【0.13.0 核心】读 **FBScene.foreground** —— 这才是"这个 scene 还算不算前台"的唯一真值。
+///
+/// 为什么必须走 KVC，而且必须问 FBScene 而不是 settings：
+///   · 归档(13) 的存在性矩阵实测：`foreground`(getter) 在 settings 上**不存在**（`-`），
+///     而 `setForeground:`(setter) **存在**（`settings=YES`）—— 它是个"只写"开关；
+///   · 但 `FBScene` 上有对应的 ivar，KVC `valueForKey:@"foreground"` 能读到真值：
+///     挂载瞬间是 1，App 被切到后台之后变成 0（P6+20s 那行日志）。
+///   · 0.9.x 的注释"本机没有 foreground/setForeground:"就是这么来的 ——
+///     当年只问了 FBScene 的 **respondsToSelector**（=NO），于是把整条 foreground 逻辑
+///     当成空转给删了。归档(13) 证明**删错了**：setter 在 settings 上是存在的。
+///
+/// 返回值：能读到就置 has=YES。
+static BOOL MFForegroundOf(id scene, BOOL *has) {
+    if (has) *has = NO;
+    if (scene == nil) return NO;
+    @try {
+        id v = [scene valueForKey:@"foreground"];
+        if (v != nil && [v respondsToSelector:@selector(boolValue)]) {
+            if (has) *has = YES;
+            return [v boolValue];
+        }
+    } @catch (NSException *e) {
+        // 没有这个 key（NSUndefinedKeyException）—— 当"读不到"处理，绝不猜。
+        return NO;
+    }
+    return NO;
+}
 /// 一次采样读到的全部"决定黑不黑"的量。`has*` = 该属性在本机是否真的存在。
 typedef struct {
     BOOL hasFg, hasIdle, hasDeact, hasCs, hasLevel, hasFrame;
@@ -666,6 +720,11 @@ typedef struct {
     unsigned long long deact;
     NSInteger cs;
     NSInteger layers;
+    // ---- 【0.13.0 新增】把"能读到的当前值"和"setter 在不在"分开记，才能做**差量写** ----
+    BOOL hasLvlVal;      // settings.level 的 getter 在不在
+    double lvlVal;       // 当前的 settings.level
+    BOOL hasSceneFg;     // FBScene.foreground 读没读到（KVC）
+    BOOL sceneFg;        // 当前值：1=还算前台，0=已经不是了
 } MFHealth;
 
 /// 采一次样。**只读不写**；读不到就把对应 has 置 NO（绝不把"不存在"当成 0 用）。
@@ -681,9 +740,13 @@ static MFHealth MFReadHealth(id scene) {
         h.deact = MFULLPropEx(st, @"deactivationReasons", &h.hasDeact);
         h.hasLevel = [st respondsToSelector:NSSelectorFromString(@"setLevel:")];
         h.hasFrame = [st respondsToSelector:NSSelectorFromString(@"setFrame:")];
+        // 【0.13.0】getter 与 setter 要分开问：deact/idle/level 都有 getter，
+        // 但真正的"前台开关"只有 setter（getter 在 settings 上不存在）。
+        h.lvlVal    = MFDPropEx(st, @"level", &h.hasLvlVal);
     }
-    h.cs     = MFIntPropEx(scene, @"contentState", &h.hasCs);
-    h.layers = MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers");
+    h.cs      = MFIntPropEx(scene, @"contentState", &h.hasCs);
+    h.layers  = MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers");
+    h.sceneFg = MFForegroundOf(scene, &h.hasSceneFg);   // 【0.13.0】这是判据的一部分，不是日志字段
     return h;
 }
 
@@ -740,16 +803,39 @@ static CGRect MFRectProp(id obj, NSString *selName, BOOL *has) {
 ///     "deact!=0 而图层还在"的那一秒。
 ///     0.9.1 正是把 `deact!=0 / cs!=2` 也算作"要动手"，所以它不掉图层；
 ///     0.10.0/0.11.0 把这一档降级成"只记日志"，于是只能等图层掉完再救 —— 必然黑。
-///   ⇒ 结论二：加回这一档时**必须把代价压到最低**。
-///     `MFDropPrevent` 只写两个纯状态量（`idleModeEnabled` / `deactivationReasons`），
-///     **不写 level、不写 displayConfiguration、不写 frame** —— 没有任何几何变化，
-///     从原理上就不该产生可见的那一帧黑（归档(10) 测到的重排元凶正是
-///     `setDisplayConfiguration:` 把 frame 打回整屏 + 随后的 `setFrame:`）。
+///   ⇒ 结论二：加回这一档时**必须把代价压到最低** —— 只写"纯状态量"，不碰几何
+///     （归档(10) 测到的重排元凶正是 `setDisplayConfiguration:` 把 frame 打回整屏
+///     + 随后的 `setFrame:`）。
+///
+/// 【0.13.0 的决定性修正 —— 归档(13)】0.12.0 的"低代价预防"方向对，但**写漏了最关键的一项**。
+///   用户原话："切换应用时悬浮窗依旧黑屏。"日志给出的完整因果链（两次会话都复现）：
+///     ① Safari 轮：`deact 0->32`（`cs=2 layers=2 hosted=2`，画面还好）
+///        → 我们的"预防写（idle+deact+level）"确实发出去了
+///        → **紧接着同一个 pid 里 `cs 2->0`，再下一拍 `layers 2->0`** ⇒ 真黑，再也回不来；
+///     ② 报告实测挂在最后的状态是
+///        `scene.settings.foreground = 1` 但 **`目标 App processState = taskState: Suspended;
+///         visibility: Background`** —— **App 进程被挂起了**。一个被挂起的进程不可能出图，
+///        写多少 settings 都没用（这解释了"81 次全量写、layers 恒为 0"）。
+///   为什么 0.9.1 不掉图层？把两版的写操作对齐就只剩**一项差别**：
+///     · 0.9.1：`hardDown` ⇒ `forceAll=YES` ⇒ `doFg = forceAll || … = **YES**`
+///       ⇒ 每一拍都发 `setForeground:YES`；
+///     · 0.10.0 起：`doFg = p0 || MFConfigBool(cfg, @"keepAliveForeground", NO)`，
+///       而 0.9.x 留下的一句注释（"`foreground` / `setForeground:` 在本机不存在，
+///       responds 守卫静默跳过"）让它默认 NO ⇒ **除了承载前的 P0，再没发过这一项**。
+///   ⇒ 那句注释是**错的**，错在"问错了对象"：它只问了 `FBScene` 的 respondsToSelector（=NO），
+///     而归档(13) 的存在性矩阵是问 settings 对象的，结果是
+///     `foreground (getter) = -`、**`setForeground: (setter) = YES`**。
+///     也就是说它是个"只写"的前台开关 —— 这正是 0.9.1 用来让 App 不被挂起的那一项。
+///   ⇒ 0.13.0 的结论：
+///     ① 预防档必须**包含** `setForeground:YES`（同时保留 level/idle/deact）；
+///     ② 判据里加入 `FBScene.foreground == 0`（能读到才算）—— 那才是"App 要进后台"的直接信号；
+///     ③ 但**绝不能每拍都写**（0.9.1 的闪就是这么来的）⇒ 改成**差量写**：
+///        先读全量当前值，只把"真的不一样"的那几项发出去；没有差量就**一个字节都不写**。
 typedef NS_ENUM(NSInteger, MFDropKind) {
     MFDropNone     = 0,   // 健康
     MFDropAdvisory = 1,   // 软警告：只记日志，**永不动手**（keepAliveSoft 打开才用，纯观察）
     MFDropPrevent  = 2,   // 【0.12.0】图层还在，但 scene 正在被去激活 / 进 idle / 掉出 ready
-                          //   ⇒ **必须预防性动手**（趁图层没掉，先把它按住）
+                          //   或 App 正在失去前台身份 ⇒ **必须预防性动手**（趁图层没掉先按住）
     MFDropReal     = 3,   // 真黑：图层没了（不可逆，只能全量写搏一下）
 };
 
@@ -759,8 +845,11 @@ static MFDropKind MFJudgeDrop(MFHealth h, NSInteger hosted, NSDictionary *cfg) {
 
     // 【0.12.0 核心】图层还在，但 scene 已经被"去激活 / 进 idle / 掉出 ready"。
     // 这就是"掉图层的最后一秒"：归档(12) 实测 deact 变 32 之后约 1 秒，layers 就 2 -> 0。
-    // 0.9.1 把这一档算作"要动手"，所以它不掉图层（代价是写得勤 = 会闪）。
-    BOOL soft = (h.hasDeact && h.deact != 0) || (h.hasIdle && h.idle) || (h.hasCs && h.cs != 2);
+    // 【0.13.0 补充】再加上"失去了前台身份"（FBScene.foreground=0）。
+    // 它是"App 要被挂起"的直接前兆 —— 归档(13) 里 App 最终就是 Suspended，
+    // 而 Suspended 的进程按定义不出图，所以这一项必须进判据，抢在挂起**之前**动手。
+    BOOL soft = (h.hasDeact && h.deact != 0) || (h.hasIdle && h.idle) ||
+                (h.hasCs && h.cs != 2)      || (h.hasSceneFg && !h.sceneFg);
     if (!soft) return MFDropNone;
 
     if (MFConfigBool(cfg, @"keepAlivePrevent", YES)) return MFDropPrevent;
@@ -770,15 +859,19 @@ static MFDropKind MFJudgeDrop(MFHealth h, NSInteger hosted, NSDictionary *cfg) {
 
 /// 把 health 渲染成一行可 diff 的签名。`y/n` 表示"该属性本机有没有"，一眼就能看出
 /// 我们到底是在读真值，还是在读一个不存在的 getter 返回的 0。
+/// 【0.13.0】签名里新增 `fgS=`：**FBScene.foreground**（0.9.x 一直想读却读错对象的那个值）。
+/// `y/n` 表示读到了没有 —— KVC 读得到的机型上它就是"App 还算不算前台"的唯一真值。
 static NSString *MFHealthSignature(id scene, MFHealth h) {
     return [NSString stringWithFormat:
-            @"valid=%d cs=%@(%d) layers=%ld fg=%@(%d) idle=%@(%d) deact=%@(%llu)",
+            @"valid=%d cs=%@(%d) layers=%ld fg=%@(%d) fgS=%@(%d) idle=%@(%d) deact=%@(%llu) lvl=%.1f",
             (int)MFBoolProp(scene, NSSelectorFromString(@"isValid")),
             h.hasCs ? @"y" : @"n", (int)h.cs,
             (long)h.layers,
             h.hasFg ? @"y" : @"n", (int)h.fg,
+            h.hasSceneFg ? @"y" : @"n", (int)h.sceneFg,
             h.hasIdle ? @"y" : @"n", (int)h.idle,
-            h.hasDeact ? @"y" : @"n", h.deact];
+            h.hasDeact ? @"y" : @"n", h.deact,
+            h.hasLvlVal ? h.lvlVal : -1.0];
 }
 
 /// presenter 的宿主容器里到底挂着几个图层 —— **这才是黑不黑的直接证据**：
@@ -835,7 +928,12 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
     BOOL p0 = (cfg == nil);
     BOOL doIdle  = p0 || MFConfigBool(cfg, @"keepAliveIdle",  YES);
     BOOL doDeact = p0 || MFConfigBool(cfg, @"keepAliveDeact", YES);
-    BOOL doFg    = p0 || MFConfigBool(cfg, @"keepAliveForeground", NO);  // 本机没这个 setter，开也只是空转
+    // 【0.13.0 关键改动：默认 NO -> YES】
+    // 0.9.1 的 `forceAll` 让这一项恒为 YES，而 0.10.0 起它默认 NO（依据是一句**问错对象**的注释，
+    // 见 MFJudgeDrop 上方那段说明）⇒ 承载之后我们再没把 scene 拉回前台，
+    // App 遂被挂起（归档(13) 报告：`taskState: Suspended; visibility: Background`），图层永久消失。
+    // `setForeground:` 在 settings 上**确实存在**（存在性矩阵 settings=YES）。
+    BOOL doFg    = (p0 || MFConfigBool(cfg, @"keepAliveForeground", YES)) && gMFFgUsable;
     BOOL doEsc   = p0 || escalate;
 
     CGSize want = gMFDesiredContentSize;
@@ -849,6 +947,23 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
 
     void (^blk)(id) = ^(id st) {
         if (st == nil) return;
+
+        // 【0.13.0】只探一次：在**可变** settings 上问每个 setter 在不在（这才是我们写的对象）。
+        if (!gMFProbedMutableSetters) {
+            gMFProbedMutableSetters = YES;
+            const char *names[] = { "setForeground:", "setLevel:", "setDisplayConfiguration:",
+                                    "setIdleModeEnabled:", "setDeactivationReasons:", "setFrame:" };
+            BOOL bits[6];
+            for (unsigned k = 0; k < 6; k++) {
+                bits[k] = [st respondsToSelector:NSSelectorFromString([NSString stringWithUTF8String:names[k]])];
+            }
+            MFLog(@"[pres] ★ 可变 settings（%@）上的 setter 实况："
+                  @"setForeground:=%d setLevel:=%d setDisplayConfiguration:=%d "
+                  @"setIdleModeEnabled:=%d setDeactivationReasons:=%d setFrame:=%d",
+                  NSStringFromClass([st class]),
+                  (int)bits[0], (int)bits[1], (int)bits[2], (int)bits[3], (int)bits[4], (int)bits[5]);
+        }
+
         if (doFg)    MFMvBool(st, @"setForeground:", YES);
         if (doIdle)  MFMvBool(st, @"setIdleModeEnabled:", NO);
         if (doDeact) MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
@@ -868,8 +983,8 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         return @"exception";
     }
 
-    NSString *summary = [NSString stringWithFormat:@"idle=%d deact=%d 升级=%d frame=%d(%.0fx%.0f)",
-                         (int)doIdle, (int)doDeact, (int)doEsc, (int)wantFrame,
+    NSString *summary = [NSString stringWithFormat:@"fg=%d idle=%d deact=%d 升级=%d frame=%d(%.0fx%.0f)",
+                         (int)doFg, (int)doIdle, (int)doDeact, (int)doEsc, (int)wantFrame,
                          want.width, want.height];
 
     if (verbose) {
@@ -878,9 +993,14 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         CGRect f = MFRectProp(after, @"frame", &hasFrame);
         // 【0.12.0】这里改成打印 **dc 的来源**（见上）。0.11.0 打的 `dc=__NSCFConstantString`
         // 掩盖了真正关键的事实："setDisplayConfiguration: 到底有没有被调用过"。
-        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f dc源=%@ cs=%ld layers=%ld frame=%@",
+        // 【0.13.0】再加一个 fgS 回读 —— 写完 `setForeground:YES` 之后
+        // `FBScene.foreground` 到底有没有变回 1，这一项决定"是不是真能救"。
+        BOOL hasFgS = NO;
+        BOOL fgS = MFForegroundOf(scene, &hasFgS);
+        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f fgS=%@(%d) dc源=%@ cs=%ld layers=%ld frame=%@",
               summary,
               MFDProp(after, NSSelectorFromString(@"level")),
+              hasFgS ? @"y" : @"n", (int)fgS,
               dcSrc ? NSStringFromClass([dcSrc class]) : @"nil（setDisplayConfiguration: 未被调用）",
               (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
               (long)MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers"),
@@ -889,23 +1009,31 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
     return summary;
 }
 
-/// 【0.12.0 新增】**预防性写** —— 在"图层还在、但 scene 正在被去激活"的那一秒把它按住。
+/// 【0.12.0 新增 / 0.13.0 重写成"差量写"】**预防性写** ——
+/// 在"图层还在、但 scene 正在被去激活 / 正在失去前台身份"的那一秒把它按住。
 ///
 /// 为什么单独做成一个函数、而不是复用 MFWriteSceneSettings：
-///   两者的代价差一个数量级，混在一起就没法既救得回来又不闪。
-///   · 真黑时（layers 已经 0）只能"全量写"：level + displayConfiguration + idle + deact + frame，
-///     其中 `setDisplayConfiguration:` 会把 frame 打回整屏 430x932，随后的 `setFrame:` 再改一次
-///     ⇒ 一次写换来两次重排，必有一帧黑。但那时已经黑了，无所谓。
-///   · 预防时（图层还在）**绝不能碰几何**：只写 `idleModeEnabled` / `deactivationReasons`
-///     两个纯状态量 —— 它们不影响任何尺寸/层级，所以理论上不会产生可见的那一帧黑。
-///     这正是 0.9.1 与 0.10.0 之间的那块拼图：
-///       0.9.1 = 预防 + 全量（不掉图层，但每次都闪）；
-///       0.10.0/0.11.0 = 不预防 + 全量（不闪，但直接掉图层 = 永久黑）；
-///       0.12.0 = **预防 + 只写状态量**（目标：不掉图层，也不闪）。
+///   · 真黑时（layers 已经 0）只能"全量写"：foreground + level + displayConfiguration
+///     + idle + deact + frame，其中 `setDisplayConfiguration:` 会把 frame 打回整屏 430x932，
+///     随后的 `setFrame:` 再改一次 ⇒ 一次写换来两次重排，必有一帧黑。但那时已经黑了，无所谓。
+///   · 预防时（图层还在）**绝不能碰几何**（displayConfiguration / frame 一律不写）。
+///     但 0.12.0 的脚步到此为止 —— 它只写 idle/deact 两个状态量，**漏了 `setForeground:`**，
+///     于是 App 照样被挂起、图层照样掉光（归档(13) 两次会话都复现）。
 ///
-/// `keepAlivePreventHard=true` 时额外带上 `setLevel:1`（仍然不碰 displayConfiguration/frame），
-/// 用于万一"只清 deact"按不住时的 A/B。
-static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, BOOL verbose) {
+/// 【0.13.0 的两个原则】
+///   原则一：**必须包含 `setForeground:YES`** —— 它是 0.9.1 与 0.10.0+ 之间唯一有效的差别。
+///   原则二：**只写差量**。先把"能读到的当前值"全读出来（`idleModeEnabled` /
+///     `deactivationReasons` / `level` / `FBScene.foreground`），只把**真的不一样**的那几项发出去；
+///     如果一项差量都没有，**连 `updateSettingsWithBlock:` 都不调**（零写入 = 零重排 = 零闪）。
+///     这就是"既不掉图层、又不闪"的唯一出路：
+///       0.9.1        = 预防 + 每拍全量写（不掉图层，但每次都闪）
+///       0.10.0/0.11  = 不预防 + 全量写（不闪，但图层掉光 = 永久黑）
+///       0.12.0       = 预防 + 只写 idle/deact（不闪，但按不住，照样黑）
+///       0.13.0       = **预防 + 差量写（含 setForeground:）** ⇒ 一次事件只写一次
+///
+/// `keepAlivePreventHard=true` 时再叠加 `setDisplayConfiguration:` + `setFrame:`
+/// （即"0.9.1 的完整版"，会闪但最猛），用于万一差量写仍按不住时的 A/B 逃生门。
+static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth h, BOOL verbose) {
     if (scene == nil) return @"scene=nil";
 
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
@@ -914,14 +1042,43 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, BOOL ver
         return @"no-updateSettingsWithBlock";
     }
 
+    // ---------- 1) 先算差量（纯读，不写）----------
+    // `foreground`：settings 上没有 getter，只能问 FBScene（KVC）。读不到就不写这一项 ——
+    //   否则就是"每拍写一次 = 每拍闪一次"（0.9.1 的老毛病）。
+    BOOL doFg = MFConfigBool(cfg, @"keepAlivePreventForeground", YES) &&
+                gMFFgUsable && h.hasSceneFg && !h.sceneFg;
+
+    BOOL doIdle  = MFConfigBool(cfg, @"keepAlivePreventIdle",  YES) && h.hasIdle  && h.idle;
+    BOOL doDeact = MFConfigBool(cfg, @"keepAlivePreventDeact", YES) && h.hasDeact && h.deact != 0;
+
+    // level：0.9.1 每拍都发；这里只在"真的不是 1.0"时发一次。
+    BOOL wantLevel = MFConfigBool(cfg, @"keepAlivePreventLevel", YES);
+    BOOL doLevel = wantLevel && h.hasLvlVal && fabs(h.lvlVal - 1.0) > 0.001;
+
     BOOL hard = MFConfigBool(cfg, @"keepAlivePreventHard", NO);
 
+    if (!doFg && !doIdle && !doDeact && !doLevel && !hard) {
+        // 关键：一个差量都没有 ⇒ **一个字都不写**。这是"不闪"的来源。
+        return @"无差量（未调用 updateSettingsWithBlock:）";
+    }
+
+    id dcSrc = nil;
+    CGSize want = gMFDesiredContentSize;
+    BOOL wantFrame = hard && gMFDesiredContentValid && want.width > 1.0 && want.height > 1.0;
+    if (hard) dcSrc = MFMsg([UIScreen mainScreen], NSSelectorFromString(@"displayConfiguration"));
+
+    // ---------- 2) 只把差量写进去 ----------
     void (^blk)(id) = ^(id st) {
         if (st == nil) return;
-        MFMvBool(st, @"setIdleModeEnabled:", NO);
-        MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
-        if (hard) MFMvDouble(st, @"setLevel:", 1.0);
-        // 刻意不写：setDisplayConfiguration: / setFrame:
+        if (doFg)    MFMvBool(st, @"setForeground:", YES);
+        if (doIdle)  MFMvBool(st, @"setIdleModeEnabled:", NO);
+        if (doDeact) MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
+        if (doLevel) MFMvDouble(st, @"setLevel:", 1.0);
+        if (hard) {
+            if (dcSrc != nil) MFMvObj(st, @"setDisplayConfiguration:", dcSrc);
+            // frame 一律最后设（setDisplayConfiguration: 会把它打回整屏）
+            if (wantFrame) MFMvRect(st, @"setFrame:", CGRectMake(0, 0, want.width, want.height));
+        }
     };
 
     @try {
@@ -931,11 +1088,36 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, BOOL ver
         return @"exception";
     }
 
-    NSString *summary = [NSString stringWithFormat:@"预防(idle+deact%@)", hard ? @"+level" : @""];
+    NSString *summary = [NSString stringWithFormat:@"预防差量(fg=%d idle=%d deact=%d level=%d%@)",
+                         (int)doFg, (int)doIdle, (int)doDeact, (int)doLevel,
+                         hard ? @" +几何(逃生门)" : @""];
+
+    // ---------- 3) 写完**立刻验证** setForeground: 到底管不管用 ----------
+    // 这是 0.13.0 最该看的一行：如果写完 `FBScene.foreground` 仍然是 0，
+    // 说明这个 setter 在本机是空的 ⇒ 连写 3 次还不行就**停止再试**
+    // （否则每拍写一次 = 每拍闪一次，而我们只是白闪）。
+    if (doFg) {
+        BOOL hasAfter = NO;
+        BOOL fgAfter = MFForegroundOf(scene, &hasAfter);
+        if (hasAfter && fgAfter) {
+            gMFFgFailStreak = 0;
+            if (verbose) MFLogS(@"[keepalive] ✔ setForeground:YES 生效（FGScene.foreground 0 -> 1）");
+        } else {
+            gMFFgFailStreak += 1;
+            MFLog(@"[keepalive] ✘ setForeground:YES 写完读回仍然是 0（第 %ld 次）—— 这个 setter 可能是空转",
+                  (long)gMFFgFailStreak);
+            if (gMFFgFailStreak >= 3) {
+                gMFFgUsable = NO;
+                MFLogS(@"[keepalive] ★ setForeground: 连续 3 次无效 -> 停止再写它（避免每拍写一次 = 每拍闪一次）");
+            }
+        }
+    }
+
     if (verbose) {
         MFHealth a = MFReadHealth(scene);
-        MFLog(@"[pres] 已写 settings（%@）-> cs=%ld layers=%ld deact=%llu idle=%d",
-              summary, (long)a.cs, (long)a.layers, a.deact, (int)a.idle);
+        MFLog(@"[pres] 已写 settings（%@）-> cs=%ld layers=%ld deact=%llu idle=%d fgS=%@(%d)",
+              summary, (long)a.cs, (long)a.layers, a.deact, (int)a.idle,
+              a.hasSceneFg ? @"y" : @"n", (int)a.sceneFg);
     }
     return summary;
 }
@@ -1542,7 +1724,10 @@ static void MFKeepAliveTick(void) {
         return;
     }
 
-    // ---------------- 预防：图层还在，但正在被去激活（0.12.0 核心）----------------
+    // ---------------- 预防：图层还在，但正在被去激活 / 正在失去前台身份 ----------------
+    // 【0.12.0 引入 / 0.13.0 修好】这是唯一能"既不掉图层、又不闪"的时机：
+    //   归档(13) 实测 `deact 0->32`（画面还好）之后约 1 秒才 `layers 2->0`；
+    //   而 App 被挂起（`taskState: Suspended`）之后，写什么都没用。
     if (kind == MFDropPrevent) {
         gMFKeepAliveAdvisoryTicks = 0;
         gMFKeepAlivePreventTicks += 1;
@@ -1556,7 +1741,18 @@ static void MFKeepAliveTick(void) {
 
         // 限流：预防写的目的是"在图层掉光之前把它按住"，不需要每拍都写
         // （排掉 0.9.1 那种"每拍一次 = 每秒闪 5 次"的代价）。
+        // 【0.13.0】再加一层**退避**：如果连续很多拍都在预防档（说明按不住，或者
+        // 系统就是要它后台），就把间隔翻倍到上限为止 —— 只是变慢，**永不停止**
+        // （0.10.0 在这里做成"放弃"是错的，那等于主动选择永久黑屏）。
         NSInteger preventMs = MFConfigInt(cfg, @"keepAlivePreventMs", 250);
+        NSInteger pbAfter   = MFConfigInt(cfg, @"keepAlivePreventBackoffAfter", 40);
+        if (pbAfter > 0 && gMFKeepAlivePreventTicks > pbAfter) {
+            NSInteger steps = (gMFKeepAlivePreventTicks - pbAfter) / 20;
+            if (steps > 5) steps = 5;
+            preventMs = preventMs * (NSInteger)(1 << steps);
+            NSInteger capMs = MFConfigInt(cfg, @"keepAlivePreventBackoffMaxMs", 2000);
+            if (capMs > 0 && preventMs > capMs) preventMs = capMs;
+        }
         if (gMFKeepAliveLastPreventTime > 0 &&
             (now - gMFKeepAliveLastPreventTime) * 1000.0 < (double)preventMs) {
             return;
@@ -1564,16 +1760,17 @@ static void MFKeepAliveTick(void) {
 
         BOOL verbose = (gMFKeepAlivePreventTicks == 1) || (gMFKeepAlivePreventTicks % 20 == 0);
         if (verbose) {
-            MFLog(@"[keepalive] 预防性拉回（第 %ld 拍：deact=%llu idle=%d cs=%ld layers=%ld hosted=%ld）"
-                  @"—— 图层还在，趁它没掉先按住",
+            MFLog(@"[keepalive] 预防性拉回（第 %ld 拍：deact=%llu idle=%d cs=%ld layers=%ld "
+                  @"hosted=%ld fgS=%@(%d)）—— 图层还在，趁它没掉先按住",
                   (long)gMFKeepAlivePreventTicks, h.deact, (int)h.idle,
-                  (long)h.cs, (long)h.layers, (long)hosted);
+                  (long)h.cs, (long)h.layers, (long)hosted,
+                  h.hasSceneFg ? @"y" : @"n", (int)h.sceneFg);
         }
-        NSString *pdid = MFWritePreventiveSettings(scene, cfg, verbose);
+        NSString *pdid = MFWritePreventiveSettings(scene, cfg, h, verbose);
         gMFKeepAliveLastPreventTime = now;
-        gMFKeepAlivePreventWrites += 1;
+        if (![pdid hasPrefix:@"无差量"]) gMFKeepAlivePreventWrites += 1;
         if (verbose) {
-            MFLog(@"[keepalive] 预防写[%@] 完成（本次累计 %ld 次）", pdid, (long)gMFKeepAlivePreventWrites);
+            MFLog(@"[keepalive] 预防写[%@]（本次累计真写 %ld 次）", pdid, (long)gMFKeepAlivePreventWrites);
         }
         gMFKeepAliveLastSig = [MFKeepAliveSignature(scene, gMFPresenter) copy];
         return;
@@ -1725,6 +1922,10 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveStartTime = [NSDate timeIntervalSinceReferenceDate];
     gMFKeepAliveLastWriteTime = 0;
 
+    // 【0.13.0】每次重新承载都重新给 setForeground: 一次机会（上一次可能只是没给够时间）。
+    gMFFgUsable = YES;
+    gMFFgFailStreak = 0;
+
     NSTimer *t = [NSTimer timerWithTimeInterval:(ms / 1000.0)
                                         repeats:YES
                                           block:^(NSTimer *timer) { MFKeepAliveTick(); }];
@@ -1732,11 +1933,13 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveTimer = t;
 
     MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 预防档=%d @ %ld ms"
-          @"（趁图层没掉，只写 idle+deact，**不碰几何**）/ 真黑全量写=%d / "
-          @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
+          @"（差量写：只发真变化的项，含 setForeground:，**不碰几何**）/ "
+          @"预防退避=%ld 拍后至 %ld ms / 真黑全量写=%d / 宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
           ms, bundleID ?: @"?",
           (int)MFConfigBool(cfg, @"keepAlivePrevent", YES),
           (long)MFConfigInt(cfg, @"keepAlivePreventMs", 250),
+          (long)MFConfigInt(cfg, @"keepAlivePreventBackoffAfter", 40),
+          (long)MFConfigInt(cfg, @"keepAlivePreventBackoffMaxMs", 2000),
           (int)MFConfigBool(cfg, @"keepAliveHardWrite", YES),
           (long)MFConfigInt(cfg, @"keepAliveGraceMs", 600),
           (long)MFConfigInt(cfg, @"keepAliveMinWriteMs", 300),
@@ -1746,13 +1949,22 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     // 不确认存在性就下结论，会让人连着几轮对着一个不存在的 getter 调试。
     MFHealth h0 = MFReadHealth(scene);
     MFLog(@"[keepalive] 初始状态 %@", MFKeepAliveSignature(scene, gMFPresenter));
-    MFLog(@"[keepalive] 属性存在性: foreground=%@ setLevel=%@ setFrame=%@ idleModeEnabled=%@ deactivationReasons=%@ contentState=%@",
+    // 【0.13.0】这一行过去**误导了两轮**：它问的是 `scene.settings`（不可变对象）的
+    // getter，所以 `foreground=NO` 让人以为"本机没有前台开关"。真相是 getter 没有、
+    // **setter 有**（`setForeground:` 在 settings 上 settings=YES），而且光看它有没有还不够 ——
+    // 还要看写完到底管不管用（见 MFWritePreventiveSettings 的读回验证）。
+    MFLog(@"[keepalive] 可读性: settings.foreground=%@ settings.idleModeEnabled=%@ "
+          @"settings.deactivationReasons=%@ settings.level=%@ FBScene.foreground=%@ "
+          @"scene.contentState=%@ | 可写性: setForeground=%@ setLevel=%@ setFrame=%@",
           h0.hasFg ? @"YES" : @"NO",
-          h0.hasLevel ? @"YES" : @"NO",
-          h0.hasFrame ? @"YES" : @"NO",
           h0.hasIdle ? @"YES" : @"NO",
           h0.hasDeact ? @"YES" : @"NO",
-          h0.hasCs ? @"YES" : @"NO");
+          h0.hasLvlVal ? @"YES" : @"NO",
+          h0.hasSceneFg ? @"YES" : @"NO",
+          h0.hasCs ? @"YES" : @"NO",
+          [MFMsg(scene, NSSelectorFromString(@"settings")) respondsToSelector:NSSelectorFromString(@"setForeground:")] ? @"YES" : @"NO",
+          h0.hasLevel ? @"YES" : @"NO",
+          h0.hasFrame ? @"YES" : @"NO");
     MFLog(@"[keepalive] 尺寸真源: %@（来自 panel.contentArea.bounds，不再读 presentationView.bounds）",
           gMFDesiredContentValid
             ? [NSString stringWithFormat:@"%.0fx%.0f",
@@ -1988,7 +2200,18 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
     // ---- 0.7.0 新增：真正决定"黑不黑"的那几个取值 ----
     [s appendFormat:@"\n==== scene.settings 关键值 ====\n"];
     id st = MFMsg(scene, NSSelectorFromString(@"settings"));
-    [s appendFormat:@"  foreground           = %@\n", MFKV(st, @"foreground")];
+    [s appendFormat:@"  settings 类           = %@（注意：这是**不可变**对象，缺 setter 不代表写不进去）\n",
+     st ? NSStringFromClass([st class]) : @"nil"];
+    {
+        [s appendFormat:@"  foreground           = %@（getter 本身在不在：%d）\n",
+         MFKV(st, @"foreground"),
+         (int)[st respondsToSelector:NSSelectorFromString(@"foreground")]];
+        // 【0.13.0】这是 0.9.x 读错的那个值 —— 它要去 FBScene 上读（KVC）。
+        BOOL hFs = NO;
+        BOOL fs = MFForegroundOf(scene, &hFs);
+        [s appendFormat:@"  ★ FBScene.foreground = %@(%d)  ← 【0.13.0】这才是「App 还算不算前台」的真值\n",
+         hFs ? @"y" : @"n", (int)fs];
+    }
     [s appendFormat:@"  level                = %@\n", MFKV(st, @"level")];
     [s appendFormat:@"  frame                = %@\n", MFKV(st, @"frame")];
     [s appendFormat:@"  interfaceOrientation = %@\n", MFKV(st, @"interfaceOrientation")];
@@ -2043,10 +2266,17 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
      gMFOwnSceneIdentity ?: @"nil"];
 
     // ---- 0.9.1 新增：这些属性/设置器到底"存不存在" ----
-    // 归档(9) 的教训：`fg` 恒 0 被我们当成"被 SpringBoard 改回来了"，足足追了两轮，
-    // 真相是这个 getter/setter 在本机根本不存在（responds 守卫静默跳过）。
-    // 所以这里把判定所依赖的每一个属性与设置器，在 settings 与 scene 两侧都问一遍。
-    [s appendFormat:@"\n==== 属性/设置器存在性矩阵（YES=本机有；settings=在 settings 对象上，scene=在 FBScene 上）====\n"];
+    // 归档(9) 的教训：`fg` 恒 0 被我们当成"被 SpringBoard 改回来了"，足足追了两轮。
+    //
+    // 【0.13.0 严重提醒】这张表探的是 `scene.settings` —— 一个**不可变**对象。
+    // 所以 `setIdleModeEnabled:` / `setDeactivationReasons:` 在这里报 `-`，
+    // 而它们在 `UIMutableApplicationSceneSettings`（也就是 `updateSettingsWithBlock:`
+    // 的 block 参数，**我们真正写入的那个对象**）上明明存在（见类 dump）。
+    // 归档(13) 就是被这张表的 `foreground=-` 误导过：`foreground` 这个 **getter**
+    // 确实不在 settings 上，但 `setForeground:` 这个 **setter** 在（下面这行就是证据）。
+    // ⇒ 结论：**这张表只用于"读得到什么"，判断"写不写得进去"必须问 block 参数**
+    //   （运行时一次性打的 `★ 可变 settings … setter 实况` 那一行才是答案）。
+    [s appendFormat:@"\n==== 属性/设置器存在性矩阵（YES=本机有；settings=在【不可变】settings 对象上，scene=在 FBScene 上）====\n"];
     id stx = MFMsg(scene, NSSelectorFromString(@"settings"));
     const char *ssels[] = {
         "foreground", "setForeground:", "level", "setLevel:", "frame", "setFrame:",

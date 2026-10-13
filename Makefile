@@ -6,10 +6,40 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
-# 0.12.0 变更（修 0.10.0 / 0.11.0 的回归：切 App / 回桌面立刻黑屏）：
-#   - 用户原话（归档(12)）："v0.10.0 和 v0.11.0 存在问题，v0.9.1 版本好像是正常的，
-#     虽然屏幕会闪一下，但是切换应用时悬浮窗不会黑屏。"
-#     这是本轮最硬的一条数据 —— 它把"哪一版的行为才算对"直接钉死了。
+# 0.13.0 变更（修 0.10.0~0.12.0 的回归：切 App / 回桌面悬浮窗黑屏）：
+#   - 用户原话（归档(13)）："切换应用时悬浮窗依旧黑屏。"（0.12.0 装上去之后）
+#   - 归档(13) 日志 + 能力报告把根因钉死在**一个开关**上：
+#       · 日志（Safari 轮，pid 21860）：`deact 0->32`（此刻 cs=2 layers=2 hosted=2，画面还好）
+#         → 我们的"预防写"确实发出去了 → **同一秒** `cs 2->0`，下一拍 `layers 2->0`，此后永不恢复；
+#       · 能力报告（最后挂载时写的）：
+#         `scene.settings.foreground = 1`，但
+#         `目标 App processState = taskState: Suspended; visibility: Background`
+#         ⇒ **App 进程被挂起了**。被挂起的进程不可能出图，写多少 settings 都没用
+#           （这就是"81 次全量写、layers 恒为 0"的原因）。
+#   - 把 0.9.1 与 0.10.0+ 的写操作逐项对齐，只剩**一项**差别：
+#       · 0.9.1：`hardDown` ⇒ `forceAll=YES` ⇒ `doFg = forceAll || … = **YES**`
+#         ⇒ 每一拍都发 `setForeground:YES`；
+#       · 0.10.0 起：`doFg = p0 || MFConfigBool(cfg, @"keepAliveForeground", NO)`，
+#         而这一项默认 NO，依据是 0.9.x 留下的一句注释（"本机没有 foreground / setForeground:，
+#         responds 守卫静默跳过"）⇒ **除了承载前的 P0，再没发过它**。
+#   - 那句注释**是错的，错在问错了对象**：它只问了 `FBScene` 的 respondsToSelector（=NO）。
+#     归档(13) 的存在性矩阵问的是 settings 对象，结果是
+#       `foreground (getter) = -`、**`setForeground: (setter) = YES`**
+#     —— 它是个"只写"的前台开关，正是 0.9.1 用来让 App 不被挂起的那一项。
+#   - 0.13.0 的三条改法：
+#     ① `keepAliveForeground` 默认 **true**（并把真黑/预防两条写路径都带上 setForeground:YES）；
+#     ② 判据加入 `FBScene.foreground == 0`（KVC 读得到时才算）——"App 要进后台"的直接信号；
+#     ③ 预防档改成**差量写**：先把能读到的当前值全读出来，只发**真的不一样**的那几项；
+#        一项差量都没有就**连 updateSettingsWithBlock: 都不调**（零写入 = 零重排 = 零闪）。
+#        再加"回读验证 + 连败 3 次停手"，防止 setForeground: 万一无效时变成"每拍写一次 = 每拍闪一次"。
+#   - 三条写路径的定位（这一版的核心）：
+#       0.9.1        = 预防 + 每拍全量写（不掉图层，但每次都闪）
+#       0.10.0/0.11  = 不预防 + 全量写（不闪，但图层掉光 = 永久黑）
+#       0.12.0       = 预防 + 只写 idle/deact（不闪，但按不住，照样黑）
+#       0.13.0       = **预防 + 差量写（含 setForeground:）** ⇒ 一次事件只写一次
+#   - 另加：预防档也做退避（连续 40 拍后间隔翻倍至 2 s 上限，**永不放弃**）；
+#     能力报告新增 `FBScene.foreground` 与"可变 settings 上的 setter 实况"两行证据。
+#   - 0.12.0 变更（历史，加回预防档）：
 #   - 归档(12) 日志的因果链（两轮都复现）：
 #       Filza 轮：挂载时就带着 deact=33，1 秒后 layers 2 -> 0，此后写了十几次全灭；
 #       Safari 轮：按 Home 后 deact 变 32（此刻 cs=2 layers=2 hosted=2，画面还是好的），
