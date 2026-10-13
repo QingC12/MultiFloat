@@ -6,7 +6,24 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
-# 0.9.1 变更：
+# 0.10.0 变更：
+#   - 0.9.1 真机（归档(10)）：不再黑屏，但**切换 App 时仍会闪一下**，而且
+#     —— 这是整轮的钥匙 —— **把 keepAliveMs 调到 100 / 50 后，闪烁反而更快**。
+#     若黑是 SpringBoard 造成的，调小周期只会让黑窗更短，绝不会更频繁；
+#     频率跟着我们的周期走 => **那一帧黑是我们自己写的**。日志逐条吻合（同 pid 20257）：
+#       · deact=32/33/8/1 出现 20+ 次，绝大多数与 layers=2 hosted=2 同时成立（画面是好的）
+#       · cs=0 出现 11 次，其中 8 次 layers/hosted 完好（cs 只是 settings 提交途中的瞬时值）
+#       · layers=0（真黑）只出现 4 次，**4 次全在我们写完 settings 之后 0~2 秒内**
+#     机制：updateSettingsWithBlock:（尤其 setDisplayConfiguration:）让 SpringBoard 重算整份 settings、
+#     App 的 scene 重新提交（contentState 2->0->1->2、图层重建）= 屏幕上闪一下。
+#     0.9.1 的判据 `deact!=0` 在真机上几乎一直成立 => 每拍写一次 => 闪的频率 = 1 / keepAliveMs。
+#   - 修法：① 判据收紧成**唯一一条**：layers<=0 || presenter 宿主 hosted<=0；
+#     ② 写操作分档：默认只写 idle+deact(+frame)，setLevel/setDisplayConfiguration 降级为默认关闭的升级写；
+#     ③ 三重刹车：挂载宽限期 / 两次写入最小间隔 / 连续 N 拍救不回来就停止写入；
+#     ④ scene.frame 真源改成 panel.contentArea.bounds（0.9.x 读 presentationView.bounds，
+#        而它在 hosting 掉线时会被系统改成整屏 430x932 => 正反馈闭环 + 比例崩）；
+#     ⑤ 修 %s 打中文的乱码、修 ps= 的 32 位 ABI 假值。
+#   - 0.9.1 变更（历史）：
 #   - 0.9.0 真机（归档(9)）：**不再黑屏了，但切换 App 时会闪一下**。
 #     日志给出精确时序（同一 pid 19856、同一轮承载，每行前缀是 Unix 秒）：
 #       +8488  状态变化 -> deact=33                        ← 去激活原因出现（此刻画面还在！）

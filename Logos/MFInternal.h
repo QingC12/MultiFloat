@@ -72,6 +72,36 @@
 //        0.9.1 把 keepAliveMs 从 1000 降到 200。
 //      还有一条：判断"黑不黑"的分水岭是 `layerManager.layers` / `hostedLayers` 是否为 0
 //        与 `contentState` 是否 != 2，**不是** presenter 的 isHosting（它全程等于 1）。
+//
+//  12. 【0.10.0 新增 · 第五次踩同一个坑的升级版：**先怀疑自己的判据，再怀疑系统**】
+//      归档(10) 真机：0.9.1 之后"切 App 不再黑屏，但会闪一下"；
+//      **用户把 keepAliveMs 调到 100 / 50 后，闪烁反而更快。**
+//      这一句就是整轮的钥匙：如果那帧黑是 SpringBoard 造成的，调小周期只会让黑窗更短，
+//      绝不会让它更频繁；频率跟着我们的周期走 ⇒ 是我们自己在制造它。日志逐条比对完全吻合：
+//        · deact=32/33/8/1 出现 20+ 次，其中**绝大多数与 layers=2 hosted=2 同时成立**（画面是好的）
+//        · cs=0 出现 11 次，其中 8 次 layers/hosted 完好（cs 只是 settings 提交途中的瞬时值）
+//        · layers=0（真黑）只出现 4 次 —— **4 次全部在我们写完 settings 之后 0~2 秒内**
+//      ⇒ `updateSettingsWithBlock:`（尤其 setDisplayConfiguration:）会让 SpringBoard 重算整份
+//        settings、让 App 的 scene 重新提交：contentState 2→0→1→2、图层重建一遍 = "闪一下"。
+//        0.9.1 的判据 `deact!=0` 在真机上几乎一直成立 ⇒ 每拍写一次 ⇒ 闪的频率 = 1 / keepAliveMs。
+//      ⇒ 规则一：**判据只能建立在"直接表征症状"的物理量上。**
+//        黑屏的直接表征是 `layers<=0` / `hosted<=0`（那块表面上没有图层）；
+//        deact / contentState / idle 都是"间接指标"，拿它们当判据会大量误报。
+//      ⇒ 规则二：**写操作本身有副作用，而且常常比问题更大。**
+//        每次写 settings 都是一次重排；所以必须分档（最小写 / 升级写）、限流、有宽限期、
+//        有"连续 N 拍救不回来就放弃"的刹车 —— 否则修 bug 的手段就是新 bug 的来源。
+//      ⇒ 规则三：**帧循环（守护/轮询）的周期，会成为用户感知的故障频率。**
+//        任何"周期性动作"上线前都要问一句：如果这个动作本身有副作用，调快它会怎样？
+//
+//  附：0.9.x 关于判据的两条旧结论**已被归档(10) 推翻**，不要再引用：
+//        · "`contentState != 2` 算掉出" —— cs=0 有 8/11 次 layers/hosted 完好，画面是好的；
+//        · "`deactivationReasons != 0` 算掉出" —— 它只是 SpringBoard 的常规标记，不是黑屏。
+//      另外两条作为纯事实保留（不是判据）：
+//        · `UIMutableApplicationSceneSettings` 上**没有** foreground / setForeground:；
+//        · `setDisplayConfiguration:` 会把 settings.frame 打回整屏（写入后必须重设 frame）。
+//      还有：`processState`、`taskState`、`visibility` 都是 32 位 int ——
+//        用 64 位 NSInteger 去接会读到未初始化高位（0.9.1 打出了 ps=10751930112）。
+//        读这类属性一律用 MFIntProp32 那种"把返回类型写成 int"的封装。
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H
 

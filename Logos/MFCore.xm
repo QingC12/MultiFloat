@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.9.1";
+    return @"0.10.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -98,21 +98,34 @@ NSDictionary *MFLoadConfig(void) {
 //                              必然拉伸变形 —— 这就是归档(7)「route 3 出画面但比例不对」的根因。
 //    allowRouteB    = false —— presenter 失败时是否退回 SBDeviceApplicationSceneViewController。
 //                              它是已被两次真机验证的**纯黑**宿主，挂着只会把失败伪装成成功。
-//    keepAlive      = true  ——【0.9.0 新增】承载成功后开一个守护定时器，反复把目标 scene 拉回
-//                              "可渲染"（foreground=YES / idle=NO / deactivationReasons=0 / 几何同步）。
-//                              归档(8) 的根因就是"P0 只设了一次，用户一换前台 App 就被 SB 改回去"。
-//    keepAliveMs    = 200   ——【0.9.1 改：1000 -> 200】守护周期（毫秒），会被夹在 50..5000。
-//                              归档(9) 实测"闪屏时长 ≈ 一个守护周期"，所以这个数字直接决定闪多久。
-//    keepAliveForeground = false ——【0.9.1 改：true -> false】
-//                              归档(9) 日志里 fg 全程恒 0 —— 真相是 settings 上**根本没有**
-//                              setForeground: / foreground（responds 守卫静默跳过），
-//                              0.9.0 的判定 `(!fg && fixFg)` 因此恒为真、每秒空拉一次。
-//                              它现在只作为日志字段（不再参与判定）；开关留着以防别的机型上真有。
-//    keepAliveIdle  = true  ——守护时是否清 idleModeEnabled=NO。
-//    keepAliveDeact = true  ——【0.9.1 新增】守护时是否清 deactivationReasons=0。
-//                              归档(9) 每次切 App 都出现 deact=32/33，且**比掉出早约 1 秒** ——
-//                              这是一次干净的预警；单独开关是为了能一轮试出"最少要保哪几项"。
-//    keepAliveLevel = true  ——【0.9.1 新增】守护时是否重设 setLevel:1 + displayConfiguration。
+//    keepAlive      = true  ——承载成功后开守护定时器，盯着目标 scene 的"图层还在不在"。
+//    keepAliveMs    = 200   ——守护周期（毫秒），夹在 50..5000。
+//                              【0.10.0 澄清】它**不再决定闪多久**：归档(10) 证明"闪"是我们自己
+//                              写 settings 造成的，而 0.10.0 起只在"真的一个图层都没有"时才写，
+//                              所以这个周期现在只影响"发现真掉出的延迟"，调小不再让闪更频繁。
+//    keepAliveSoft  = false ——【0.10.0 新增】是否把 deact!=0 / idle=1 也当成"要动手"。
+//                              **默认 false，这是 0.10.0 修掉闪屏的关键。** 归档(10) 日志里
+//                              deact=32/33 出现 20+ 次而其中绝大多数 layers/hosted 完好（画面是好的），
+//                              0.9.1 拿它当判据 → 每拍都写 settings → 每写一次就闪一次。
+//                              打开它只用于 A/B 对照。
+//    keepAliveForeground = false ——本机（iOS 17.3.1）settings 上**根本没有**
+//                              setForeground: / foreground（responds 守卫静默跳过）。
+//                              它现在只作为日志字段；开关留着以防别的机型上真有。
+//    keepAliveIdle  = true  ——真掉出时是否清 idleModeEnabled=NO。
+//    keepAliveDeact = true  ——真掉出时是否清 deactivationReasons=0。
+//    keepAliveLevel = false ——【0.10.0 改：true -> false】是否允许"升级写"
+//                              （额外重设 setLevel:1 + displayConfiguration）。
+//                              它们会让 SpringBoard 重算整份 settings，且 setDisplayConfiguration:
+//                              会把 frame 打回整屏 430x932（归档(10) 反复实测）——越救越糟。
+//                              默认关；打开后只在"真掉出连续 keepAliveEscalateAfter 拍没救回来"时用。
+//    keepAliveEscalateAfter = 5    ——【0.10.0 新增】连续几拍没救回来才允许升级写。
+//    keepAliveMinWriteMs    = 300  ——【0.10.0 新增】两次写 settings 的最小间隔（限流）。
+//    keepAliveGraceMs       = 1500 ——【0.10.0 新增】挂载宽限期：presenter 建 hosting 是异步的，
+//                                     刚挂上时"没有图层"很正常，这段时间只观察不写。
+//    keepAliveGiveUpAfter   = 30   ——【0.10.0 新增】连续 N 拍都救不回来就**停止写入**，
+//                                     避免无休止重排（= 无休止闪屏）。
+//    keepAliveFrameSync     = true ——【0.10.0 新增】是否在守护里纠正 scene.frame
+//                                     （只在真的漂了时写，且每秒最多查一次）。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
@@ -146,17 +159,28 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   闪屏时长 ≈ 一个守护周期（归档(9) 实测），砍到 1/5
         @"keepAliveForeground" : @NO,                  // 【0.9.1 改】默认 YES -> NO：
                                                        //   本机没有 setForeground:，这一项一直是空转
-        @"keepAliveIdle"   : @YES,                     // 守护时是否清 idleModeEnabled
-        @"keepAliveDeact"  : @YES,                     // 【0.9.1 新增】单独控制 deactivationReasons=0
-        @"keepAliveLevel"  : @YES,                     // 【0.9.1 新增】单独控制 setLevel:1 + displayConfiguration
+        @"keepAliveIdle"   : @YES,                     // 真掉出时清 idleModeEnabled
+        @"keepAliveDeact"  : @YES,                     // 真掉出时清 deactivationReasons=0
+        @"keepAliveLevel"  : @NO,                      // 【0.10.0 改】默认 YES -> NO：
+                                                       //   升级写（setLevel + displayConfiguration）会让
+                                                       //   SpringBoard 重算整份 settings，而且把 frame 打回
+                                                       //   整屏 430x932 => 一写换两次重排，纯亏。默认关。
+        @"keepAliveSoft"   : @NO,                      // 【0.10.0 新增】是否把 deact/idle 也当"要动手"。
+                                                       //   **默认 NO 是 0.10.0 修掉闪屏的关键**：归档(10) 里
+                                                       //   deact 波动 20+ 次而画面大多是好的，一动手就闪。
+        @"keepAliveMinWriteMs"    : @300,              // 【0.10.0 新增】两次写 settings 的最小间隔
+        @"keepAliveGraceMs"       : @1500,             // 【0.10.0 新增】挂载宽限期（只观察不写）
+        @"keepAliveEscalateAfter" : @5,                // 【0.10.0 新增】连续几拍没救回来才允许升级写
+        @"keepAliveGiveUpAfter"   : @30,               // 【0.10.0 新增】连续几拍就停止写入（避免无休止重排）
+        @"keepAliveFrameSync"     : @YES,              // 【0.10.0 新增】是否纠正漂掉的 scene.frame
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @10,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @11,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / keepAliveDeact=true）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / 只把「没有图层」当黑 / keepAliveSoft=false）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -178,8 +202,11 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"allowRouteB"] == nil ||
                         cfg[@"keepAlive"] == nil || cfg[@"keepAliveMs"] == nil ||
                         cfg[@"keepAliveIdle"] == nil || cfg[@"keepAliveForeground"] == nil ||
-                        cfg[@"keepAliveDeact"] == nil || cfg[@"keepAliveLevel"] == nil);
-    if (cur >= 10 && !missingKeys) return;
+                        cfg[@"keepAliveDeact"] == nil || cfg[@"keepAliveLevel"] == nil ||
+                        cfg[@"keepAliveSoft"] == nil || cfg[@"keepAliveMinWriteMs"] == nil ||
+                        cfg[@"keepAliveGraceMs"] == nil || cfg[@"keepAliveEscalateAfter"] == nil ||
+                        cfg[@"keepAliveGiveUpAfter"] == nil || cfg[@"keepAliveFrameSync"] == nil);
+    if (cur >= 11 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -200,7 +227,13 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @NO;  // 0.9.1 新默认
         if (up[@"keepAliveIdle"]   == nil) up[@"keepAliveIdle"]   = @YES;
         if (up[@"keepAliveDeact"]  == nil) up[@"keepAliveDeact"]  = @YES;
-        if (up[@"keepAliveLevel"]  == nil) up[@"keepAliveLevel"]  = @YES;
+        if (up[@"keepAliveLevel"]  == nil) up[@"keepAliveLevel"]  = @NO;   // 0.10.0 新默认
+        if (up[@"keepAliveSoft"]   == nil) up[@"keepAliveSoft"]   = @NO;   // 0.10.0 新默认（闪屏修复的关键）
+        if (up[@"keepAliveMinWriteMs"]    == nil) up[@"keepAliveMinWriteMs"]    = @300;
+        if (up[@"keepAliveGraceMs"]       == nil) up[@"keepAliveGraceMs"]       = @1500;
+        if (up[@"keepAliveEscalateAfter"] == nil) up[@"keepAliveEscalateAfter"] = @5;
+        if (up[@"keepAliveGiveUpAfter"]   == nil) up[@"keepAliveGiveUpAfter"]   = @30;
+        if (up[@"keepAliveFrameSync"]     == nil) up[@"keepAliveFrameSync"]     = @YES;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -261,10 +294,30 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @10;
         }
 
+        // ---- 0.10 -> 0.11：把"越救越闪"的那两项关掉 ----
+        // 归档(10) 真机证据（这条是整轮的决定性证据）：
+        //   用户把 keepAliveMs 调成 100 / 50 后，**闪烁反而更快**。
+        //   若黑是 SpringBoard 造成的，调小周期只会让黑窗更短，不会更频繁；
+        //   频率跟着我们的周期走 ⇒ 是我们自己的写操作在造那一帧黑。逐条比对日志也印证：
+        //     deact=32/33 出现 20+ 次、其中绝大多数 layers/hosted 完好；
+        //     layers=0（真黑）只出现 4 次，且 4 次全在我们写完 settings 之后 0~2 秒内。
+        if (cur < 11) {
+            if (MFConfigBool(up, @"keepAliveLevel", YES)) {
+                up[@"keepAliveLevel"] = @NO;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveLevel true -> false"
+                      @"（升级写会让 SpringBoard 重算整份 settings，且把 frame 打回整屏；一写换两次重排）");
+            }
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=11：新增 keepAliveSoft / keepAliveMinWriteMs / keepAliveGraceMs /"
+                  @" keepAliveEscalateAfter / keepAliveGiveUpAfter / keepAliveFrameSync"
+                  @"（默认 false / 300 / 1500 / 5 / 30 / true）");
+            MFLogS(@"[cfg]   0.10.0 起守护只在「一个图层都没有」时才写 settings；deact/idle 只记日志。");
+            up[@"cfgVersion"] = @11;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveForeground=%@ / keepAliveDeact=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveLevel=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
-             up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveForeground"], up[@"keepAliveDeact"]);
+             up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"], up[@"keepAliveLevel"]);
         return;
     }
 }
