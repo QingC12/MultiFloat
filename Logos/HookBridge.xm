@@ -12,7 +12,7 @@
 
 %ctor {
     @autoreleasepool {
-        MFLogRawC("=== MultiFloat 0.10.0 加载 ===\n");
+        MFLogRawC("=== MultiFloat 0.11.0 加载 ===\n");
 
         // 先把"上一轮崩在哪一步"读出来：这一步必须在任何 UI 之前，
         // 因为它要的结果会被浮窗的启动流程引用，而且它会把步骤日志轮转留档。

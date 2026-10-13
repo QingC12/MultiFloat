@@ -6,6 +6,37 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.11.0 变更（修 0.10.0 的回归）：
+#   - 0.10.0 真机（归档(11)）：**这一版不稳定，悬浮窗大概率黑屏** —— 比 0.9.1 还差。
+#     日志事实：承载成功后约 1 秒内 hostedLayers/layers 掉到 0，然后**再也没回来** ——
+#       [keepalive] 真掉出（第 1/10/20/.../220 拍：layers=0 hosted=0 ...）
+#     期间我们写了十几次 settings，**一次都没拉回来**（P6+3s / P6+20s 始终 layers=0）。
+#   - 根因（把 0.9.1 与 0.10.0 的拉回动作并排看，一眼就出来）：
+#       0.9.1 的 MFApplySceneFix 里有 doLevel => `setLevel:1` + `setDisplayConfiguration:`
+#       0.10.0 把它们当成"重排元凶"删掉了，真黑时只剩"最小写"（idle + deact + frame）
+#     ⇒ 判据是对的（只有 layers<=0 才算黑，这条保留），**但顺手把救命的那一笔删了**。
+#       这两项恰恰是让 render server 重新给 scene 建图层的开关 —— 少了它们，真黑救不回来。
+#     ⇒ 教训：减少副作用时，先确认"去掉的那一步不是必要条件"；
+#       同一个动作健康时是副作用、故障时可能是唯一解 —— 要**按状态分档**，不是一刀砍掉。
+#   - 第二处错误：0.10.0 的 keepAliveGiveUpAfter=30 ⇒ 真黑 6 秒后**永久停止重试**。
+#     真黑是"必须救"的状态，对它踩刹车 = 主动选择永久黑屏。改成**退避**（间隔翻倍、有上限），永不停止。
+#   - 第三处发现：**黑有两种，0.10.0 只认一种。**
+#     归档(11) 的 Filza 轮：scene 自己完全健康（contentState=2 layers=2），但
+#     presenter.isHosting=0、hostContainer=nil、presentationView 被改成整屏 430x932
+#     —— 这是**承载侧**掉了，写 scene settings 完全打不中，只会白送一次全量重排。
+#     ⇒ 现在先分类：layers>0 && hosted<=0 ⇒ 只修承载（re-activate + 视图放回内容区）；
+#       layers<=0 ⇒ 才去写 settings。
+#   - 修法汇总：
+#     ① 真黑一律**全量写**（keepAliveHardWrite，默认 true；设 false 可复现 0.10.0 的黑屏）；
+#     ② 用退避代替放弃（keepAliveGiveUpAfter 默认 0 = 永不放弃；新增 keepAliveBackoffAfter=50
+#        / keepAliveBackoffMaxMs=2000）；
+#     ③ 承载侧修复每拍可做（几乎零成本，不写 settings）；
+#     ④ 挂载时把两次 settings 写合并成一次（P0 之前先登记目标尺寸，frame 进同一个 block，
+#        并用"刚写过同一 frame"的备忘挡住随后的重复写）；
+#     ⑤ 宽限期 1500 -> 600 ms；写入日志不再被 verbose 门控（否则看不到真实的写入序列）；
+#     ⑥ cfgVersion 11 -> 12（只纠正"还停在旧默认值"的项）。
+#   - 判据本身**不动**：仍然只有 layers<=0 || hosted<=0 才算黑；deact/cs/idle 只记日志。
+#
 # 0.10.0 变更：
 #   - 0.9.1 真机（归档(10)）：不再黑屏，但**切换 App 时仍会闪一下**，而且
 #     —— 这是整轮的钥匙 —— **把 keepAliveMs 调到 100 / 50 后，闪烁反而更快**。
@@ -23,6 +54,7 @@
 #     ④ scene.frame 真源改成 panel.contentArea.bounds（0.9.x 读 presentationView.bounds，
 #        而它在 hosting 掉线时会被系统改成整屏 430x932 => 正反馈闭环 + 比例崩）；
 #     ⑤ 修 %s 打中文的乱码、修 ps= 的 32 位 ABI 假值。
+#     【0.11.0 复盘】②③ 就是这一版的两处回归：② 删掉了必要条件，③ 把刹车做成了放弃。
 #   - 0.9.1 变更（历史）：
 #   - 0.9.0 真机（归档(9)）：**不再黑屏了，但切换 App 时会闪一下**。
 #     日志给出精确时序（同一 pid 19856、同一轮承载，每行前缀是 Unix 秒）：

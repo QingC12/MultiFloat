@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.10.0";
+    return @"0.11.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -100,31 +100,43 @@ NSDictionary *MFLoadConfig(void) {
 //                              它是已被两次真机验证的**纯黑**宿主，挂着只会把失败伪装成成功。
 //    keepAlive      = true  ——承载成功后开守护定时器，盯着目标 scene 的"图层还在不在"。
 //    keepAliveMs    = 200   ——守护周期（毫秒），夹在 50..5000。
-//                              【0.10.0 澄清】它**不再决定闪多久**：归档(10) 证明"闪"是我们自己
-//                              写 settings 造成的，而 0.10.0 起只在"真的一个图层都没有"时才写，
-//                              所以这个周期现在只影响"发现真掉出的延迟"，调小不再让闪更频繁。
-//    keepAliveSoft  = false ——【0.10.0 新增】是否把 deact!=0 / idle=1 也当成"要动手"。
-//                              **默认 false，这是 0.10.0 修掉闪屏的关键。** 归档(10) 日志里
+//                              【0.11.0 澄清】它只决定"发现真黑要多久"和"重试有多密"：
+//                              归档(10) 里"闪的频率 = 1/keepAliveMs"是因为那时**健康时也每拍写**
+//                              （判据太宽），现在只有真的一个图层都没有时才写，所以调小它
+//                              不会让闪更频繁。反过来，真黑时调小它是**好事**（救得更快）。
+//    keepAliveSoft  = false ——是否把 deact!=0 / idle=1 也当成"要动手"。
+//                              **默认 false，这是 0.10.0 修掉闪屏的关键一档。** 归档(10) 日志里
 //                              deact=32/33 出现 20+ 次而其中绝大多数 layers/hosted 完好（画面是好的），
 //                              0.9.1 拿它当判据 → 每拍都写 settings → 每写一次就闪一次。
 //                              打开它只用于 A/B 对照。
 //    keepAliveForeground = false ——本机（iOS 17.3.1）settings 上**根本没有**
 //                              setForeground: / foreground（responds 守卫静默跳过）。
 //                              它现在只作为日志字段；开关留着以防别的机型上真有。
-//    keepAliveIdle  = true  ——真掉出时是否清 idleModeEnabled=NO。
-//    keepAliveDeact = true  ——真掉出时是否清 deactivationReasons=0。
-//    keepAliveLevel = false ——【0.10.0 改：true -> false】是否允许"升级写"
-//                              （额外重设 setLevel:1 + displayConfiguration）。
-//                              它们会让 SpringBoard 重算整份 settings，且 setDisplayConfiguration:
-//                              会把 frame 打回整屏 430x932（归档(10) 反复实测）——越救越糟。
-//                              默认关；打开后只在"真掉出连续 keepAliveEscalateAfter 拍没救回来"时用。
-//    keepAliveEscalateAfter = 5    ——【0.10.0 新增】连续几拍没救回来才允许升级写。
-//    keepAliveMinWriteMs    = 300  ——【0.10.0 新增】两次写 settings 的最小间隔（限流）。
-//    keepAliveGraceMs       = 1500 ——【0.10.0 新增】挂载宽限期：presenter 建 hosting 是异步的，
-//                                     刚挂上时"没有图层"很正常，这段时间只观察不写。
-//    keepAliveGiveUpAfter   = 30   ——【0.10.0 新增】连续 N 拍都救不回来就**停止写入**，
-//                                     避免无休止重排（= 无休止闪屏）。
-//    keepAliveFrameSync     = true ——【0.10.0 新增】是否在守护里纠正 scene.frame
+//    keepAliveIdle  = true  ——真黑时是否清 idleModeEnabled=NO。
+//    keepAliveDeact = true  ——真黑时是否清 deactivationReasons=0。
+//    keepAliveHardWrite = true ——【0.11.0 新增】真黑时是否走**全量写**
+//                              （idle + deact + setLevel:1 + setDisplayConfiguration: + frame）。
+//                              **必须默认 true。** 归档(11) 证明：0.10.0 的"最小写"（只有
+//                              idle + deact + frame）一次都拉不回来 —— layers=0 连续 220+ 拍、
+//                              其间写了十几次全灭。0.9.1 能拉回来，差别就是这两项。
+//                              设成 false 等于复现 0.10.0 的黑屏，仅用于对照实验。
+//    keepAliveLevel = false ——【0.11.0 澄清】它现在只管**软警告**那一档：
+//                              软警告要不要也动手、以及动手时要不要带 level。真黑不看它。
+//    keepAliveEscalateAfter = 5    ——（0.11.0 起仅供软警告档参考）
+//    keepAliveMinWriteMs    = 300  ——两次写 settings 的最小间隔（限流）。
+//    keepAliveGraceMs       = 600  ——【0.11.0 改 1500 -> 600】挂载宽限期：
+//                                     presenter 建 hosting 是异步的，刚挂上时"没有图层"很正常，
+//                                     这段时间只观察不写。真黑本来就该尽快救，600 ms 足够盖住
+//                                     "P0 的写 + presenter 挂载"这一个异步窗口。
+//    keepAliveBackoffAfter  = 50   ——【0.11.0 新增】连续多少拍没救回来之后开始**退避**
+//                                     （写入间隔按 20 拍一档翻倍，上限 keepAliveBackoffMaxMs）。
+//    keepAliveBackoffMaxMs  = 2000 ——【0.11.0 新增】退避的写入间隔上限。
+//    keepAliveGiveUpAfter   = 0    ——【0.11.0 改 30 -> 0】**0 = 永不放弃**。
+//                                     0.10.0 设成 30，结果真黑 6 秒后我们就再也不写了
+//                                     （归档(11)：日志一路刷到"第 220 拍"，画面始终没回来）。
+//                                     真黑是"必须救"的状态，放弃 = 永久黑屏。
+//                                     设成 >0 可以复现 0.10.0 的行为，仅用于对照实验。
+//    keepAliveFrameSync     = true ——是否在守护里纠正 scene.frame
 //                                     （只在真的漂了时写，且每秒最多查一次）。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
@@ -161,26 +173,29 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   本机没有 setForeground:，这一项一直是空转
         @"keepAliveIdle"   : @YES,                     // 真掉出时清 idleModeEnabled
         @"keepAliveDeact"  : @YES,                     // 真掉出时清 deactivationReasons=0
-        @"keepAliveLevel"  : @NO,                      // 【0.10.0 改】默认 YES -> NO：
-                                                       //   升级写（setLevel + displayConfiguration）会让
-                                                       //   SpringBoard 重算整份 settings，而且把 frame 打回
-                                                       //   整屏 430x932 => 一写换两次重排，纯亏。默认关。
+        @"keepAliveLevel"  : @NO,                       // 【0.11.0 澄清】现在只管"软警告要不要也动手"
         @"keepAliveSoft"   : @NO,                      // 【0.10.0 新增】是否把 deact/idle 也当"要动手"。
                                                        //   **默认 NO 是 0.10.0 修掉闪屏的关键**：归档(10) 里
                                                        //   deact 波动 20+ 次而画面大多是好的，一动手就闪。
+        @"keepAliveHardWrite"     : @YES,              // 【0.11.0 新增】真黑时全量写（idle+deact+level+dc+frame）。
+                                                       //   归档(11) 证明 0.10.0 的"最小写"一次都拉不回来。
+                                                       //   false = 复现 0.10.0 的黑屏，仅用于对照实验。
         @"keepAliveMinWriteMs"    : @300,              // 【0.10.0 新增】两次写 settings 的最小间隔
-        @"keepAliveGraceMs"       : @1500,             // 【0.10.0 新增】挂载宽限期（只观察不写）
-        @"keepAliveEscalateAfter" : @5,                // 【0.10.0 新增】连续几拍没救回来才允许升级写
-        @"keepAliveGiveUpAfter"   : @30,               // 【0.10.0 新增】连续几拍就停止写入（避免无休止重排）
+        @"keepAliveGraceMs"       : @600,              // 【0.11.0 改 1500 -> 600】挂载宽限期（只观察不写）
+        @"keepAliveEscalateAfter" : @5,                // 【0.10.0 新增】（0.11.0 起仅供软警告档参考）
+        @"keepAliveGiveUpAfter"   : @0,                // 【0.11.0 改 30 -> 0】**0 = 永不放弃**。
+                                                       //   真黑是"必须救"的状态，放弃 = 永久黑屏。
+        @"keepAliveBackoffAfter"  : @50,               // 【0.11.0 新增】连续多少拍没救回来开始退避
+        @"keepAliveBackoffMaxMs"  : @2000,             // 【0.11.0 新增】退避后的写入间隔上限
         @"keepAliveFrameSync"     : @YES,              // 【0.10.0 新增】是否纠正漂掉的 scene.frame
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @11,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @12,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / 只把「没有图层」当黑 / keepAliveSoft=false）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / 只把「没有图层」当黑 / keepAliveSoft=false / 真黑全量写=true）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -205,8 +220,10 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAliveDeact"] == nil || cfg[@"keepAliveLevel"] == nil ||
                         cfg[@"keepAliveSoft"] == nil || cfg[@"keepAliveMinWriteMs"] == nil ||
                         cfg[@"keepAliveGraceMs"] == nil || cfg[@"keepAliveEscalateAfter"] == nil ||
-                        cfg[@"keepAliveGiveUpAfter"] == nil || cfg[@"keepAliveFrameSync"] == nil);
-    if (cur >= 11 && !missingKeys) return;
+                        cfg[@"keepAliveGiveUpAfter"] == nil || cfg[@"keepAliveFrameSync"] == nil ||
+                        cfg[@"keepAliveHardWrite"] == nil || cfg[@"keepAliveBackoffAfter"] == nil ||
+                        cfg[@"keepAliveBackoffMaxMs"] == nil);
+    if (cur >= 12 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -229,10 +246,13 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAliveDeact"]  == nil) up[@"keepAliveDeact"]  = @YES;
         if (up[@"keepAliveLevel"]  == nil) up[@"keepAliveLevel"]  = @NO;   // 0.10.0 新默认
         if (up[@"keepAliveSoft"]   == nil) up[@"keepAliveSoft"]   = @NO;   // 0.10.0 新默认（闪屏修复的关键）
+        if (up[@"keepAliveHardWrite"]    == nil) up[@"keepAliveHardWrite"]    = @YES;  // 0.11.0 新默认
         if (up[@"keepAliveMinWriteMs"]    == nil) up[@"keepAliveMinWriteMs"]    = @300;
-        if (up[@"keepAliveGraceMs"]       == nil) up[@"keepAliveGraceMs"]       = @1500;
+        if (up[@"keepAliveGraceMs"]       == nil) up[@"keepAliveGraceMs"]       = @600;   // 0.11.0 新默认
         if (up[@"keepAliveEscalateAfter"] == nil) up[@"keepAliveEscalateAfter"] = @5;
-        if (up[@"keepAliveGiveUpAfter"]   == nil) up[@"keepAliveGiveUpAfter"]   = @30;
+        if (up[@"keepAliveGiveUpAfter"]   == nil) up[@"keepAliveGiveUpAfter"]   = @0;     // 0.11.0 新默认（永不放弃）
+        if (up[@"keepAliveBackoffAfter"]  == nil) up[@"keepAliveBackoffAfter"]  = @50;    // 0.11.0 新增
+        if (up[@"keepAliveBackoffMaxMs"]  == nil) up[@"keepAliveBackoffMaxMs"]  = @2000;  // 0.11.0 新增
         if (up[@"keepAliveFrameSync"]     == nil) up[@"keepAliveFrameSync"]     = @YES;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
@@ -314,10 +334,37 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @11;
         }
 
+        // ---- 0.11 -> 0.12：把 0.10.0 那个"救不回来还不许救"的错误配置纠正回来 ----
+        // 归档(11) 真机证据：0.10.0 装上去之后"悬浮窗大概率黑屏"。
+        //   ① 拉回动作被降级成"最小写"（丢掉 setLevel + setDisplayConfiguration）
+        //      ⇒ layers=0 连续 220+ 拍、其间写了十几次，**一次都没拉回来**；
+        //   ② keepAliveGiveUpAfter=30 ⇒ 6 秒后连试都不试了，永久黑屏；
+        //   ③ 还有一种黑根本没被识别：scene 好好的（layers=2）但 presenter 掉了 hosting。
+        // 所以这一版把默认值改回来：真黑全量写 / 永不放弃 / 宽限期 600 ms / 新增退避参数。
+        // 只改"还停在 0.10.0 旧默认值"的项，用户自己调过的原样尊重。
+        if (cur < 12) {
+            if (MFConfigInt(up, @"keepAliveGiveUpAfter", 30) == 30) {
+                up[@"keepAliveGiveUpAfter"] = @0;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveGiveUpAfter 30 -> 0（0 = 永不放弃）"
+                      @"—— 归档(11) 里就是它让真黑 6 秒后再也不重试，变成永久黑屏");
+            }
+            if (MFConfigInt(up, @"keepAliveGraceMs", 1500) == 1500) {
+                up[@"keepAliveGraceMs"] = @600;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveGraceMs 1500 -> 600（真黑本来就该尽快救）");
+            }
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=12：新增 keepAliveHardWrite / keepAliveBackoffAfter /"
+                  @" keepAliveBackoffMaxMs（默认 true / 50 / 2000）");
+            MFLogS(@"[cfg]   ★ 真黑时现在一律**全量写**（含 setLevel + setDisplayConfiguration）——"
+                  @"0.10.0 的"最小写"实测一次都拉不回来；要复现旧行为把 keepAliveHardWrite 设 false。");
+            MFLogS(@"[cfg]   ★ 0.11.0 还区分了两种黑：scene 没图层（写 settings）vs presenter 掉 hosting（只修承载）。");
+            up[@"cfgVersion"] = @12;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveLevel=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
-             up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"], up[@"keepAliveLevel"]);
+             up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
+             up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"]);
         return;
     }
 }

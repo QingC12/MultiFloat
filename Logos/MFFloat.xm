@@ -210,6 +210,22 @@ static id        gMFCurrentContentView  = nil;  // 本轮挂上去的承载视�
 static CGSize gMFDesiredContentSize = {0, 0};
 static BOOL   gMFDesiredContentValid = NO;
 
+// 【0.11.0 新增】承载视图"应该待在哪个内容区里"，以及 frame 写入备忘。
+//
+// 归档(11) 的 Filza 轮：P6+20s 时 scene 自己是好的（layers=2 contentState=2），
+// 但 presenter.isHosting=0、hostContainer=nil、presentationView 被系统改成整屏 430x932
+// —— 黑的不是 scene，是**承载**。这种情况写 scene settings 一点用都没有，只会白送一次重排。
+// 所以要能把视图放回内容区，就得记住内容区是谁。
+static UIView *gMFCurrentContentArea = nil;
+
+// 【0.11.0 新增】"刚刚写过这个 frame"的备忘，用来把**挂载时的两次 settings 写合并成一次**。
+// 归档(11) 的挂载序列是：P0 写一次（那时还没登记目标尺寸 ⇒ 不含 frame）→ 紧接着
+// MFSyncSceneGeometry 再写一次（补 frame）。两次写 = 两次 SpringBoard 重算。
+// 现在 P0 之前就登记目标尺寸，P0 的 block 里已经带了 setFrame:；这一层备忘拦住随后的重复写。
+static id             gMFFrameMemoScene = nil;
+static CGRect         gMFFrameMemoRect  = {{0, 0}, {0, 0}};
+static NSTimeInterval gMFFrameMemoTime  = 0;
+
 // 【0.9.0】scene 守护（keep-alive）用到的状态。
 // 声明放在这里而不是"函数旁边"，因为在它下面出现的 MFLogPresenterState 也要读它们。
 static NSTimer *gMFKeepAliveTimer = nil;        // 守护定时器
@@ -747,6 +763,27 @@ static NSInteger MFHostedLayerCount(id pres) {
     return MFKVCount(MFMsg(pv, NSSelectorFromString(@"hostContainerView")), @"hostedLayers");
 }
 
+/// 【0.11.0 新增】写 frame 之后记一笔，避免紧接着又为同一尺寸重复写。
+/// 每一次 `updateSettingsWithBlock:` 都是一次 SpringBoard 全量重算 —— 少写一次就少一次重排。
+static void MFFrameMemoPut(id scene, CGRect r) {
+    gMFFrameMemoScene = scene;
+    gMFFrameMemoRect  = r;
+    gMFFrameMemoTime  = [NSDate timeIntervalSinceReferenceDate];
+}
+
+/// 刚刚（1.5 秒内）已经为**同一个** scene 写过**完全相同**的 frame？
+/// 窗口取 1.5 秒是因为 `updateSettingsWithBlock:` 是异步的：写完之后立刻读 `settings.frame`
+/// 读回来的可能还是旧值（归档(11) 挂载序列里 P0 写完读回 430x932 就是这一条）。
+static BOOL MFFrameMemoHit(id scene, CGRect r) {
+    if (scene == nil || gMFFrameMemoScene != scene) return NO;
+    NSTimeInterval age = [NSDate timeIntervalSinceReferenceDate] - gMFFrameMemoTime;
+    if (age < 0 || age * 1000.0 > 1500.0) return NO;
+    return fabs(gMFFrameMemoRect.origin.x - r.origin.x) < 0.5 &&
+           fabs(gMFFrameMemoRect.origin.y - r.origin.y) < 0.5 &&
+           fabs(gMFFrameMemoRect.size.width  - r.size.width)  < 0.5 &&
+           fabs(gMFFrameMemoRect.size.height - r.size.height) < 0.5;
+}
+
 /// 写一次 scene settings，返回**实际发出去**的动作摘要（要写进日志，否则下一轮又只能猜）。
 ///
 /// 【0.10.0 重写】按"代价"分两档，默认只走第一档：
@@ -793,6 +830,7 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
 
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
+        if (wantFrame) MFFrameMemoPut(scene, CGRectMake(0, 0, want.width, want.height));
     } @catch (NSException *e) {
         MFLog(@"[pres] updateSettingsWithBlock 抛异常: %@", e.reason);
         return @"exception";
@@ -806,9 +844,13 @@ static NSString *MFWriteSceneSettings(id scene, NSDictionary *cfg, BOOL escalate
         id after = MFMsg(scene, NSSelectorFromString(@"settings"));
         BOOL hasFrame = NO;
         CGRect f = MFRectProp(after, @"frame", &hasFrame);
-        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f cs=%ld layers=%ld frame=%@",
+        // 【0.11.0】顺便把 displayConfiguration 回读一次：归档(11)/(12) 要靠它判断
+        // "全量写到底有没有把 level + displayConfiguration 真的写进去"（这是能不能救回来的关键）。
+        id dcv = MFKV(after, @"displayConfiguration");
+        MFLog(@"[pres] 已写 settings（%@）-> level=%.1f dc=%@ cs=%ld layers=%ld frame=%@",
               summary,
               MFDProp(after, NSSelectorFromString(@"level")),
+              dcv ? NSStringFromClass([dcv class]) : @"nil",
               (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
               (long)MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers"),
               hasFrame ? NSStringFromCGRect(f) : @"-");
@@ -862,12 +904,30 @@ static void MFSetSceneFrame(id scene, CGRect frame) {
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
     if (![scene respondsToSelector:upd]) return;
 
+    // 【0.11.0】能不写就不写 —— 每一次写都是"一帧黑"的潜在来源。
+    //   ① 刚写过同一个值（异步窗口内，读回来还是旧的）-> 跳过；
+    //   ② settings.frame 本来就是我们要的尺寸 -> 跳过。
+    if (MFFrameMemoHit(scene, frame)) {
+        MFLog(@"[pres] scene.frame 刚设成 %@（异步窗口内）-> 不重复写", NSStringFromCGRect(frame));
+        return;
+    }
+    BOOL hasCur = NO;
+    CGRect cur = MFRectProp(MFMsg(scene, NSSelectorFromString(@"settings")), @"frame", &hasCur);
+    if (hasCur &&
+        fabs(cur.origin.x - frame.origin.x) < 0.5 && fabs(cur.origin.y - frame.origin.y) < 0.5 &&
+        fabs(cur.size.width  - frame.size.width)  < 0.5 && fabs(cur.size.height - frame.size.height) < 0.5) {
+        MFFrameMemoPut(scene, frame);
+        MFLog(@"[pres] scene.frame 已经是 %@ -> 不写（少一次重排）", NSStringFromCGRect(frame));
+        return;
+    }
+
     void (^blk)(id) = ^(id st) {
         if (st == nil) return;
         MFMvRect(st, @"setFrame:", frame);
     };
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
+        MFFrameMemoPut(scene, frame);
         MFLog(@"[pres] 已把 scene.frame 设成 %@", NSStringFromCGRect(frame));
     } @catch (NSException *e) {
         MFLog(@"[pres] 设 scene.frame 抛异常: %@", e.reason);
@@ -1089,12 +1149,34 @@ static void MFLogPresenterState(NSString *tag, id pres, id view) {
     }
 }
 
-#pragma mark ========== 0.9.0：scene 守护（0.10.0 大改：只在"真黑"时动手）==========
+#pragma mark ========== 0.9.0：scene 守护（0.11.0：真黑全量写 + 退避，不再"放弃"）==========
 
-// 【这一节要解决的问题：归档(8) 的"切到别的 App 就黑屏"、归档(9) 的"不黑了但闪一下"、
-//   归档(10) 的"闪的频率跟着 keepAliveMs 走"】
+// 【0.11.0 修正了 0.10.0 的两个错误 —— 这一节以归档(11) 为准】
 //
-// 三轮日志串起来是一条完整证据链：
+//  错误一：把"救命的写"给省掉了。
+//    0.10.0 认为 setLevel / setDisplayConfiguration 是"越救越糟"的重排元凶，于是把它们从
+//    常规拉回动作里降级成"升级手段"，而且默认关闭、永不触发。结果真黑时用的是**最小写**
+//    （只有 idle + deact + frame）——归档(11) 里这一次都没救回来：
+//      layers=0 连续 220+ 拍、其间写了十几次，全灭；画面上就是"悬浮窗大概率黑屏"。
+//    对照 0.9.1 能一把拉回来，差别恰恰就是这两项。
+//    ⇒ 真黑一律**全量写**（keepAliveHardWrite，默认 YES）。
+//      想复现 0.10.0 的黑屏做对照，把它设成 false。
+//
+//  错误二："连续 30 拍救不回来就放弃"。
+//    真黑是"必须救"的状态，放弃 = 永久黑屏。0.10.0 的 30 拍 ~ 6 秒之后我们就再也不写了，
+//    归档(11) 里正是这样：日志一路刷到"第 220 拍"，画面始终没回来。
+//    ⇒ 改成**退避**：连续失败越多、写入间隔越大（上限 keepAliveBackoffMaxMs），但永不停止。
+//
+//  顺带修掉一个"打偏了"的问题：黑有两种，0.10.0 只认一种。
+//    归档(11) 的 Filza 轮：scene 自己完全健康（contentState=2 layers=2），
+//    但 presenter.isHosting=0、hostContainer=nil、presentationView 被改成整屏 430x932。
+//    这是**承载侧**掉了，写 scene settings 完全打不中 —— 只会白送一次全量重排。
+//    ⇒ 现在先看 scene：layers>0 而 hosted<=0 ⇒ 只修承载（re-activate + 把视图放回内容区）。
+//
+// 【这一节要解决的问题：归档(8) 的"切到别的 App 就黑屏"、归档(9) 的"不黑了但闪一下"、
+//   归档(10) 的"闪的频率跟着 keepAliveMs 走"、归档(11) 的"0.10.0 大概率黑屏"】
+//
+// 四轮日志串起来是一条完整证据链：
 //
 //   归档(8)  桌面主屏时正常，一切到"设置"就黑。
 //            P6 contentState=2 layers=2 → P6+20s contentState=0 layers=0 hostedLayers=0。
@@ -1227,6 +1309,39 @@ static void MFKeepAliveFixViewFrameIfNeeded(void) {
     v.frame = CGRectMake(0, 0, want.width, want.height);
 }
 
+/// 【0.11.0 新增】把"承载"这一侧修好 —— **不碰 scene settings**，所以不会引发重排。
+///   ① presenter 掉了 hosting  -> 重新 activate（幂等；0.7.0 已实测不会崩）；
+///   ② 承载视图不在内容区里了  -> 放回内容区并对齐尺寸。
+///
+/// 归档(11) 的 Filza 轮就是第 ① 种：P6+20s 时 scene 自己**完全健康**
+/// （contentState=2 layers=2）、但 presenter.isHosting=0、hostContainer=nil、
+/// presentationView 被系统改成整屏 430x932 —— 黑的根本不是 scene，是承载。
+/// 这种情况下 0.10.0 会去写 scene settings（白送一次重排），完全打不中要害。
+static BOOL MFRepairPresenterHosting(BOOL verbose) {
+    BOOL did = NO;
+
+    if (gMFPresenter != nil && !MFBoolProp(gMFPresenter, NSSelectorFromString(@"isHosting"))) {
+        MFMsg(gMFPresenter, NSSelectorFromString(@"activate"));
+        did = YES;
+        if (verbose) MFLogS(@"[keepalive] presenter.isHosting=0 -> 重新 activate（只修承载，不写 settings）");
+    }
+
+    if (gMFCurrentContentArea != nil && [gMFCurrentContentView isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)gMFCurrentContentView;
+        if (v.superview != gMFCurrentContentArea) {
+            v.frame = gMFCurrentContentArea.bounds;
+            [gMFCurrentContentArea addSubview:v];
+            did = YES;
+            if (verbose) {
+                MFLog(@"[keepalive] 承载视图已不在内容区里（superview=%@）-> 重新挂回 frame=%@",
+                      v.superview ? NSStringFromClass([v.superview class]) : @"nil",
+                      NSStringFromCGRect(v.frame));
+            }
+        }
+    }
+    return did;
+}
+
 /// 守护定时器的一次心跳。
 /// 【注意】这里**故意不写** MFStepMark —— 步骤日志是给人肉回传用的，几秒一行会把它冲垮。
 static void MFKeepAliveTick(void) {
@@ -1296,19 +1411,22 @@ static void MFKeepAliveTick(void) {
         return;
     }
 
-    // ---------------- 真黑：没有图层了（只有这一种允许写 settings）----------------
+    // ---------------- 真黑：没有图层了（只有这一种允许动手）----------------
     gMFKeepAliveAdvisoryTicks = 0;
     gMFKeepAliveDownTicks += 1;
     BOOL verbose = (gMFKeepAliveDownTicks == 1) || (gMFKeepAliveDownTicks % 10 == 0);
 
     if (verbose) {
-        MFLog(@"[keepalive] 真掉出（第 %ld 拍：layers=%ld hosted=%ld cs=%ld deact=%llu idle=%d fg=%d）",
+        MFLog(@"[keepalive] 真黑（第 %ld 拍：layers=%ld hosted=%ld cs=%ld deact=%llu idle=%d fg=%d）",
               (long)gMFKeepAliveDownTicks, (long)h.layers, (long)hosted,
               (long)h.cs, h.deact, (int)h.idle, (int)h.fg);
     }
 
-    // ---- 刹车 1：挂载宽限期（presenter 建 hosting 是异步的，刚挂上时"没图层"很正常）----
-    NSInteger graceMs = MFConfigInt(cfg, @"keepAliveGraceMs", 1500);
+    // ---- 刹车 1：挂载宽限期 ----
+    // presenter 建 hosting 是异步的，刚挂上那一两百毫秒里"没图层"很正常；
+    // 这段时间只观察不动手。0.11.0 把它从 1500 ms 收到 600 ms：真黑时我们本来就该尽快救，
+    // 宽限期只需要盖住"P0 的写 + presenter 挂载"这一个异步窗口。
+    NSInteger graceMs = MFConfigInt(cfg, @"keepAliveGraceMs", 600);
     if (gMFKeepAliveStartTime > 0 &&
         (now - gMFKeepAliveStartTime) * 1000.0 < (double)graceMs) {
         if (verbose) {
@@ -1317,45 +1435,77 @@ static void MFKeepAliveTick(void) {
         return;
     }
 
-    // ---- 刹车 2：连续 N 拍都救不回来就停止写入（避免无休止重排 = 无休止闪屏）----
-    NSInteger giveUpAfter = MFConfigInt(cfg, @"keepAliveGiveUpAfter", 30);
+    // ---- 【0.11.0 关键】先分清"是谁黑了"，再决定动不动 scene settings ----
+    // scene 自己还有图层（layers>0）而 presenter 宿主是 0 ⇒ scene 在正常出图，
+    // 黑的只是**承载**这一侧（isHosting=0 / 视图被摘掉 / 被改成整屏）。
+    // 这种情况写 scene settings 一点用都没有，只会白送一次全量重排。
+    if (h.layers > 0 && hosted <= 0) {
+        if (verbose) {
+            MFLog(@"[keepalive] 承载侧掉了（scene 好的：layers=%ld；hosted=%ld isHosting=%d）-> 只修承载，不写 settings",
+                  (long)h.layers, (long)hosted,
+                  (int)MFBoolProp(gMFPresenter, NSSelectorFromString(@"isHosting")));
+        }
+        BOOL repaired = MFRepairPresenterHosting(verbose);
+        MFKeepAliveFixViewFrameIfNeeded();
+        if (repaired && !verbose) MFLogS(@"[keepalive] 承载侧已修（重新 activate / 视图挂回内容区）");
+        gMFKeepAliveLastSig = [MFKeepAliveSignature(scene, gMFPresenter) copy];
+        return;
+    }
+
+    // ---- 刹车 2：失败**退避**（0.10.0 在这里是"放弃"，那是错的）----
+    // 0.10.0 的 keepAliveGiveUpAfter=30 让它连续 30 拍救不回来就**永久停止写入**；
+    // 而真黑是"必须救"的状态 —— 放弃就是永久黑屏（归档(11) 里 layers=0 持续了 220+ 拍，
+    // 用户看到的就是"大概率黑屏"）。现在改成退避：连续失败越多、写入间隔越大（有上限），
+    // 但**永远不停止**。keepAliveGiveUpAfter 仍然保留（>0 时才生效），只为 A/B 复现旧行为。
+    NSInteger baseWriteMs = MFConfigInt(cfg, @"keepAliveMinWriteMs", 300);
+    NSInteger effWriteMs  = baseWriteMs;
+    NSInteger giveUpAfter = MFConfigInt(cfg, @"keepAliveGiveUpAfter", 0);
     if (giveUpAfter > 0 && gMFKeepAliveDownTicks >= giveUpAfter) {
         if (verbose) {
-            MFLog(@"[keepalive] 连续 %ld 拍都没救回来 -> 停止写入（不再重排）；"
-                  @"画面可点 ↻ 重新拉列表再点应用名重挂", (long)gMFKeepAliveDownTicks);
+            MFLog(@"[keepalive] 连续 %ld 拍都没救回来 -> 已停止写入（keepAliveGiveUpAfter=%ld，仅用于对照）",
+                  (long)gMFKeepAliveDownTicks, (long)giveUpAfter);
+        }
+        return;
+    }
+    NSInteger backoffAfter = MFConfigInt(cfg, @"keepAliveBackoffAfter", 50);
+    if (backoffAfter > 0 && gMFKeepAliveDownTicks > backoffAfter) {
+        NSInteger steps = (gMFKeepAliveDownTicks - backoffAfter) / 20;
+        if (steps > 6) steps = 6;
+        effWriteMs = baseWriteMs * (NSInteger)(1 << steps);
+        NSInteger capMs = MFConfigInt(cfg, @"keepAliveBackoffMaxMs", 2000);
+        if (capMs > 0 && effWriteMs > capMs) effWriteMs = capMs;
+    }
+
+    // ---- 刹车 3：两次写入的最小间隔（退避后取放大值）----
+    if (gMFKeepAliveLastWriteTime > 0 &&
+        (now - gMFKeepAliveLastWriteTime) * 1000.0 < (double)effWriteMs) {
+        if (verbose) {
+            MFLog(@"[keepalive] 距上次写入不足 %ld ms -> 本拍跳过（%@）",
+                  (long)effWriteMs,
+                  (effWriteMs > baseWriteMs) ? @"已进入退避，仍会继续试" : @"限流");
         }
         return;
     }
 
-    // ---- 刹车 3：两次写入的最小间隔 ----
-    NSInteger minWriteMs = MFConfigInt(cfg, @"keepAliveMinWriteMs", 300);
-    if (gMFKeepAliveLastWriteTime > 0 &&
-        (now - gMFKeepAliveLastWriteTime) * 1000.0 < (double)minWriteMs) {
-        if (verbose) MFLog(@"[keepalive] 距上次写入不足 %ld ms -> 本拍跳过（限流）", (long)minWriteMs);
-        return;
-    }
-
-    // ---- 升级判据：允许升级 + 已经写过 N 次都没救回来 ----
-    BOOL allowEscalate = MFConfigBool(cfg, @"keepAliveLevel", NO);
-    NSInteger escalateAfter = MFConfigInt(cfg, @"keepAliveEscalateAfter", 5);
-    BOOL escalate = allowEscalate && (gMFKeepAliveWritesInDrop >= escalateAfter);
-
-    NSString *did = MFWriteSceneSettings(scene, cfg, escalate, verbose);
+    // ---- 【0.11.0 关键】真黑一律**全量写** ----
+    // 0.10.0 在这里用"最小写"（只有 idle + deact + frame），结果**一次都拉不回来**：
+    // 归档(11) 里 layers=0 持续 220+ 拍、其间写了十几次，全灭，画面上就是永久黑屏。
+    // 对照 0.9.1 能拉回来，是因为它的拉回动作里有 `setLevel:1` + `setDisplayConfiguration:`
+    // —— 这两项才是让 render server 重新给这个 scene 建图层的开关。
+    // 所以：真黑 ⇒ 全量写（含 level + displayConfiguration + idle + deact + frame）。
+    // 要复现 0.10.0 的黑屏（仅用于对照实验）可以把 keepAliveHardWrite 设成 false。
+    BOOL hardWrite = MFConfigBool(cfg, @"keepAliveHardWrite", YES);
+    NSString *did = MFWriteSceneSettings(scene, cfg, hardWrite, YES);
     gMFKeepAliveLastWriteTime = now;
     gMFKeepAliveWritesInDrop += 1;
 
-    // presenter 若掉了 hosting，补一次 activate（幂等；0.7.0 已实测不会崩）
-    if (gMFPresenter != nil && !MFBoolProp(gMFPresenter, NSSelectorFromString(@"isHosting"))) {
-        MFMsg(gMFPresenter, NSSelectorFromString(@"activate"));
-        if (verbose) MFLogS(@"[keepalive] presenter.isHosting=0 -> 重新 activate");
-    }
-
+    MFRepairPresenterHosting(verbose);
     MFKeepAliveFixViewFrameIfNeeded();
 
     // 拉回后立刻复采一次并写进"上一次签名"，这样下一拍只有**真的没拉回来**才会再报。
     NSString *after = MFKeepAliveSignature(scene, gMFPresenter);
     gMFKeepAliveLastSig = [after copy];
-    if (verbose) MFLog(@"[keepalive] 已写[%@] -> %@", did, after);
+    MFLog(@"[keepalive] 已写[%@] -> %@", did, after);
 }
 
 /// 开启守护。承载成功后调用；已在守护别的 scene 时会先停掉旧的。
@@ -1395,12 +1545,13 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveTimer = t;
 
     MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 只把「一个图层都没有」当黑 / "
-          @"软警告开关=%d / 宽限=%ld ms / 写入间隔=%ld ms / 允许升级写=%d）",
+          @"软警告动手=%d / 真黑全量写=%d / 宽限=%ld ms / 写入间隔=%ld ms / 不退避上限=%ld ms）",
           ms, bundleID ?: @"?",
           (int)MFConfigBool(cfg, @"keepAliveSoft", NO),
-          (long)MFConfigInt(cfg, @"keepAliveGraceMs", 1500),
+          (int)MFConfigBool(cfg, @"keepAliveHardWrite", YES),
+          (long)MFConfigInt(cfg, @"keepAliveGraceMs", 600),
           (long)MFConfigInt(cfg, @"keepAliveMinWriteMs", 300),
-          (int)MFConfigBool(cfg, @"keepAliveLevel", NO));
+          (long)MFConfigInt(cfg, @"keepAliveBackoffMaxMs", 2000));
 
     // 启动时把"本机到底有哪些属性"一次性写进日志 —— 归档(9)/(10) 的教训是：
     // 不确认存在性就下结论，会让人连着几轮对着一个不存在的 getter 调试。
@@ -2303,6 +2454,14 @@ static char kMFRowBundleIDKey;
     }
 
     // ---------- P0：让 scene 变成"可渲染"（只有 route 3 需要）----------
+    // 【0.11.0】关键顺序：**先登记内容区目标尺寸，再做 P0**。
+    // 归档(11) 的挂载序列是两次 settings 写：P0 写一次（那时还没登记目标尺寸 ⇒ 不含 frame）
+    // → 紧接着 MFSyncSceneGeometry 再写一次补 frame。两次写 = 两次 SpringBoard 全量重算。
+    // 现在 P0 之前就登记好，P0 的 block 里已经带了 setFrame:（frame 依然是 block 内最后一项），
+    // 随后的 MFSyncSceneGeometry 会被 gMFFrameMemo* 拦住不再重复写。一次写搞定。
+    if (route == 3 || route == 4) {
+        MFSetDesiredContentSize(panel.contentArea.bounds.size);
+    }
     // route=4 自己造的 scene 生来就是 foreground=YES，不用再拉。
     if (route == 3) {
         if (MFConfigBool(self.config, @"forceForeground", YES)) {
@@ -2421,9 +2580,11 @@ static char kMFRowBundleIDKey;
     }
     MFStepOk(kMFStepAttach);
 
-    // 记住这一轮的目标 scene / 承载视图，供用户拖 ◢ 缩放时重新同步几何
+    // 记住这一轮的目标 scene / 承载视图 / 内容区，供用户拖 ◢ 缩放时重新同步几何，
+    // 也供守护发现"承载侧掉了"时把视图放回内容区（0.11.0）。
     gMFCurrentScene = targetScene;
     gMFCurrentContentView = contentView ?: MFMsg(hostVC, NSSelectorFromString(@"view"));
+    gMFCurrentContentArea = panel.contentArea;
 
     // ---------- P6：把 presenter / 图层宿主的真实状态写下来 ----------
     // 这是判断"还黑不黑"的第一手证据，也是下一版唯一的依据：
