@@ -690,74 +690,64 @@ static NSString *MFSectionLive(void) {
     [gLive appendFormat:@"UIApplication.sharedApplication = %@\n", MFClassOf(uiApp)];
 
     id conn = MFObjProp(uiApp, @selector(connectedScenes));
+    NSUInteger wsCount = MFCountOf(conn);
     [gLive appendFormat:@"connectedScenes = %@ (count=%lu)\n",
-     MFClassOf(conn), [conn respondsToSelector:@selector(count)] ? (unsigned long)[conn count] : 0UL];
-    if ([conn respondsToSelector:@selector(allObjects)]) {
-        id arr = MFObjProp(conn, @selector(allObjects));
-        if ([arr respondsToSelector:@selector(count)]) {
-            NSUInteger n = (NSUInteger)[arr count];
-            for (NSUInteger i = 0; i < n && i < 12; i++) {
-                id ws = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(arr, @selector(objectAtIndex:), i);
-                [gLive appendFormat:@"\n  [windowScene %lu] %@\n", (unsigned long)i, MFClassOf(ws)];
-                id sm = MFObjProp(ws, @selector(sceneManager));
-                [gLive appendFormat:@"      sceneManager = %@\n", MFClassOf(sm)];
-                id all = MFObjProp(sm, @selector(allScenes));
-                [gLive appendFormat:@"      allScenes = %@\n", MFClassOf(all)];
-                if ([all respondsToSelector:@selector(allObjects)]) {
-                    id sarr = MFObjProp(all, @selector(allObjects));
-                    NSUInteger sn = [sarr respondsToSelector:@selector(count)] ? (NSUInteger)[sarr count] : 0;
-                    [gLive appendFormat:@"      allScenes count = %lu\n", (unsigned long)sn];
-                    for (NSUInteger k = 0; k < sn && k < 60; k++) {
-                        id sc = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(sarr, @selector(objectAtIndex:), k);
-                        NSString *sid = MFStrProp(sc, @selector(identifier));
-                        [gLive appendFormat:@"        - %@ id=%@\n", MFClassOf(sc), sid ?: @"?"];
-                    }
-                }
-            }
+     MFClassOf(conn), (unsigned long)wsCount];
+
+    for (NSUInteger i = 0; i < wsCount && i < 12; i++) {
+        id ws = MFObjectAt(conn, i);
+        if (!ws) continue;
+        [gLive appendFormat:@"\n  [windowScene %lu] %@\n", (unsigned long)i, MFClassOf(ws)];
+        id sm = MFObjProp(ws, @selector(sceneManager));
+        [gLive appendFormat:@"      sceneManager = %@\n", MFClassOf(sm)];
+        id all = MFObjProp(sm, @selector(allScenes));
+        NSUInteger sn = MFCountOf(all);
+        [gLive appendFormat:@"      allScenes = %@ count=%lu\n", MFClassOf(all), (unsigned long)sn];
+        for (NSUInteger k = 0; k < sn && k < 80; k++) {
+            id sc = MFObjectAt(all, k);
+            if (!sc) continue;
+            [gLive appendFormat:@"        - %@ id=%@\n",
+             MFClassOf(sc), MFStrProp(sc, @selector(identifier)) ?: @"?"];
         }
     }
 
-    // --- 7.2 逐个 windowScene 做 scene→handle 反查（同上一段的场景对象复用不了，单独再来一次）---
+    // --- 7.2 逐个 windowScene 做 scene→handle 反查 ---
     MFBeat("live:handleMap");
     [gLive appendString:@"\n---- scene → sceneHandle 反查 ----\n"];
-    if ([conn respondsToSelector:@selector(allObjects)]) {
-        id arr = MFObjProp(conn, @selector(allObjects));
-        NSUInteger n = [arr respondsToSelector:@selector(count)] ? (NSUInteger)[arr count] : 0;
-        for (NSUInteger i = 0; i < n && i < 12; i++) {
-            id ws = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(arr, @selector(objectAtIndex:), i);
-            id sm = MFObjProp(ws, @selector(sceneManager));
-            if (!sm || ![sm respondsToSelector:@selector(allScenes)]) continue;
-            id all = MFObjProp(sm, @selector(allScenes));
-            id sarr = MFObjProp(all, @selector(allObjects));
-            NSUInteger sn = [sarr respondsToSelector:@selector(count)] ? (NSUInteger)[sarr count] : 0;
-            for (NSUInteger k = 0; k < sn && k < 60; k++) {
-                id sc = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(sarr, @selector(objectAtIndex:), k);
-                NSString *sid = MFStrProp(sc, @selector(identifier));
-                id h = nil;
-                if ([sm respondsToSelector:@selector(existingSceneHandleForScene:)]) {
-                    @try {
-                        h = ((id (*)(id, SEL, id))objc_msgSend)(sm, @selector(existingSceneHandleForScene:), sc);
-                    } @catch (NSException *e) { h = nil; }
-                }
-                [gLive appendFormat:@"  scene id=%@ -> handle=%@\n", sid ?: @"?", MFClassOf(h)];
-                if (h) {
-                    id app = MFObjProp(h, @selector(application));
-                    NSString *bid = MFStrProp(app, @selector(bundleIdentifier));
-                    [gLive appendFormat:@"      handle.application=%@ bid=%@ persistence=%@\n",
-                     MFClassOf(app), bid ?: @"?", MFStrProp(h, @selector(persistenceIdentifier)) ?: @"?"];
-                }
-                // scene 的呈现管理器探测（只读）
-                NSString *pmLine = nil;
-                for (NSString *pmSel in @[@"uiPresentationManager", @"presentationManager"]) {
-                    SEL sl = NSSelectorFromString(pmSel);
-                    if (![sc respondsToSelector:sl]) continue;
-                    id pm = MFObjProp(sc, sl);
-                    pmLine = [NSString stringWithFormat:@"      %@ = %@  createPresenterWithIdentifier:priority:=%@  createPresenterForLayerTarget:identifier:priority:=%@\n",
-                              pmSel, MFClassOf(pm),
-                              [pm respondsToSelector:@selector(createPresenterWithIdentifier:priority:)] ? @"YES" : @"NO",
-                              [pm respondsToSelector:@selector(createPresenterForLayerTarget:identifier:priority:)] ? @"YES" : @"NO"];
-                    [gLive appendString:pmLine];
-                }
+    for (NSUInteger i = 0; i < wsCount && i < 12; i++) {
+        id ws = MFObjectAt(conn, i);
+        if (!ws) continue;
+        id sm = MFObjProp(ws, @selector(sceneManager));
+        if (!sm || ![sm respondsToSelector:@selector(allScenes)]) continue;
+        id all = MFObjProp(sm, @selector(allScenes));
+        NSUInteger sn = MFCountOf(all);
+        for (NSUInteger k = 0; k < sn && k < 80; k++) {
+            id sc = MFObjectAt(all, k);
+            if (!sc) continue;
+            NSString *sid = MFStrProp(sc, @selector(identifier));
+            id h = nil;
+            if ([sm respondsToSelector:@selector(existingSceneHandleForScene:)]) {
+                @try {
+                    h = ((id (*)(id, SEL, id))objc_msgSend)(sm, @selector(existingSceneHandleForScene:), sc);
+                } @catch (NSException *e) { h = nil; }
+            }
+            [gLive appendFormat:@"  scene id=%@ -> handle=%@\n", sid ?: @"?", MFClassOf(h)];
+            if (h) {
+                id app = MFObjProp(h, @selector(application));
+                [gLive appendFormat:@"      handle.application=%@ bid=%@ persistence=%@\n",
+                 MFClassOf(app),
+                 MFStrProp(app, @selector(bundleIdentifier)) ?: @"?",
+                 MFStrProp(h, @selector(persistenceIdentifier)) ?: @"?"];
+            }
+            // scene 的呈现管理器探测（只读，不 createPresenter）
+            for (NSString *pmSel in @[@"uiPresentationManager", @"presentationManager"]) {
+                SEL sl = NSSelectorFromString(pmSel);
+                if (![sc respondsToSelector:sl]) continue;
+                id pm = MFObjProp(sc, sl);
+                [gLive appendFormat:@"      %@ = %@  createPresenterWithIdentifier:priority:=%@  createPresenterForLayerTarget:identifier:priority:=%@\n",
+                 pmSel, MFClassOf(pm),
+                 [pm respondsToSelector:@selector(createPresenterWithIdentifier:priority:)] ? @"YES" : @"NO",
+                 [pm respondsToSelector:@selector(createPresenterForLayerTarget:identifier:priority:)] ? @"YES" : @"NO"];
             }
         }
     }
@@ -1034,10 +1024,17 @@ static void MFProbeRun(void) {
 
 %ctor {
     MFBeat("ctor:enter");
-    // SpringBoard 完全启动、类注册齐全后再采样（后台队列，不阻塞主线程）
+    // 第一轮：SpringBoard 完全启动、类注册齐全后再采样（后台队列，不阻塞主线程）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         MFProbeRun();
+    });
+    // 第二轮（仅活体段）：留出时间让用户手动打开目标 App，再抓一次它的 scene / sceneHandle
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(75.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        MFBeat("live2:enter");
+        MFWrite(@"MultiFloatProbe-live2.log", MFSectionLive());
+        MFBeat("live2:done");
     });
     MFBeat("ctor:exit");
 }
