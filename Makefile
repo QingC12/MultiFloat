@@ -6,6 +6,28 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.9.0 变更：
+#   - 0.8.0 真机（归档(8)）：**浮窗全程正常了** —— 内容对、拖 ◢ 缩放时比例也对、没触发安全模式。
+#     唯一剩下的问题：在桌面主屏时浮窗里 Safari 画面正常，一切到"设置"就变黑。
+#   - 日志给出的事故链（同一个 pid 19432，同一轮承载）：
+#       P6      : foreground=1 contentState=2 layerManager.layers=2 hostedLayers=2   ← 正常出画面
+#       P6+20s  : foreground=0 contentState=0 layerManager.layers=0 hostedLayers=0   ← 内容没了 => 黑
+#     根因：P0（把 scene settings 拉成 foreground=YES/level=1）是**一次性**动作；
+#     前台 App 一换人，SpringBoard 就把目标 App 的 scene settings 重算回去并写回 foreground=NO
+#     （同时极可能打开 idleModeEnabled、加上 deactivationReasons），App 的 layerManager 随之丢光图层，
+#     _UIScenePresentationView 没东西可承载 => 黑。
+#   - 修法：新增 scene 守护（keepAlive，默认 1 秒一次）。承载成功后反复把
+#       foreground=YES / level=1 / idleModeEnabled=NO / deactivationReasons=0
+#     拉回，并同步 scene.frame 到内容区尺寸；presenter 掉了 hosting 就重新 activate。
+#     两个新 setter 的存在性由归档(8) 的 MF-presenter-report.txt 确认：
+#       UIMutableApplicationSceneSettings - setDeactivationReasons: v24@0:8Q16
+#       UIMutableApplicationSceneSettings - setIdleModeEnabled:     v20@0:8B16
+#   - 日志策略：状态签名变化才记一行（`[keepalive] 状态变化 旧 -> 新`），其余每 20 拍一行心跳，
+#     连续掉出时第 1 次与每 10 次记明细 —— 否则一秒一行，用户没法回传。
+#   - 仍然【一个 hook 都不装】：用的还是 updateSettingsWithBlock: 这个 0.7.0 已验证能让画面出来的
+#     非侵入手段，只是从"打一枪"改成"持续按住"。
+#   - 新增配置 keepAlive / keepAliveMs / keepAliveIdle，cfgVersion 升到 9（8->9 只新增键，不改旧值）。
+#
 # 0.8.0 变更：
 #   - 0.7.0 真机（归档(7)）：**第一次真的出画面了**（route 3 出画面但比例不对；route 4 出画面但崩）
 #   - 缺陷 1 画面比例：presentationView 的自然尺寸 = scene.settings.frame；

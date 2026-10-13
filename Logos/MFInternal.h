@@ -41,6 +41,20 @@
 //        `_UIScenePresentationView` 的自然尺寸 = `scene.settings.frame`。
 //        想让浮窗里的画面比例正确，就得让 **scene.frame == 浮窗内容区尺寸**；
 //        只设 `resizesHostedContext=YES` 是不够的（那只是让 App 跟着重新布局）。
+//  10. 【0.9.0 新增 · "设置一次"和"一直保持"是两件事】
+//      归档(8) 真机：浮窗终于全程正常 —— 内容对、缩放时比例也对、不崩。
+//      但用户一从桌面切到"设置"，浮窗里的 Safari 就变黑。
+//      日志（同一个 pid，同一轮承载）：
+//        P6      : foreground=1 contentState=2 layerManager.layers=2 hostedLayers=2  ← 好的
+//        P6+20s  : foreground=0 contentState=0 layerManager.layers=0 hostedLayers=0  ← 黑的
+//      ⇒ P0（把 scene settings 拉成 foreground=YES）是**一次性**动作，
+//        而 SpringBoard 会在"前台 App 换人"时重算目标 App 的 scene settings 并写回 NO
+//        （很可能同时打开 idleModeEnabled、加上 deactivationReasons），
+//        App 的 layerManager 随之丢光图层，presenter 手里只剩一个"没有图层可承载"的视图 ⇒ 黑。
+//      ⇒ 规则：凡是"必须持续成立"的运行时状态（这里是 scene 可渲染），
+//        就不能只在进入时设一次；要么上守护定时器反复拉回，要么 hook 住改它的那一方。
+//        本项目坚持不装 hook，所以用守护定时器（keepAlive，默认 1 秒一次）。
+//        并且守护必须**在日志里留下它拉回的证据**（状态签名变化才记一行），否则下一轮又只能猜。
 //
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H

@@ -203,6 +203,12 @@ static id        gMFPresenterScene      = nil;  // gMFPresenter 挂在哪个 sce
 static id        gMFCurrentScene        = nil;  // 本轮承载的目标 scene（供缩放时重新同步几何）
 static id        gMFCurrentContentView  = nil;  // 本轮挂上去的承载视图
 
+// 【0.9.0】scene 守护（keep-alive）用到的状态。
+// 声明放在这里而不是"函数旁边"，因为在它下面出现的 MFLogPresenterState 也要读它们。
+static NSTimer *gMFKeepAliveTimer = nil;        // 守护定时器
+static id       gMFKeepAliveScene = nil;        // 正在守护的 scene
+static id       gMFKeepAliveApp   = nil;        // 目标 SBApplication（只用来打印 processState）
+
 // 启动时由 HookBridge 灌入"上一轮崩在哪一步"（nil = 上一轮没崩）
 static NSString *gMFBootCrashStep = nil;
 void MFFloatSetBootCrashStep(NSString *step) {
@@ -589,7 +595,23 @@ static BOOL MFOwnSceneIsAlive(void) {
 
 #pragma mark ========== 0.7.0：P0 —— 让 scene 变成"可渲染" ==========
 
-/// 把目标 scene 的 settings 拉成"前台 + 在该屏 + 竖屏"。
+/// 无符号 64 位属性读取（deactivationReasons 的类型编码是 Q，用 NSInteger 读会截断符号）
+static unsigned long long MFULLProp(id obj, SEL sel) {
+    if (obj == nil || sel == NULL) return 0;
+    if (![obj respondsToSelector:sel]) return 0;
+    @try { return ((unsigned long long (*)(id, SEL))objc_msgSend)(obj, sel); }
+    @catch (NSException *e) { return 0; }
+}
+
+static void MFMvULL(id o, NSString *selName, unsigned long long v) {
+    if (o == nil || selName == nil) return;
+    SEL s = NSSelectorFromString(selName);
+    if (![o respondsToSelector:s]) return;
+    @try { ((void (*)(id, SEL, unsigned long long))objc_msgSend)(o, s, v); }
+    @catch (NSException *e) { MFLog(@"[abi] %@ 抛异常: %@", selName, e.reason); }
+}
+
+/// 把目标 scene 的 settings 拉成"前台 + 在该屏 + 竖屏 + 不空闲"。
 ///
 /// 为什么必须做：App 被切到后台后，它的 scene settings 里 foreground=NO，
 /// App 进程不会再往这个 scene 里渲染 —— 这种 scene 就算被 presenter 正确承载，
@@ -600,16 +622,35 @@ static BOOL MFOwnSceneIsAlive(void) {
 ///     settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
 ///     settings.interfaceOrientation = UIInterfaceOrientationPortrait;
 /// 我们这里对**已存在**的 scene 做同样的事（唯一区别是用 updateSettingsWithBlock: 原地改）。
-static void MFForceSceneRenderable(id scene) {
+///
+/// 【0.9.0 新增两项，直指归档(8) 的"切到别的 App 就黑屏"】
+///   归档(8) 日志给出的事故链：
+///     t=1791887361  P6      : foreground=1 contentState=2 layerManager.layers=2 hostedLayers=2  ← 画面正常
+///     t=1791887381  P6+20s  : foreground=0 contentState=0 layerManager.layers=2                ← 被 SB 拉回后台
+///     t=1791887405  P6+20s  : foreground=0 contentState=0 layerManager.layers=0 hostedLayers=0  ← 内容彻底没了 => 黑屏
+///   => P0 是**一次性**的：只要用户切到别的 App，SpringBoard 会把目标 App 的 scene settings 重算一遍，
+///      把 foreground 写回 NO，App 的 layerManager 随之丢光图层，_UIScenePresentationView 就没东西可承载 => 黑。
+///   所以 0.9.0 除了 foreground/level，再把另两个"让 App 停止渲染"的开关一起清掉：
+///     idleModeEnabled    —— SpringBoard 在 App 不显示时会打开它，App 进入空闲渲染模式，图层会掉；
+///     deactivationReasons—— SB 的去激活原因位掩码（MovedOffscreen 等），非 0 时 scene 即使
+///                           foreground=YES 也算"被去激活"。
+///   这两个 setter 的存在性已由归档(8) 的 MF-presenter-report.txt 确认：
+///     UIMutableApplicationSceneSettings - setDeactivationReasons:  v24@0:8Q16
+///     UIMutableApplicationSceneSettings - setIdleModeEnabled:       v20@0:8B16
+static void MFForceSceneRenderableEx(id scene, BOOL setForeground, BOOL clearIdle, BOOL verbose) {
     if (scene == nil) return;
 
     id before = MFMsg(scene, NSSelectorFromString(@"settings"));
-    MFLog(@"[pres] P0 前 settings: foreground=%d level=%.1f frame=%@ contentState=%ld active=%d",
-         (int)MFBoolProp(before, NSSelectorFromString(@"foreground")),
-         MFDProp(before, NSSelectorFromString(@"level")),
-         MFKV(before, @"frame") ?: @"-",
-         (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
-         (int)MFBoolProp(scene, NSSelectorFromString(@"isActive")));
+    if (verbose) {
+        MFLog(@"[pres] P0 前 settings: foreground=%d level=%.1f idle=%d deact=%llu frame=%@ contentState=%ld active=%d",
+             (int)MFBoolProp(before, NSSelectorFromString(@"foreground")),
+             MFDProp(before, NSSelectorFromString(@"level")),
+             (int)MFBoolProp(before, NSSelectorFromString(@"idleModeEnabled")),
+             MFULLProp(before, NSSelectorFromString(@"deactivationReasons")),
+             MFKV(before, @"frame") ?: @"-",
+             (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
+             (int)MFBoolProp(scene, NSSelectorFromString(@"isActive")));
+    }
 
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
     if (![scene respondsToSelector:upd]) {
@@ -621,25 +662,40 @@ static void MFForceSceneRenderable(id scene) {
 
     void (^blk)(id) = ^(id st) {
         if (st == nil) return;
-        MFMvBool(st,   @"setForeground:", YES);
+        if (setForeground) MFMvBool(st, @"setForeground:", YES);
         MFMvDouble(st, @"setLevel:", 1.0);
         MFMvLong(st,   @"setInterfaceOrientation:", (long)UIInterfaceOrientationPortrait);
+        if (clearIdle) {
+            MFMvBool(st, @"setIdleModeEnabled:", NO);
+            MFMvULL(st,  @"setDeactivationReasons:", 0ULL);
+        }
         if (dc != nil) MFMvObj(st, @"setDisplayConfiguration:", dc);
     };
 
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(scene, upd, (id)blk);
-        MFLogS(@"[pres] P0 已发 updateSettingsWithBlock（foreground=YES / level=1 / portrait）");
+        if (verbose) {
+            MFLog(@"[pres] P0 已发 updateSettingsWithBlock（level=1 / portrait / 拉 fg=%d / 清 idle=%d）",
+                  (int)setForeground, (int)clearIdle);
+        }
     } @catch (NSException *e) {
         MFLog(@"[pres] P0 updateSettingsWithBlock 抛异常: %@", e.reason);
     }
 
-    id after = MFMsg(scene, NSSelectorFromString(@"settings"));
-    MFLog(@"[pres] P0 后 settings: foreground=%d level=%.1f frame=%@ contentState=%ld",
-         (int)MFBoolProp(after, NSSelectorFromString(@"foreground")),
-         MFDProp(after, NSSelectorFromString(@"level")),
-         MFKV(after, @"frame") ?: @"-",
-         (long)MFIntProp(scene, NSSelectorFromString(@"contentState")));
+    if (verbose) {
+        id after = MFMsg(scene, NSSelectorFromString(@"settings"));
+        MFLog(@"[pres] P0 后 settings: foreground=%d level=%.1f idle=%d deact=%llu frame=%@ contentState=%ld",
+             (int)MFBoolProp(after, NSSelectorFromString(@"foreground")),
+             MFDProp(after, NSSelectorFromString(@"level")),
+             (int)MFBoolProp(after, NSSelectorFromString(@"idleModeEnabled")),
+             MFULLProp(after, NSSelectorFromString(@"deactivationReasons")),
+             MFKV(after, @"frame") ?: @"-",
+             (long)MFIntProp(after, NSSelectorFromString(@"contentState")));
+    }
+}
+
+static void MFForceSceneRenderable(id scene) {
+    MFForceSceneRenderableEx(scene, YES, YES, YES);
 }
 
 #pragma mark ========== 0.7.0：presenter 主链（Route 3 / Route 4 共用）==========
@@ -867,11 +923,211 @@ static void MFLogPresenterState(NSString *tag, id pres, id view) {
         id lm = MFMsg(hostScene, NSSelectorFromString(@"layerManager"));
         // 这几项能直接回答"SpringBoard 有没有把我们设的 foreground=YES 又改回去"：
         // 若 P0 后是 1、这里变成 0，说明 SB 的 _scene:interceptUpdateWithNewSettings: 覆盖了我们。
-        MFLog(@"[pres] %@ scene=%@ foreground=%@ level=%@ frame=%@ contentState=%@ layers=%ld",
+        //
+        // 【0.9.0 补充】idle / deact 也一并打出来 —— 归档(8) 里真正把内容弄黑的很可能不是
+        // foreground 本身，而是 SpringBoard 顺手打开的 idleModeEnabled（App 进入空闲渲染模式，
+        // layerManager.layers 直接掉到 0）。没有这两个数，下一轮还是只能猜。
+        MFLog(@"[pres] %@ scene=%@ foreground=%@ idle=%@ deact=%@ level=%@ frame=%@ contentState=%@ layers=%ld",
              tag, NSStringFromClass([hostScene class]),
-             MFKV(st, @"foreground"), MFKV(st, @"level"), MFKV(st, @"frame"),
+             MFKV(st, @"foreground"), MFKV(st, @"idleModeEnabled"),
+             MFKV(st, @"deactivationReasons"),
+             MFKV(st, @"level"), MFKV(st, @"frame"),
              MFKV(hostScene, @"contentState"), (long)MFKVCount(lm, @"layers"));
     }
+    if (gMFKeepAliveApp != nil) {
+        MFLog(@"[pres] %@ 目标 App processState=%@（0=运行 1=挂起 2=后台任务 3=没有进程）",
+             tag, MFKV(gMFKeepAliveApp, @"processState"));
+    }
+}
+
+#pragma mark ========== 0.9.0：scene 守护（切到别的 App 后画面不再变黑）==========
+
+// 【这一节要解决的问题：归档(8)】
+//   用户描述：在桌面主屏时浮窗里 Safari 画面正常，一切到"设置"就变黑。
+//   日志里的事故链（同一个 pid 19432，同一轮承载）：
+//     P6       : foreground=1 contentState=2 layers=2  hostedLayers=2   → 正常出画面
+//     P6+20s   : foreground=0 contentState=0 layers=2                   → 被 SpringBoard 拉回后台
+//     P6+20s   : foreground=0 contentState=0 layers=0  hostedLayers=0   → 内容没了 → 黑屏
+//   结论：P0 是**一次性**的。只要前台 App 变成别人，SpringBoard 就会重算目标 App 的
+//   scene settings 并写回 foreground=NO（同时很可能打开 idleModeEnabled、加上
+//   deactivationReasons），App 的 layerManager 随之丢光图层，presenter 手里就只剩
+//   一个"没有图层可承载"的 _UIScenePresentationView ⇒ 黑。
+//
+//   修法：承载成功后开一个**守护定时器**（默认 1 秒一次），反复把这几项拉回"可渲染"状态。
+//   不装 hook（本版仍然一个 hook 都不装），只用 updateSettingsWithBlock: 这种非侵入手段；
+//   它同时也是 0.7.0 已经真机验证过"确实能让画面出来"的那一招，只是从"打一枪"改成"持续按住"。
+//
+//   为什么必须"持续"而不是"再补一次"：SpringBoard 的重算发生在**用户切 App 的那一刻**，
+//   我们无法预先知道那一刻什么时候来；轮询是唯一不需要 hook 的可靠做法。
+//
+//   日志策略（很重要，日志要人肉回传）：
+//     状态**变化**时记一行 `[keepalive] 状态变化 旧 -> 新` ；
+//     判定掉出前台并拉回时记一行 `[keepalive] 拉回` ；
+//     其余每 20 个周期记一行心跳。-- 否则一秒一行，用户没法回传。
+
+static NSString *gMFKeepAliveBundleID = nil;
+static NSDictionary *gMFKeepAliveConfig = nil;
+static NSInteger gMFKeepAliveTicks = 0;
+static NSString *gMFKeepAliveLastSig = nil;
+static NSInteger gMFKeepAliveDegradedStreak = 0;   // 连续"掉出可渲染态"的次数（日志节流用）
+
+/// 采集一次"决定黑不黑"的全部关键值，做成可直接字符串比较的签名。
+/// 放在一行里，是为了让日志里能直接做 diff（`旧 -> 新`）。
+static NSString *MFKeepAliveSignature(id scene, id pres) {
+    if (scene == nil) return @"scene=nil";
+    id st = MFMsg(scene, NSSelectorFromString(@"settings"));
+    id lm = MFMsg(scene, NSSelectorFromString(@"layerManager"));
+    id pv = MFMsg(pres, NSSelectorFromString(@"presentationView"));
+    NSInteger hosted = (pv != nil) ? MFKVCount(MFMsg(pv, NSSelectorFromString(@"hostContainerView")), @"hostedLayers")
+                                   : -1;
+    return [NSString stringWithFormat:
+            @"valid=%d fg=%d idle=%d deact=%llu cs=%ld layers=%ld host=%d hosted=%ld ps=%ld",
+            (int)MFBoolProp(scene, NSSelectorFromString(@"isValid")),
+            (int)MFBoolProp(st, NSSelectorFromString(@"foreground")),
+            (int)MFBoolProp(st, NSSelectorFromString(@"idleModeEnabled")),
+            MFULLProp(st, NSSelectorFromString(@"deactivationReasons")),
+            (long)MFIntProp(scene, NSSelectorFromString(@"contentState")),
+            (long)MFKVCount(lm, @"layers"),
+            (int)MFBoolProp(pres, NSSelectorFromString(@"isHosting")),
+            (long)hosted,
+            gMFKeepAliveApp ? (long)MFIntProp(gMFKeepAliveApp, NSSelectorFromString(@"processState")) : -1];
+}
+
+/// 读一次"决定黑不黑"的原始取值。
+/// 这里**只取不判**：判不判"算掉出去了"取决于配置里允许我们拉哪几项
+/// （keepAliveForeground / keepAliveIdle），那是调用方的事。
+/// 唯一无条件算异常的是"一个图层都没有" —— 那正是黑屏本身。
+static void MFReadSceneHealth(id scene, BOOL *outFg, BOOL *outIdle, BOOL *outDeact, BOOL *outNoLayers) {
+    id st = MFMsg(scene, NSSelectorFromString(@"settings"));
+    BOOL fg      = MFBoolProp(st, NSSelectorFromString(@"foreground"));
+    BOOL idle    = MFBoolProp(st, NSSelectorFromString(@"idleModeEnabled"));
+    unsigned long long deact = MFULLProp(st, NSSelectorFromString(@"deactivationReasons"));
+    NSInteger layers = MFKVCount(MFMsg(scene, NSSelectorFromString(@"layerManager")), @"layers");
+
+    if (outFg)       *outFg = fg;
+    if (outIdle)     *outIdle = idle;
+    if (outDeact)    *outDeact = (deact != 0);
+    if (outNoLayers) *outNoLayers = (layers <= 0);
+}
+
+/// 停掉守护（换目标 / 关闭浮窗 / scene 失效时一定要调，否则会一直摸一个已经不属于我们的 scene）
+static void MFStopSceneKeepAlive(NSString *why) {
+    if (gMFKeepAliveTimer != nil) {
+        [gMFKeepAliveTimer invalidate];
+        gMFKeepAliveTimer = nil;
+        MFLog(@"[keepalive] 已停止守护（%@）", why ?: @"?");
+    }
+    gMFKeepAliveScene = nil;
+    gMFKeepAliveApp = nil;
+    gMFKeepAliveBundleID = nil;
+    gMFKeepAliveConfig = nil;
+    gMFKeepAliveLastSig = nil;
+    gMFKeepAliveTicks = 0;
+    gMFKeepAliveDegradedStreak = 0;
+}
+
+/// 守护定时器的一次心跳。
+///
+/// 【注意】这里**故意不写** MFStepMark —— 步骤日志是给人肉回传用的，一秒一行会把它冲垮。
+/// 这一段的崩溃保护由"承载崩溃标记"承担：标记在 20 秒后才清，且下一次承载前一定会重新检查。
+static void MFKeepAliveTick(void) {
+    id scene = gMFKeepAliveScene;
+    if (scene == nil) { MFStopSceneKeepAlive(@"scene 引用为空"); return; }
+
+    BOOL valid = MFBoolProp(scene, NSSelectorFromString(@"isValid"));
+    NSString *sig = MFKeepAliveSignature(scene, gMFPresenter);
+    gMFKeepAliveTicks += 1;
+
+    if (!valid) {
+        MFLog(@"[keepalive] scene 已失效（%@）-> 停止守护；点 ↻ 重新拉应用列表再点一次应用名即可重挂", sig);
+        MFStopSceneKeepAlive(@"scene 失效");
+        return;
+    }
+
+    // 状态一变就记一行：这是下一轮判断"到底是谁把它改回去的"的唯一证据。
+    if (gMFKeepAliveLastSig == nil || ![sig isEqualToString:gMFKeepAliveLastSig]) {
+        MFLog(@"[keepalive] 状态变化 %@ -> %@",
+             gMFKeepAliveLastSig ?: @"<初值>", sig);
+        gMFKeepAliveLastSig = [sig copy];
+    }
+
+    BOOL fg = YES, idle = NO, deact = NO, noLayers = NO;
+    MFReadSceneHealth(scene, &fg, &idle, &deact, &noLayers);
+    NSDictionary *cfg = gMFKeepAliveConfig;
+    BOOL fixFg   = MFConfigBool(cfg, @"keepAliveForeground", YES);
+    BOOL fixIdle = MFConfigBool(cfg, @"keepAliveIdle", YES);
+
+    // "掉出去"= 没有图层（黑屏本身），或我们被允许修的某一项出了问题。
+    BOOL degraded = noLayers || (!fg && fixFg) || ((idle || deact) && fixIdle);
+
+    if (degraded) {
+        // 连续掉出去多少次了（第一次记一次明细，之后每 10 次记一次，避免日志被刷爆）
+        gMFKeepAliveDegradedStreak += 1;
+        BOOL verbose = (gMFKeepAliveDegradedStreak == 1) || (gMFKeepAliveDegradedStreak % 10 == 0);
+
+        if (verbose) {
+            MFLog(@"[keepalive] 掉出可渲染态（第 %ld 次：fg=%d idle=%d deact=%d 无图层=%d）-> 重新拉回",
+                  (long)gMFKeepAliveDegradedStreak, (int)fg, (int)idle, (int)deact, (int)noLayers);
+        }
+
+        // 1) 把 scene settings 拉回"前台 + 不空闲"
+        MFForceSceneRenderableEx(scene, fixFg, fixIdle, verbose);
+
+        // 2) 几何：内容区尺寸可能被用户拖过，scene.frame 必须跟着，否则比例又歪。
+        if (MFConfigBool(cfg, @"hostSceneFrame", YES) && [gMFCurrentContentView isKindOfClass:[UIView class]]) {
+            MFSetSceneFrame(scene, ((UIView *)gMFCurrentContentView).bounds);
+        }
+
+        // 3) presenter 若掉了 hosting，重新 activate 一次（幂等，且我们已验证过它不会崩）
+        if (gMFPresenter != nil && !MFBoolProp(gMFPresenter, NSSelectorFromString(@"isHosting"))) {
+            MFMsg(gMFPresenter, NSSelectorFromString(@"activate"));
+            if (verbose) MFLogS(@"[keepalive] presenter.isHosting=0 -> 重新 activate");
+        }
+
+        // 拉回后立刻复采一次，写进"上一次签名"里，这样下一 tick 只有在**真的没拉回来**时才会再报。
+        NSString *after = MFKeepAliveSignature(scene, gMFPresenter);
+        gMFKeepAliveLastSig = [after copy];
+        if (verbose) MFLog(@"[keepalive] 拉回后 %@", after);
+    } else {
+        gMFKeepAliveDegradedStreak = 0;
+        if (gMFKeepAliveTicks % 20 == 0) MFLog(@"[keepalive] 心跳 %@", sig);
+    }
+}
+
+/// 开启守护。承载成功后调用；已在守护别的 scene 时会先停掉旧的。
+static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictionary *cfg) {
+    MFStopSceneKeepAlive(@"换守护目标");
+
+    if (scene == nil) return;
+    if (!MFConfigBool(cfg, @"keepAlive", YES)) {
+        MFLogS(@"[keepalive] keepAlive=false -> 不启动守护（这是归档(8)「切到别的 App 就黑屏」的直接原因，仅用于 A/B 对照）");
+        return;
+    }
+
+    double ms = 1000.0;
+    id v = cfg[@"keepAliveMs"];
+    if ([v respondsToSelector:@selector(doubleValue)]) ms = [v doubleValue];
+    if (ms < 300.0) ms = 300.0;
+    if (ms > 5000.0) ms = 5000.0;
+
+    gMFKeepAliveScene = scene;
+    gMFKeepAliveApp = app;
+    gMFKeepAliveBundleID = [bundleID copy];
+    gMFKeepAliveConfig = cfg;
+    gMFKeepAliveTicks = 0;
+    gMFKeepAliveLastSig = nil;
+
+    NSTimer *t = [NSTimer timerWithTimeInterval:(ms / 1000.0)
+                                        repeats:YES
+                                          block:^(NSTimer *timer) { MFKeepAliveTick(); }];
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+    gMFKeepAliveTimer = t;
+
+    MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 拉 fg=%d / 清 idle=%d）—— 之后切到别的 App 也会把 scene 拉回可渲染态",
+          ms, bundleID ?: @"?",
+          (int)MFConfigBool(cfg, @"keepAliveForeground", YES),
+          (int)MFConfigBool(cfg, @"keepAliveIdle", YES));
+    MFLog(@"[keepalive] 初始状态 %@", MFKeepAliveSignature(scene, gMFPresenter));
 }
 
 #pragma mark ========== 0.7.0：Route 4 —— 自建 scene ==========
@@ -1245,6 +1501,9 @@ static char kMFRowBundleIDKey;
 
 - (void)onCloseTapped {
     MFLogS(@"[ui] 关闭按钮被点（respring 可再次显示）");
+    // 【0.9.0】浮窗都关了就别再守护了 —— 守护是"为了让已经挂上去的画面不掉"，
+    // 画面都没了还一直改别人的 scene settings 属于越界。
+    MFStopSceneKeepAlive(@"浮窗被关闭");
     self.hostWindow.hidden = YES;
 }
 
@@ -1322,6 +1581,8 @@ static char kMFRowBundleIDKey;
 
 - (void)showMessage:(NSString *)message detail:(NSString *)detail {
     [self attachContentViewController:nil];
+    // 【0.9.0】内容区要被提示信息顶掉了 => 不再守护那个已经不在显示的 scene
+    MFStopSceneKeepAlive(@"内容区换成提示信息");
     UIView *box = [[UIView alloc] initWithFrame:self.contentArea.bounds];
     box.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
@@ -1348,6 +1609,8 @@ static char kMFRowBundleIDKey;
 
 - (void)showAppList:(NSArray<NSArray<NSString *> *> *)items {
     [self attachContentViewController:nil];
+    // 【0.9.0】点 ↻ 拉列表 = 用户要重新选 App，旧画面已经不在显示 => 停守护
+    MFStopSceneKeepAlive(@"拉取应用列表");
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:self.contentArea.bounds];
     scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     scroll.alwaysBounceVertical = YES;
@@ -1535,6 +1798,11 @@ static char kMFRowBundleIDKey;
     MFLog(@"[host] hostStep 上限 = %ld", (long)limit);
 
     // 从这里开始才有崩的可能：先落崩溃标记，再开一格新的步骤日志
+    //
+    // 【0.9.0】开始新一轮承载前，先把上一轮的 scene 守护停掉 ——
+    // 否则守护定时器会继续摸一个马上要被换掉的 scene（换目标时 presenter 会被销毁，
+    // 那种"半死"状态下再 updateSettings 只会制造噪声，甚至误判）。
+    MFStopSceneKeepAlive(@"开始新一轮承载");
     MFAttemptWrite("host-begin");
     MFStepReset();
     self.hostSeq += 1;
@@ -1551,6 +1819,9 @@ static char kMFRowBundleIDKey;
            ? MFMsg1(controller, NSSelectorFromString(@"applicationWithBundleIdentifier:"), bundleID)
            : nil;
     MFLog(@"[host] SBApplication=%@", app ? NSStringFromClass([app class]) : @"nil");
+    // 【0.9.0】记下来给 P6 / keepalive 打印 processState 用：
+    // 它是区分"App 进程被系统挂起"与"只是 scene 被去激活"的唯一直接证据。
+    gMFKeepAliveApp = app;
     MFStepOk(kMFStepApp);
 
     if (controller == nil) {
@@ -1766,6 +2037,12 @@ static char kMFRowBundleIDKey;
     MFLogPresenterState(@"P6", gMFPresenter, stateView);
     MFStepOk(kMFStepState);
 
+    // ---------- 【0.9.0】S7 之前：启动 scene 守护 ----------
+    // 归档(8) 的"切到设置就黑屏"就是在这里输掉的：此刻画面是好的（P6: foreground=1 layers=2），
+    // 但用户一换前台 App，SpringBoard 就把这套 settings 重算回去，图层掉光 => 黑。
+    // 守护定时器会持续把 foreground/idle/deactivationReasons 拉回可渲染态，并把变化记进日志。
+    MFStartSceneKeepAlive(targetScene, app, bundleID, self.config);
+
     [panel setStatusText:[NSString stringWithFormat:@"已承载 %@", bundleID]];
 
     // ---------- S7：存活确认 ----------
@@ -1883,7 +2160,7 @@ void MFFloatBootstrap(void) {
     double delay = 12.0;
     id cfgDelay = config[@"showDelay"];
     if ([cfgDelay respondsToSelector:@selector(doubleValue)]) delay = [cfgDelay doubleValue];
-    MFLog(@"[gate] %.1f 秒后显示浮窗（0.5.0 不做任何自动承载）", delay);
+    MFLog(@"[gate] %.1f 秒后显示浮窗（启动时不自动承载）", delay);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

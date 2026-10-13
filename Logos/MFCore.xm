@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.8.0";
+    return @"0.9.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -86,18 +86,28 @@ NSDictionary *MFLoadConfig(void) {
     return nil;
 }
 
-//  0.8.0 的默认配置（相对 0.7.0 改了两处默认值，都是为了归档(7) 的两个真机缺陷）：
+//  0.9.0 的默认配置（相对 0.8.0 新增三项，全部围绕归档(8) 的"切到别的 App 就黑屏"）：
 //    enabled        = true  —— 总显示开关（装上就显示外壳）
 //    hostEnabled    = false —— 真承载开关（只有它为 true 才可能碰 SpringBoard 的对象）
 //    hostRoute      = 3     —— 承载路线（3=接管已存在 scene，实测唯一"出画面且不崩"的路）
 //    forceForeground= true  —— 承载前把目标 scene 设成"前台可渲染"（P0 步）
 //    resizesHosted  = true  —— 让被承载的 scene 按浮窗尺寸渲染（App 跟着重新布局）
-//    hostSceneFrame = true  ——【默认 false -> true】把 scene.frame 也设成浮窗内容区尺寸。
+//    hostSceneFrame = true  —— 把 scene.frame 也设成浮窗内容区尺寸。
 //                              presentationView 的自然尺寸就等于 scene.frame，不设的话
 //                              整屏 scene(430x932, 宽高比 0.461) 塞进内容区(267x336.6, 0.793)
 //                              必然拉伸变形 —— 这就是归档(7)「route 3 出画面但比例不对」的根因。
-//    allowRouteB    = false ——【新增】presenter 失败时是否退回 SBDeviceApplicationSceneViewController。
+//    allowRouteB    = false —— presenter 失败时是否退回 SBDeviceApplicationSceneViewController。
 //                              它是已被两次真机验证的**纯黑**宿主，挂着只会把失败伪装成成功。
+//    keepAlive      = true  ——【0.9.0 新增】承载成功后开一个守护定时器，反复把目标 scene 拉回
+//                              "可渲染"（foreground=YES / idle=NO / deactivationReasons=0 / 几何同步）。
+//                              归档(8) 的根因就是"P0 只设了一次，用户一换前台 App 就被 SB 改回去"。
+//    keepAliveMs    = 1000  ——【0.9.0 新增】守护周期（毫秒），会被夹在 300..5000。
+//    keepAliveForeground = true ——【0.9.0 新增】守护时是否把 foreground 拉回 YES。
+//                              唯一需要关掉它的场景：若"持续 foreground=YES"会让目标 App 在 SpringBoard
+//                              眼里变成可见 App（有弹成全屏的风险），把它设 false，就只清 idle/deact。
+//    keepAliveIdle  = true  ——【0.9.0 新增】守护时是否连 idleModeEnabled=NO / deactivationReasons=0
+//                              一起清。留这个开关是为了下一轮能做干净的 A/B：
+//                              若关掉它也照样不黑，说明只需要 foreground；若关掉就黑，说明元凶就是 idle。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
@@ -125,15 +135,19 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"hostSceneFrame"  : @YES,                     // 【0.8.0 默认改成 YES】把 scene.frame 设成浮窗内容区尺寸
                                                        //   —— 这是"画面比例正确"的必要条件：presentationView
                                                        //   的自然尺寸就等于 scene.frame，两者宽高比必须一致
-        @"allowRouteB"     : @NO,                      // 【0.8.0 新增】presenter 失败时是否退回那个已知纯黑的宿主 VC
+        @"allowRouteB"     : @NO,                      // presenter 失败时是否退回那个已知纯黑的宿主 VC
+        @"keepAlive"       : @YES,                     // 【0.9.0 新增】承载成功后守护 scene（切 App 不再黑屏）
+        @"keepAliveMs"     : @1000,                    // 【0.9.0 新增】守护周期（毫秒）
+        @"keepAliveForeground" : @YES,                 // 【0.9.0 新增】守护时是否把 foreground 拉回 YES
+        @"keepAliveIdle"   : @YES,                     // 【0.9.0 新增】守护时是否连 idle / deactivationReasons 一起清
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @8,                       // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @9,                       // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3 / hostSceneFrame=true）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3 / hostSceneFrame=true / keepAlive=true）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -152,8 +166,10 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
     BOOL missingKeys = (cfg[@"hostEnabled"] == nil || cfg[@"hostStep"] == nil ||
                         cfg[@"hostRoute"] == nil || cfg[@"forceForeground"] == nil ||
                         cfg[@"resizesHosted"] == nil || cfg[@"hostSceneFrame"] == nil ||
-                        cfg[@"allowRouteB"] == nil);
-    if (cur >= 8 && !missingKeys) return;
+                        cfg[@"allowRouteB"] == nil ||
+                        cfg[@"keepAlive"] == nil || cfg[@"keepAliveMs"] == nil ||
+                        cfg[@"keepAliveIdle"] == nil || cfg[@"keepAliveForeground"] == nil);
+    if (cur >= 9 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -169,6 +185,10 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"resizesHosted"]   == nil) up[@"resizesHosted"]   = @YES;
         if (up[@"hostSceneFrame"]  == nil) up[@"hostSceneFrame"]  = @YES;
         if (up[@"allowRouteB"]     == nil) up[@"allowRouteB"]     = @NO;
+        if (up[@"keepAlive"]       == nil) up[@"keepAlive"]       = @YES;
+        if (up[@"keepAliveMs"]     == nil) up[@"keepAliveMs"]     = @1000;
+        if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @YES;
+        if (up[@"keepAliveIdle"]   == nil) up[@"keepAliveIdle"]   = @YES;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -201,9 +221,20 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @8;
         }
 
+        // ---- 0.8 -> 0.9：只**新增键**，不改任何已有取值 ----
+        // 归档(8) 证明 route 3 和 route 4 都能出画面且都不崩，所以这次没有需要"纠正"的旧值；
+        // 用户的 hostRoute / hostSceneFrame 原样保留（想做对照实验的继续用 4 也没问题）。
+        if (cur < 9) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=9：新增 keepAlive / keepAliveMs / keepAliveForeground / keepAliveIdle（默认 true / 1000 / true / true）");
+            MFLogS(@"[cfg]   这三项是归档(8)「切到别的 App 浮窗就变黑」的修复开关：承载成功后会守护 scene，");
+            MFLogS(@"[cfg]   持续把 foreground / idleModeEnabled / deactivationReasons 拉回可渲染态。");
+            up[@"cfgVersion"] = @9;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=8 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / allowRouteB=%@）",
-             path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"], up[@"allowRouteB"]);
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveIdle=%@）",
+             up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
+             up[@"keepAlive"], up[@"keepAliveIdle"]);
         return;
     }
 }
