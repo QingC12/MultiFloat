@@ -1086,10 +1086,23 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
     }
 
     // ---------- 1) 先算差量（纯读，不写）----------
-    // `foreground`：settings 上没有 getter，只能问 FBScene（KVC）。读不到就不写这一项 ——
-    //   否则就是"每拍写一次 = 每拍闪一次"（0.9.1 的老毛病）。
-    BOOL doFg = MFConfigBool(cfg, @"keepAlivePreventForeground", YES) &&
-                gMFFgUsable && h.hasSceneFg && !h.sceneFg;
+    // 【0.15.0 关键改动】`foreground` 从"差量项"改成"保活项"。
+    // 归档(15) 钉死的事实链：
+    //   ① 本机 `FBScene.foreground` **读不到**（KVC 抛 NSUndefinedKeyException，
+    //      全场 fg=n(0)、可读性 FBScene.foreground=NO）
+    //      ⇒ 差量检测永远失效 ⇒ 预防档**从没发过 setForeground:YES**；
+    //   ② 全场 23 次真黑（切换时 layers 掉 1~2 拍 = 用户看到的"闪一下"，
+    //      切走一次、切回一次）全部由真黑档 L1 里**无条件**写的 fg=1 拉回
+    //      —— 救场的其实一直是 fg，只是每次都晚 200~400ms（必须等 layers 掉光才出手）；
+    //   ③ 45/48 次真黑发生在 deact=0 时 ⇒ 系统的去激活跟 deact 位无关，
+    //      掉的是渲染资格（前台身份）⇒ 0.14.0 熔断 deact 是对的。
+    // ⇒ 读不到 fg 时按"可能已掉"处理：每拍保活发一次 setForeground:YES
+    //   （纯状态量、不碰几何；写完回读验证兜底，但"读不到"不再计败，见下面第 3 步）。
+    //   读得到 fg 的机器仍然走真差量：fg=1 就不写，零浪费。
+    BOOL doFg = NO;
+    if (MFConfigBool(cfg, @"keepAlivePreventForeground", YES) && gMFFgUsable) {
+        doFg = h.hasSceneFg ? !h.sceneFg : YES;
+    }
 
     BOOL doIdle  = MFConfigBool(cfg, @"keepAlivePreventIdle",  YES) && h.hasIdle  && h.idle;
     // 【0.14.0】这一项加了熔断。归档(14) 实测：本机 `deact` 常态就是 32（画面好好的），
@@ -1145,15 +1158,26 @@ static NSString *MFWritePreventiveSettings(id scene, NSDictionary *cfg, MFHealth
                          hard ? @" +几何(逃生门)" : @""];
 
     // ---------- 3) 写完**立刻验证** setForeground: 到底管不管用 ----------
-    // 这是 0.13.0 最该看的一行：如果写完 `FBScene.foreground` 仍然是 0，
-    // 说明这个 setter 在本机是空的 ⇒ 连写 3 次还不行就**停止再试**
-    // （否则每拍写一次 = 每拍闪一次，而我们只是白闪）。
+    // 【0.15.0 修正】三态判定，不再是二态：
+    //   · 读回 fg=1        ⇒ 成功，清零计败；
+    //   · 读回 fg=0        ⇒ 失败，计败；连败 3 次 ⇒ 熔断（这个 setter 是空转）；
+    //   · **读不到（KVC 抛异常）⇒ 未知，既不计败也不清零**。
+    // 0.14.0 及之前是二态：hasAfter=NO 会掉进 else 计败 ⇒ 在"fg 读不到"的机器上
+    // （归档(15)：全场 fg=n(0)），只要预防档真的开始发 fg，3 拍后就会被**误熔断**——
+    // 而 gMFFgUsable 一旦为 NO，真黑档 L1 的 doFg 也跟着关闭（974 行共用它）
+    // ⇒ 直接回到 0.12.0"layers 掉了写不回 = 永久黑"的险境。这是本轮最重要的一个修正。
+    // 保活写是否真的在按住，用**宏观指标**验收：真黑次数应趋零（见交付说明第 5 节）。
     if (doFg) {
         BOOL hasAfter = NO;
         BOOL fgAfter = MFForegroundOf(scene, &hasAfter);
         if (hasAfter && fgAfter) {
             gMFFgFailStreak = 0;
             if (verbose) MFLogS(@"[keepalive] ✔ setForeground:YES 生效（FGScene.foreground 0 -> 1）");
+        } else if (!hasAfter) {
+            // 本机读不到 fg（KVC NSUndefinedKeyException）—— 写没写进去**无从得知**。
+            // 不计败（那会把"读不到"误判成"空转"），也不清零（没有正面证据）。
+            // 验收靠宏观指标：切换时真黑（layers 掉）次数是否趋零。
+            if (verbose) MFLogS(@"[keepalive] · setForeground:YES 已发（本机 fg 读不到，无法逐笔回读验证；看真黑次数是否趋零）");
         } else {
             gMFFgFailStreak += 1;
             MFLog(@"[keepalive] ✘ setForeground:YES 写完读回仍然是 0（第 %ld 次）—— 这个 setter 可能是空转",
@@ -1420,6 +1444,26 @@ static UIView *MFPresentScene(id scene, NSString *sceneID, NSDictionary *config,
             void (^blk)(id) = ^(id mc) {
                 if (mc == nil) return;
                 MFMvLong(mc, @"setAppearanceStyle:", 2);
+
+                // 【0.15.0 消闪核心①】把"未承载背景色"从黑改成透明。
+                // 归档(15) 的 context dump 给出了铁证：
+                //   `BGColorWhileHosting = UIExtendedGrayColorSpace 0 1`（纯黑）
+                // 而 `_UIScenePresentationView._updateBackgroundColor` 在**未承载**
+                // （hostedLayers=0，即每次切换 App 掉图层的 200~400ms 黑窗）时
+                // 画的就是这个色 —— "闪一下"不是没渲染，是 presenter 在明确画黑。
+                // 设成 clearColor 之后，黑窗变成"透窗"：露出我们垫底的
+                // 最后一帧快照（见 MFSnapshotPadUpdate）＝画面定格而不是闪黑。
+                SEL setBg = NSSelectorFromString(@"setBackgroundColorWhileNotHosting:");
+                if ([mc respondsToSelector:setBg]) {
+                    SEL getBg = NSSelectorFromString(@"backgroundColorWhileNotHosting");
+                    id before = [mc respondsToSelector:getBg] ? MFMsg(mc, getBg) : nil;
+                    MFMvObj(mc, @"setBackgroundColorWhileNotHosting:", [UIColor clearColor]);
+                    id after = [mc respondsToSelector:getBg] ? MFMsg(mc, getBg) : nil;
+                    MFLog(@"[pres] P3b 未承载背景色：%@ -> %@（已设透明；切换掉图层时应透出垫底快照而不是黑）",
+                          before, after);
+                } else {
+                    MFLogS(@"[pres] P3b 没有 setBackgroundColorWhileNotHosting:（黑窗维持原样）");
+                }
             };
             ((void (*)(id, SEL, id))objc_msgSend)(pres, presModify, (id)blk);
             MFLogS(@"[pres] P3b 已设 appearanceStyle=2（FrontBoardAppLauncher 同款）");
@@ -1737,6 +1781,74 @@ static BOOL MFRepairPresenterHosting(BOOL verbose) {
     return did;
 }
 
+// ---------------- 【0.15.0 消闪三件套（视觉侧）】 ----------------
+//
+// 归档(15) 钉死的事实：切换 App 时系统会直接把浮窗 scene 的图层掉光
+// （48 次真黑里 45 次前一拍 deact 还是 0 —— **没有前兆**，预防档根本来不及），
+// 黑窗 200~400ms 后由我们的 L1 写拉回。轮询永远追不上"直接掉"，
+// 所以真正能消闪的是**视觉侧**：掉图层的那一瞬间，别让用户看到黑。
+//
+//   ① context 的"未承载背景色"设透明（P3b，见上）—— 黑窗变透窗；
+//   ② 剥掉 presentationView 自带的黑底（背景 view / layer 背景色）；
+//   ③ 内容区最底层垫一张"最后一帧"快照 —— 透窗露出的不是面板底色，
+//     而是定格的画面，体感 = 画面停了一拍，几乎无感。
+
+static UIImageView *gMFPadView    = nil;   // 垫底快照视图（内容区 index 0）
+static double       gMFPadLastTime = 0;     // 快照节流
+
+/// 剥掉承载视图的自带黑底。承载成功后调用一次。
+/// 归档(15) 报告：`_UIScenePresentationView` 有 `backgroundView` 属性 +
+/// `_updateBackgroundColor` 方法 —— 黑八成画在这个内部背景 view 上。
+static void MFStripPresentationBlack(void) {
+    if (![gMFCurrentContentView isKindOfClass:[UIView class]]) return;
+    UIView *v = (UIView *)gMFCurrentContentView;
+    v.backgroundColor = [UIColor clearColor];
+    v.layer.backgroundColor = [UIColor clearColor].CGColor;
+    v.opaque = NO;
+    id bg = MFMsg(v, NSSelectorFromString(@"backgroundView"));
+    if ([bg isKindOfClass:[UIView class]]) {
+        UIView *bgv = (UIView *)bg;
+        bgv.backgroundColor = [UIColor clearColor];
+        bgv.hidden = YES;   // 直接藏掉最稳（hosted layers 在 hostContainerView，不受影响）
+        MFLog(@"[pres] 消闪：presentationView 背景已剥黑并隐藏（backgroundView=%@）",
+              NSStringFromClass([bgv class]));
+    } else {
+        MFLogS(@"[pres] 消闪：presentationView 背景已剥黑（无 backgroundView 或读不到）");
+    }
+}
+
+/// 更新垫底快照。只在**健康拍**调用（layers>0 且 hosted>0），黑窗期间绝不更新
+/// —— 否则会把黑抓进去。限流 2 s 一次。
+static void MFSnapshotPadUpdate(NSDictionary *cfg) {
+    if (cfg != nil && !MFConfigBool(cfg, @"keepAliveSnapshot", YES)) return;
+    UIView *area = gMFCurrentContentArea;
+    if (![area isKindOfClass:[UIView class]] || area.bounds.size.width < 1.0) return;
+    if (![gMFCurrentContentView isKindOfClass:[UIView class]]) return;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (gMFPadLastTime > 0 && (now - gMFPadLastTime) < 2.0) return;
+    gMFPadLastTime = now;
+    @try {
+        UIGraphicsImageRenderer *r =
+            [[UIGraphicsImageRenderer alloc] initWithBounds:area.bounds];
+        UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [area drawViewHierarchyInRect:area.bounds afterScreenUpdates:NO];
+        }];
+        if (img == nil) return;
+        if (gMFPadView == nil) {
+            gMFPadView = [[UIImageView alloc] initWithFrame:area.bounds];
+            gMFPadView.userInteractionEnabled = NO;
+            gMFPadView.autoresizingMask =
+                UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            [area addSubview:gMFPadView];
+            [area sendSubviewToBack:gMFPadView];   // 垫在最底，承载视图盖在它上面
+            MFLogS(@"[pres] 垫底快照视图已建立（内容区 index 0）");
+        }
+        gMFPadView.image = img;
+    } @catch (NSException *e) {
+        // 快照失败不影响主链路（部分 remote layer 结构抓不出来，垫底就当没有）
+    }
+}
+
 /// 守护定时器的一次心跳。
 /// 【注意】这里**故意不写** MFStepMark —— 步骤日志是给人肉回传用的，几秒一行会把它冲垮。
 static void MFKeepAliveTick(void) {
@@ -1768,6 +1880,9 @@ static void MFKeepAliveTick(void) {
 
     // ---------------- 健康 ----------------
     if (kind == MFDropNone) {
+        // 【0.15.0】健康时刷新垫底快照（内部自带 2 s 节流；黑窗期间不会进到这里，
+        // 所以垫底永远是"最后一帧好画面"，不会把黑抓进去）。
+        MFSnapshotPadUpdate(cfg);
         if (gMFKeepAliveDownTicks > 0) {
             MFLog(@"[keepalive] 已恢复：本次真黑持续 %ld 拍（约 %ld ms），写了 %ld 次 settings"
                   @"（末次档位 L%ld）｜ 本轮累计 L1救回=%ld L2救回=%ld L3救回=%ld",
@@ -2042,10 +2157,11 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAliveTimer = t;
 
     MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 预防档=%d @ %ld ms"
-          @"（差量写：只发真变化的项，含 setForeground:，**不碰几何**；"
+          @"（差量写 + fg 保活：本机 fg 读不到时每拍发 setForeground:YES，不碰几何；"
           @"deact 写带熔断 keepAliveDeactFuse=%ld） / "
           @"预防退避=%ld 拍后至 %ld ms / 真黑恢复=分级(L1纯状态量/L2+frame/L3+DC) tiered=%d / "
-          @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms）",
+          @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms / "
+          @"消闪=背景透明+剥黑底+垫底快照=%d）",
           ms, bundleID ?: @"?",
           (int)MFConfigBool(cfg, @"keepAlivePrevent", YES),
           (long)MFConfigInt(cfg, @"keepAlivePreventMs", 250),
@@ -2055,7 +2171,8 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
           (int)MFConfigBool(cfg, @"keepAliveTieredRestore", YES),
           (long)MFConfigInt(cfg, @"keepAliveGraceMs", 600),
           (long)MFConfigInt(cfg, @"keepAliveMinWriteMs", 300),
-          (long)MFConfigInt(cfg, @"keepAliveBackoffMaxMs", 2000));
+          (long)MFConfigInt(cfg, @"keepAliveBackoffMaxMs", 2000),
+          (int)MFConfigBool(cfg, @"keepAliveSnapshot", YES));
 
     // 启动时把"本机到底有哪些属性"一次性写进日志 —— 归档(9)/(10) 的教训是：
     // 不确认存在性就下结论，会让人连着几轮对着一个不存在的 getter 调试。
@@ -3116,6 +3233,12 @@ static char kMFRowBundleIDKey;
     gMFCurrentScene = targetScene;
     gMFCurrentContentView = contentView ?: MFMsg(hostVC, NSSelectorFromString(@"view"));
     gMFCurrentContentArea = panel.contentArea;
+
+    // 【0.15.0 消闪】剥掉承载视图的自带黑底（配合 P3b 的未承载背景色=透明 +
+    // 垫底快照：切换 App 掉图层的那 200~400ms 里，用户看到的是"画面定格"而不是黑）。
+    // gMFPadView 属于上一轮的旧快照：换 App 后立即作废，等健康拍重新抓。
+    if (gMFPadView != nil) { gMFPadView.image = nil; }
+    MFStripPresentationBlack();
 
     // ---------- P6：把 presenter / 图层宿主的真实状态写下来 ----------
     // 这是判断"还黑不黑"的第一手证据，也是下一版唯一的依据：

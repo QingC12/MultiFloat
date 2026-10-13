@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.14.0";
+    return @"0.15.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -254,8 +254,12 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   每拍都「有差量」⇒ 每拍写一次 = 每拍闪一次）。
         // ---- 【0.13.0 新增】预防档的"差量写"开关（只发真的不一样的那几项）----
         @"keepAlivePreventForeground" : @YES,          //   **核心**：发 setForeground:YES。
-                                                       //   先在 FBScene 上读 foreground，只有是 0 才写；
-                                                       //   写完读回验证，连续 3 次无效就停手（防每拍闪）。
+                                                       //   【0.15.0 语义升级】从"差量项"改成"保活项"：
+                                                       //   本机 FBScene.foreground 读不到（KVC 抛异常）
+                                                       //   ⇒ 差量检测永远失效（归档(15) 全场 fg=n(0)，
+                                                       //   预防档从没发过 fg）⇒ 读不到就按"可能已掉"
+                                                       //   处理，每拍保活发一次（写完回读兜底，
+                                                       //   "读不到"不计败）；读得到的机器仍走真差量。
         @"keepAlivePreventIdle"       : @YES,          //   清 idleModeEnabled（差量）
         @"keepAlivePreventDeact"      : @YES,          //   清 deactivationReasons（差量）
         @"keepAlivePreventLevel"      : @YES,          //   补 setLevel:1（只在 level != 1 时发）
@@ -271,10 +275,18 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   → L2 +frame → L3 +displayConfiguration。
                                                        //   归档(14)：真黑 1 拍就恢复，多半 L1 就够；
                                                        //   关掉 = 回到 0.13.0 恒为 L3（含 DC，必闪）。
+        // ---- 【0.15.0 新增】消闪（视觉侧）----
+        @"keepAliveSnapshot"      : @YES,              //   垫底快照：内容区最底层垫一张"最后一帧"截图
+                                                       //   （健康时限流 2 s 刷新）。配合"未承载背景色=透明
+                                                       //   + 剥黑底"，切换 App 掉图层的那 200~400ms 里
+                                                       //   露出的是定格画面而不是黑 —— 体感从"闪黑"
+                                                       //   变成"画面停一拍"。归档(15)：48 次真黑里 45 次
+                                                       //   前一拍 deact 还是 0，**没有前兆**，轮询永远
+                                                       //   追不上，只能在视觉侧兜住。
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @15,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @16,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
@@ -319,8 +331,9 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAlivePreventBackoffAfter"] == nil ||
                         cfg[@"keepAlivePreventBackoffMaxMs"] == nil ||
                         cfg[@"keepAliveDeactFuse"] == nil ||
-                        cfg[@"keepAliveTieredRestore"] == nil);
-    if (cur >= 15 && !missingKeys) return;
+                        cfg[@"keepAliveTieredRestore"] == nil ||
+                        cfg[@"keepAliveSnapshot"] == nil);
+    if (cur >= 16 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -366,6 +379,8 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         // ---- 0.14.0 消闪三件套 ----
         if (up[@"keepAliveDeactFuse"]     == nil) up[@"keepAliveDeactFuse"]     = @5;   // 0.14.0 新增
         if (up[@"keepAliveTieredRestore"] == nil) up[@"keepAliveTieredRestore"] = @YES; // 0.14.0 新增
+        // ---- 0.15.0 视觉消闪 ----
+        if (up[@"keepAliveSnapshot"] == nil) up[@"keepAliveSnapshot"] = @YES;           // 0.15.0 新增
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -549,6 +564,31 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @15;
         }
 
+        // ---- 0.15 -> 0.16：消闪第二阶段（fg 保活 + 视觉侧兜底）----
+        // 归档(15) 真机证据（用户原话："切走和切回都会闪一下"）：
+        //   · 23 次真黑（切换掉图层）全部 1~2 拍（200~400ms）被 L1 拉回；
+        //   · 45/48 次真黑前一拍 deact=0 —— **没有前兆**，预防档来不及介入；
+        //   · 全场 fg=n(0)：本机 FBScene.foreground KVC 读不到 ⇒ 预防档的 fg
+        //     差量检测从未生效 ⇒ setForeground:YES 一次都没发过（救场的全是
+        //     真黑档 L1 的无条件 fg=1 —— 每次都晚 200~400ms）。
+        // 三处改动：
+        //   ① 预防档 fg 改**保活**：读不到 fg 的机器每拍发 setForeground:YES
+        //      （纯状态量、不碰几何；回读"读不到"不计败 —— 否则会被误熔断）；
+        //   ② P3b 把 context 的"未承载背景色"设透明（归档(15) dump：
+        //      BGColorWhileHosting = 灰度0 α1 = 纯黑，这正是黑窗的颜色来源）；
+        //   ③ 新增 keepAliveSnapshot：内容区垫"最后一帧"快照 —— 掉图层时
+        //      露出定格画面而不是黑，体感从"闪黑"变"画面停一拍"。
+        if (cur < 16) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=16：消闪第二阶段 ——");
+            MFLogS(@"[cfg]     ① 预防档 setForeground:YES 从「差量项」改「保活项」"
+                  @"（本机 fg 读不到 ⇒ 差量检测从未生效 ⇒ 一次都没发过）");
+            MFLogS(@"[cfg]     ② presenter 上下文的「未承载背景色」黑 -> 透明"
+                  @"（切换掉图层的黑窗 = presenter 在画这个色）");
+            MFLogS(@"[cfg]     ③ 新增 keepAliveSnapshot=YES：内容区垫最后一帧快照，"
+                  @"掉图层时露出定格画面；掉图层的 200~400ms 由 L1 拉回，视觉上几乎无感");
+            up[@"cfgVersion"] = @16;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
         MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
@@ -556,7 +596,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
              up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
              up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"],
              up[@"keepAliveForeground"], up[@"keepAlivePreventForeground"],
-             up[@"keepAliveDeactFuse"], up[@"keepAliveTieredRestore"]);
+             up[@"keepAliveDeactFuse"], up[@"keepAliveTieredRestore"], up[@"keepAliveSnapshot"]);
         return;
     }
 }
