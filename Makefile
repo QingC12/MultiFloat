@@ -6,6 +6,11 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.4.0 变更：
+#   - 修 0.3.0 的"崩→重启→再崩→安全模式"循环（三处独立缺陷，详见 MFFloat.xm 头部注释）
+#   - 启动不再自动承载；行为开关全部改成布尔（hostEnabled），字符串不再参与判断
+#   - 承载链路逐步插桩（S1..S7），崩溃可归因到具体一步
+#   - 删掉 FBScene -activateWithTransitionContext:nil（0.3.0 的崩点）
 # 0.3.0 变更：
 #   - 从"纯空壳"变为第一个真实功能版（默认关闭）
 #   - 编译单元收敛为纯 Objective-C + Logos：Swift 骨架暂时移出构建

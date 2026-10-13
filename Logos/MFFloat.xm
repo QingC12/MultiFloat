@@ -2,29 +2,71 @@
 //  MFFloat.xm — 浮窗外壳 + 真实承载（Route B）
 //
 //  ============ 为什么是 Route B ============
-//  v0.5.0 段 9 的全镜像归属搜索给出了定论：
-//      uiPresentationManager —— 全机 99398 个类里【只有 NSObject 定义】(@16@0:8)。
+//  MFProbe v0.5.0 段 9 的全镜像归属搜索给出定论：
+//      uiPresentationManager —— 全机 99398 个类里【只有 NSObject 记录到】(@16@0:8)。
 //      FBScene 的 120 个自有方法里没有它，UIScene/UIWindowScene 也都没有覆写。
+//      _uiPresentationManager / _setResizesHostedContext: 更是 0 个类。
 //  => 旧方案（scene.uiPresentationManager -> createPresenterWithIdentifier:）在 17.3.1 上拿不到东西。
 //
 //  而 SpringBoard 自己的"宿主视图"这条路实测全都在：
 //      SBSceneHandle              -newSceneViewController                        @16@0:8
-//      SBSceneHandle              -newSceneViewWithReferenceSize:...            @56@0:8...
-//      SBDeviceApplicationSceneViewController -initWithSceneHandle:             @24@0:8@16
-//      SBDeviceApplicationSceneViewController -setSceneResizesHostedContext:    v20@0:8B16  <-- 命门
+//      SBSceneHandle              -sceneIfExists                                @16@0:8
+//      SBDeviceApplicationSceneViewController -setSceneResizesHostedContext:    v20@0:8B16
 //      SBSceneManager             -existingSceneHandleForPersistenceIdentifier: @24@0:8@16
 //      SBSceneManager             -existingSceneHandleForScene:                 @24@0:8@16
 //      SBSceneManagerCoordinator  +mainDisplaySceneManager
 //      SBApplicationController    -applicationWithBundleIdentifier:             @24@0:8@16
 //
-//  所以本版用 SpringBoard 自己的 VC 去承载 scene，而不是自己拼 presenter。
+//  ============ 0.3.0 → 0.4.0 要解决的问题 ============
+//  0.3.0 真机：外壳完全正常（可拖动/缩放），一点"运行中应用列表"里的行就崩，
+//  连崩两次进安全模式。日志给出两件事：
 //
-//  ============ 三条铁律 ============
-//   1. 全部在主线程执行（v0.4.0 的崩因高度怀疑就是后台线程上碰这些对象）。
-//   2. 每一步先落盘日志再执行 —— 崩了就靠最后一行定位。
-//   3. 任何一步失败都降级到"外壳 + 可读错误文本"，绝不给黑屏。
+//   (1) 崩点定位：最后一行是
+//         [host] setSceneResizesHostedContext:YES 已设置
+//       而它之后紧接着的两条语句是
+//         ① [scene respondsToSelector:@selector(activateWithTransitionContext:)]
+//         ② objc_msgSend(scene, @selector(activateWithTransitionContext:), nil)   ← nil 上下文
+//       下一行 `activateWithTransitionContext:nil 已发送` 从未出现。
+//       查 FBScene 方法表：activateWithTransitionContext: 确实存在（v24@0:8@16，吃一个对象）。
+//       => 高度怀疑 ② ：给 FBScene 传 nil transition context。
+//       而 scene 本身 active=1，压根不需要我们再激活一次。所以 0.4.0 直接【删掉这次调用】。
+//
+//   (2) 为什么会"连崩→安全模式"：两个独立缺陷
+//       缺陷 A（最致命）：用户用 Filza 改 plist 时把 mode 写成 shell，iOS 键盘自动更正成 she'll。
+//            我们的判定是 `if ([mode isEqualToString:@"shell"]) 走 shell else 走 host`，
+//            字符串不匹配 => 掉进 host 分支 => **每次开屏自动承载** => 崩→重启→再崩→安全模式。
+//            修法：所有行为开关改成布尔/整数（hostEnabled），mode 只做展示；且判定方向反过来
+//            —— 不认识的配置一律走"最保守"分支，绝不允许"写错一个字就进危险路径"。
+//       缺陷 B：attempt 标记在 (delay+30s) 无条件清除，而承载是"用户点行"才发生的。
+//            用户点得晚，标记早没了 => 危险动作完全没保护。
+//            修法：标记改为【只在承载前后】写/清，并且承载入口每次都重新检查标记。
+//
+//  ============ 0.4.0 的三道防线 ============
+//   防线 1  默认 hostEnabled=false：装上只显示外壳，一个 SpringBoard 对象都不碰。
+//   防线 2  承载前写 /var/mobile/MF-float-attempt.txt，链路走完并存活 20 秒才清除。
+//           任何一次崩溃都会让标记留下 => 之后所有承载直接拒绝 => 物理上不可能崩循环。
+//   防线 3  承载链路每一步写 `>>> 步名` / `<<< 步名 ok` 到 /var/mobile/MF-host-step.txt。
+//           崩了就靠"最后一个没配对的 >>>"定位；下一次启动自动写成 MF-crash-attribution.txt。
+//           配合配置项 hostStep(1..6) 可以做不崩的逐步逼近。
+//
+//  另外：本版仍然【一个 hook 都不装】。
 //
 #import "MFInternal.h"
+
+// ============ 承载链路步骤名（顺序即执行顺序）============
+static NSString *const kMFStepApp     = @"S1-app";
+static NSString *const kMFStepHandle  = @"S2-handle";
+static NSString *const kMFStepScene   = @"S3-scene";
+static NSString *const kMFStepVC      = @"S4-hostvc";
+static NSString *const kMFStepResize  = @"S5-resize";
+static NSString *const kMFStepAttach  = @"S6-attach";
+static NSString *const kMFStepSettle  = @"S7-settle";
+
+// 启动时由 HookBridge 灌入"上一轮崩在哪一步"（nil = 上一轮没崩）
+static NSString *gMFBootCrashStep = nil;
+void MFFloatSetBootCrashStep(NSString *step) {
+    gMFBootCrashStep = [step copy];
+}
 
 #pragma mark ========== 小工具 ==========
 
@@ -67,7 +109,7 @@ static id MFMainSceneManager(void) {
 }
 
 /// 路线 1：纯字符串查表（不接触任何 scene 对象，最安全）
-static id MFFindHandleByPersistenceID(id app, NSString *bundleID) {
+static id MFFindHandleByPersistenceID(id app) {
     id sceneManager = MFMainSceneManager();
     MFLog(@"[host] SBSceneManager=%@", sceneManager ? NSStringFromClass([sceneManager class]) : @"nil");
     if (sceneManager == nil) return nil;
@@ -88,24 +130,26 @@ static id MFFindHandleByPersistenceID(id app, NSString *bundleID) {
     MFLog(@"[host] sceneID=%@ persistenceID=%@", sceneID ?: @"nil", persistenceID ?: @"nil");
     if (![persistenceID isKindOfClass:[NSString class]] || persistenceID.length == 0) return nil;
 
-    SEL existing = NSSelectorFromString(@"existingSceneHandleForPersistenceIdentifier:");
-    id handle = MFMsg1(sceneManager, existing, persistenceID);
+    id handle = MFMsg1(sceneManager,
+                       NSSelectorFromString(@"existingSceneHandleForPersistenceIdentifier:"),
+                       persistenceID);
     if (handle != nil) return handle;
 
     // 再试一次按 scene identity 查（部分是 nil 的 persistence id）
     if (sceneID != nil) {
-        SEL idSel = NSSelectorFromString(@"sceneIdentityForApplication:");
-        id token = MFMsg1(sceneManager, idSel, app);
-        MFLog(@"[host] sceneIdentityForApplication:=%@", token ? NSStringFromClass([token class]) : @"nil");
+        id token = MFMsg1(sceneManager, NSSelectorFromString(@"sceneIdentityForApplication:"), app);
+        MFLog(@"[host] sceneIdentityForApplication:=%@",
+             token ? NSStringFromClass([token class]) : @"nil");
         if (token != nil) {
-            handle = MFMsg1(sceneManager, NSSelectorFromString(@"existingSceneHandleForSceneIdentity:"), token);
+            handle = MFMsg1(sceneManager,
+                            NSSelectorFromString(@"existingSceneHandleForSceneIdentity:"), token);
             if (handle != nil) return handle;
         }
     }
     return nil;
 }
 
-/// 路线 2：枚举活体 scene 反查（v0.4.0 崩在这里，但那是后台线程 + 无类型守卫）
+/// 路线 2：枚举活体 scene 反查（实测在主线程上安全：0.3.0 里它扫了 5 个 scene 没有崩）
 static id MFFindHandleBySceneScan(NSString *bundleID) {
     UIApplication *app = [UIApplication sharedApplication];
     if (![app respondsToSelector:@selector(connectedScenes)]) return nil;
@@ -121,7 +165,8 @@ static id MFFindHandleBySceneScan(NSString *bundleID) {
         for (id scene in scenes) {
             NSString *sceneID = MFStr(scene, NSSelectorFromString(@"identifier"));
             id handle = MFMsg1(sceneManager, NSSelectorFromString(@"existingSceneHandleForScene:"), scene);
-            NSString *handleBID = MFStr(MFMsg(handle, NSSelectorFromString(@"application")), NSSelectorFromString(@"bundleIdentifier"));
+            NSString *handleBID = MFStr(MFMsg(handle, NSSelectorFromString(@"application")),
+                                        NSSelectorFromString(@"bundleIdentifier"));
             MFLog(@"[host]   scene=%@ handle=%@ bid=%@",
                  sceneID ?: @"?", handle ? NSStringFromClass([handle class]) : @"nil", handleBID ?: @"?");
             if (handleBID != nil && [handleBID isEqualToString:bundleID]) return handle;
@@ -135,11 +180,12 @@ static id MFFindHandleBySceneScan(NSString *bundleID) {
 
 @class MFFloatPanel;
 
-/// 管理器接口前置声明（实现体在后面），这样面板里可以直接调用它
 @interface MFFloatManager : NSObject
 @property (nonatomic, strong) NSDictionary *config;
 @property (nonatomic, strong) MFFloatPanel *panel;
 @property (nonatomic, strong) UIWindow *window;
+/// 每次承载 +1：用来让"存活确认"只在本次承载仍然是最新一次时才清标记
+@property (nonatomic, assign) NSUInteger hostSeq;
 + (instancetype)shared;
 - (void)startWithConfig:(NSDictionary *)config;
 - (void)hostBundleID:(NSString *)bundleID;
@@ -226,10 +272,11 @@ static char kMFRowBundleIDKey;
     statusBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
     [self.view addSubview:statusBar];
 
-    UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, w - 40, statusH)];
+    UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, w - 16, statusH)];
     status.font = [UIFont systemFontOfSize:10];
     status.textColor = [UIColor colorWithWhite:0.80 alpha:1.0];
     status.text = @"初始化…";
+    status.lineBreakMode = NSLineBreakByTruncatingTail;
     status.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [statusBar addSubview:status];
     self.statusLabel = status;
@@ -338,7 +385,7 @@ static char kMFRowBundleIDKey;
                                                                  box.bounds.size.width - 28, 0)];
         body.text = detail;
         body.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
-        body.font = [UIFont systemFontOfSize:11];
+        body.font = [UIFont systemFontOfSize:10];
         body.numberOfLines = 0;
         [body sizeToFit];
         [box addSubview:body];
@@ -356,7 +403,7 @@ static char kMFRowBundleIDKey;
     const CGFloat rowH = 40.0;
     if (items.count == 0) {
         UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(14, 14, scroll.bounds.size.width - 28, 60)];
-        empty.text = @"没有正在运行的 App。\n先手动打开目标 App 再进 shell 模式。";
+        empty.text = @"没有正在运行的 App。\n先手动打开目标 App，再点右上角 ↻。";
         empty.textColor = [UIColor colorWithWhite:0.8 alpha:1];
         empty.font = [UIFont systemFontOfSize:12];
         empty.numberOfLines = 0;
@@ -441,105 +488,216 @@ static char kMFRowBundleIDKey;
 
     MFLog(@"[ui] 浮窗已显示 level=%.0f frame=%@ hidden=%d key=%d",
          level, NSStringFromCGRect(win.frame), (int)win.isHidden, (int)win.isKeyWindow);
-    [panel setStatusText:@"外壳就绪"];
 
-    NSString *mode = self.config[@"mode"];
-    if (![mode isKindOfClass:[NSString class]] || mode.length == 0) mode = @"host";
+    // ---- 0.4.0：绝不在启动时自动承载 ----
+    // 0.3.0 的崩循环就是因为"启动即自动承载"。现在只出外壳 + 应用列表，
+    // 承载必须由用户点某一行显式触发（点之前一定先过两道闸门）。
+    BOOL hostEnabled = MFConfigBool(self.config, @"hostEnabled", NO);
+    MFLog(@"[gate] hostEnabled=%d（字符串 mode 不再参与任何判断）", (int)hostEnabled);
 
-    if ([mode isEqualToString:@"shell"]) {
-        [panel setStatusText:@"shell 模式：选一个在跑的 App 试试"];
-        [self refreshAppList];
+    [self refreshAppList];
+
+    if (gMFBootCrashStep.length > 0 && MFAttemptExists()) {
+        [panel setStatusText:[NSString stringWithFormat:
+                              @"上次承载崩在 %@ · 已停用承载（删 MF-float-attempt.txt 可重试）",
+                              gMFBootCrashStep]];
+    } else if (hostEnabled) {
+        [panel setStatusText:@"hostEnabled=true · 点应用名开始承载"];
     } else {
-        NSString *bid = self.config[@"targetBundleID"];
-        if (![bid isKindOfClass:[NSString class]] || bid.length == 0) bid = @"com.apple.mobilesafari";
-        [self hostBundleID:bid];
+        [panel setStatusText:@"只看外壳 · hostEnabled=false"];
     }
 }
 
 #pragma mark 承载
+
+/// 到达 hostStep 上限时停下（用于不崩地逐步逼近崩点）
+- (void)stopAtStep:(NSInteger)nextStep limit:(NSInteger)limit {
+    MFLog(@"[host] 按 hostStep=%ld 在下一步(%ld)之前停止（本轮没有碰任何危险对象）",
+                 (long)limit, (long)nextStep);
+    MFFloatPanel *panel = self.panel;
+    // 主动停下不是崩溃：标记必须清掉，否则下一次启动会被误判成"上一轮崩了"
+    MFAttemptClear();
+    [panel showMessage:[NSString stringWithFormat:@"已在 hostStep=%ld 处停止", (long)limit]
+                detail:[NSString stringWithFormat:
+                        @"配置里 hostStep=%ld，链路只走到第 %ld 步就主动停下。\n"
+                        @"step=1 只解析应用；2 拿 sceneHandle；3 拿 FBScene；"
+                        @"4 建宿主 VC；5 设 resizesHostedContext；6 挂载视图。\n"
+                        @"把 hostStep 调大一位再 respring，就能不崩溃地逼近崩点。",
+                        (long)limit, (long)limit]];
+    [panel setStatusText:[NSString stringWithFormat:@"hostStep=%ld 上限停止", (long)limit]];
+}
 
 - (void)hostBundleID:(NSString *)bundleID {
     MFFloatPanel *panel = self.panel;
     if (panel == nil) return;
 
     MFLog(@"[host] ========== begin bid=%@ ==========", bundleID);
+
+    // ---------- 闸门 1：行为开关一律用布尔，绝不用字符串 ----------
+    if (!MFConfigBool(self.config, @"hostEnabled", NO)) {
+        MFLogS(@"[host] 拒绝：hostEnabled=false");
+        [panel showMessage:@"真承载未启用"
+                    detail:@"当前 hostEnabled=false，只会显示外壳与应用列表。\n"
+                           @"确认设备稳定后，用 Filza 把 /var/mobile/MultiFloat.plist 里的\n"
+                           @"    <key>hostEnabled</key><false/>\n"
+                           @"改成  <key>hostEnabled</key><true/>\n"
+                           @"然后 respring。\n\n"
+                           @"⚠️ 不要再去改 mode 那个字符串 —— 0.3.0 就是因为它被 iOS 自动更正"
+                           @"（shell ➜ she'll）而误进危险分支的。hostEnabled 是布尔，敲不错。"];
+        [panel setStatusText:@"承载未启用（hostEnabled=false）"];
+        return;
+    }
+
+    // ---------- 闸门 2：崩溃自解除 ----------
+    if (MFAttemptExists()) {
+        MFLogS(@"[host] 拒绝：上一轮承载留下的崩溃标记仍在");
+        [panel showMessage:@"上次承载崩过，已自动停用"
+                    detail:@"这是保护机制在起作用，不是新故障 —— 设计上最多只会崩一次。\n\n"
+                           @"重试方法：Filza 里删掉 /var/mobile/MF-float-attempt.txt，"
+                           @"然后不用 respring，直接再点一次应用行。\n\n"
+                           @"要先看崩点的话，日志在这两个文件里：\n"
+                           @"  /var/mobile/MF-crash-attribution.txt\n"
+                           @"  /var/mobile/MF-host-step-prev.txt"];
+        [panel setStatusText:@"已停用 · 删掉 MF-float-attempt.txt 可重试"];
+        return;
+    }
+
+    NSInteger limit = MFConfigInt(self.config, @"hostStep", 6);
+    if (limit < 1) limit = 1;
+    if (limit > 6) limit = 6;
+    MFLog(@"[host] hostStep 上限 = %ld", (long)limit);
+
+    // 从这里开始才有崩的可能：先落崩溃标记，再开一格新的步骤日志
+    MFAttemptWrite("host-begin");
+    MFStepReset();
+    self.hostSeq += 1;
+    NSUInteger mySeq = self.hostSeq;
+
     [panel setStatusText:[NSString stringWithFormat:@"正在承载 %@", bundleID]];
 
+    // ---------- S1：解析应用 ----------
+    MFStepMark(kMFStepApp);
     id controller = MFClassSharedInstance(@"SBApplicationController");
-    MFLog(@"[host] SBApplicationController=%@", controller ? NSStringFromClass([controller class]) : @"nil");
+    MFLog(@"[host] SBApplicationController=%@",
+         controller ? NSStringFromClass([controller class]) : @"nil");
+    id app = (controller != nil)
+           ? MFMsg1(controller, NSSelectorFromString(@"applicationWithBundleIdentifier:"), bundleID)
+           : nil;
+    MFLog(@"[host] SBApplication=%@", app ? NSStringFromClass([app class]) : @"nil");
+    MFStepOk(kMFStepApp);
+
     if (controller == nil) {
-        [self fail:@"SBApplicationController 不可用" detail:nil];
+        [self fail:@"SBApplicationController 不可用" detail:@"SpringBoard 里找不到这个类。"];
         return;
     }
-
-    id app = MFMsg1(controller, NSSelectorFromString(@"applicationWithBundleIdentifier:"), bundleID);
-    MFLog(@"[host] SBApplication=%@", app ? NSStringFromClass([app class]) : @"nil");
     if (app == nil) {
         [self fail:[NSString stringWithFormat:@"找不到应用 %@", bundleID]
-             detail:@"检查配置里的 targetBundleID 是否拼写正确。"];
+             detail:@"bundleID 拼错，或者这个 App 从来没在本机启动过。"];
         return;
     }
+    if (limit < 2) { [self stopAtStep:2 limit:limit]; return; }
 
-    id handle = MFFindHandleByPersistenceID(app, bundleID);
+    // ---------- S2：拿 sceneHandle ----------
+    MFStepMark(kMFStepHandle);
+    id handle = MFFindHandleByPersistenceID(app);
     MFLog(@"[host] handle(路线1 查表)=%@", handle ? NSStringFromClass([handle class]) : @"nil");
     if (handle == nil) {
         handle = MFFindHandleBySceneScan(bundleID);
         MFLog(@"[host] handle(路线2 扫描)=%@", handle ? NSStringFromClass([handle class]) : @"nil");
     }
+    MFStepOk(kMFStepHandle);
+
     if (handle == nil) {
         [self fail:@"找不到该 App 的运行中 scene"
-             detail:@"这个 App 现在没有活着的 scene。\n"
-                    @"做法：先把目标 App 手动打开（让它在前台跑起来），"
-                    @"再点标题栏右上角的 ↻ 拉出运行中应用列表，点对应那一行重试。\n"
-                    @"（不要用 respring 重试 —— respring 会把 App 的 scene 一起杀掉。）"];
+             detail:@"这个 App 现在没有活着的 scene（被系统回收了，或者还没真正跑起来）。\n\n"
+                    @"做法：手动打开目标 App 让它在前台跑一下，回到桌面后点右上角 ↻，"
+                    @"点列表里对应那一行重试。\n"
+                    @"不要用 respring 重试 —— respring 会把 App 的 scene 一起杀掉。"];
         return;
     }
+    if (limit < 3) { [self stopAtStep:3 limit:limit]; return; }
 
+    // ---------- S3：拿 FBScene ----------
+    MFStepMark(kMFStepScene);
     id scene = MFMsg(handle, NSSelectorFromString(@"sceneIfExists"));
     MFLog(@"[host] sceneIfExists=%@ active=%d contentState=%ld",
          scene ? NSStringFromClass([scene class]) : @"nil",
          (int)MFBoolProp(scene, NSSelectorFromString(@"isActive")),
          (long)MFIntProp(scene, NSSelectorFromString(@"contentState")));
+    MFStepOk(kMFStepScene);
 
-    id hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
-    MFLog(@"[host] newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
-    if (hostVC == nil) {
-        [self fail:@"newSceneViewController 返回 nil"
-             detail:@"SpringBoard 拒绝了宿主视图创建。把这条日志发回来。"];
+    if (scene == nil) {
+        [self fail:@"sceneIfExists 返回 nil"
+             detail:@"handle 在，但它背后的 scene 已经失效了。\n"
+                    @"先把目标 App 切到前台再点 ↻ 重试。"];
         return;
     }
+    if (limit < 4) { [self stopAtStep:4 limit:limit]; return; }
 
+    // ---------- S4：建宿主 VC ----------
+    MFStepMark(kMFStepVC);
+    id hostVC = MFMsg(handle, NSSelectorFromString(@"newSceneViewController"));
+    MFLog(@"[host] newSceneViewController=%@", hostVC ? NSStringFromClass([hostVC class]) : @"nil");
+    MFStepOk(kMFStepVC);
+
+    if (hostVC == nil) {
+        [self fail:@"newSceneViewController 返回 nil"
+             detail:@"SpringBoard 拒绝了宿主视图创建。"];
+        return;
+    }
+    if (limit < 5) { [self stopAtStep:5 limit:limit]; return; }
+
+    // ---------- S5：setSceneResizesHostedContext:YES ----------
+    // 这是让"浮窗里的 scene 按浮窗尺寸渲染"的关键；不设的话宿主会按整屏渲染，画面必然错位。
+    MFStepMark(kMFStepResize);
     SEL resizeSel = NSSelectorFromString(@"setSceneResizesHostedContext:");
+    BOOL resizeOK = NO;
     if ([hostVC respondsToSelector:resizeSel]) {
         @try {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(hostVC, resizeSel, YES);
-            MFLogS(@"[host] setSceneResizesHostedContext:YES 已设置");
+            resizeOK = YES;
         } @catch (NSException *e) {
             MFLog(@"[host] setSceneResizesHostedContext 抛异常: %@", e.reason);
         }
-    } else {
-        MFLogS(@"[host] !! 宿主 VC 不响应 setSceneResizesHostedContext:（可能出现画面错位）");
     }
+    MFLog(@"[host] setSceneResizesHostedContext:YES -> %@",
+         resizeOK ? @"已设置" : @"未设置（宿主可能按整屏渲染，画面会错位）");
+    MFStepOk(kMFStepResize);
 
-    SEL activateSel = NSSelectorFromString(@"activateWithTransitionContext:");
-    if (scene != nil && [scene respondsToSelector:activateSel]) {
-        @try {
-            ((void (*)(id, SEL, id))objc_msgSend)(scene, activateSel, nil);
-            MFLogS(@"[host] activateWithTransitionContext:nil 已发送");
-        } @catch (NSException *e) {
-            MFLog(@"[host] activate 抛异常: %@", e.reason);
-        }
-    }
+    if (limit < 6) { [self stopAtStep:6 limit:limit]; return; }
 
+    // ---------- S6：把宿主视图挂进浮窗 ----------
+    // 【0.4.0 关键删减】0.3.0 在这里之后调用了
+    //     objc_msgSend(scene, @selector(activateWithTransitionContext:), nil)
+    // 然后就崩了。FBScene 确实有这个方法（v24@0:8@16），但喂 nil 上下文极可能就是死因；
+    // 而且日志里 scene 本来 active=1，根本不需要我们再激活。所以本版彻底不调它。
+    MFStepMark(kMFStepAttach);
     [panel attachContentViewController:hostVC];
+    MFStepOk(kMFStepAttach);
+
     [panel setStatusText:[NSString stringWithFormat:@"已承载 %@", bundleID]];
-    MFLog(@"[host] ========== done bid=%@ ==========", bundleID);
+
+    // ---------- S7：存活确认 ----------
+    // 链路走完还不够：宿主视图真正开始渲染是异步的，有些断言在之后几十毫秒~几秒才炸。
+    // 所以标记要等 20 秒才清；只有"本次承载仍是最新一次"才允许清（防止误清下一轮的标记）。
+    MFStepMark(kMFStepSettle);
+    MFLog(@"[host] ========== done bid=%@ （20 秒后确认存活）==========", bundleID);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.hostSeq != mySeq) return;   // 期间又发起过承载 -> 不是本轮的事
+        MFStepOk(kMFStepSettle);
+        MFAttemptClear();
+        MFLogS(@"[gate] 承载存活 20 秒 -> 崩溃标记已清除（下次还能再试）");
+    });
 }
 
 - (void)fail:(NSString *)message detail:(NSString *)detail {
     MFLog(@"[host] FAIL: %@", message);
     MFFloatPanel *panel = self.panel;
     if (panel == nil) return;
+    // 注意：这不是崩溃，是"走到了但没成功"。标记清掉，否则会被误判成崩过。
+    MFAttemptClear();
     [panel showMessage:message detail:detail];
     [panel setStatusText:@"承载失败 · 点右上角 ↻ 拉应用列表重试"];
 }
@@ -547,6 +705,10 @@ static char kMFRowBundleIDKey;
 #pragma mark 应用列表
 
 - (void)refreshAppList {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshAppList]; });
+        return;
+    }
     id controller = MFClassSharedInstance(@"SBApplicationController");
     if (controller == nil) {
         [self.panel showMessage:@"SBApplicationController 不可用" detail:nil];
@@ -572,45 +734,37 @@ static char kMFRowBundleIDKey;
 void MFFloatBootstrap(void) {
     MFLogRawC("--- MFFloatBootstrap 进入 ---\n");
 
-    // 首次运行写出默认配置（enabled=false），方便用户在 Filza 里直接改
+    // 首次运行写出默认配置（enabled=false, hostEnabled=false），方便用户在 Filza 里直接改
     MFWriteDefaultConfigIfNeeded();
-
-    // 崩溃自解除：上一轮写过标记又没活过存活窗口 => 上一轮崩了 => 本轮不动
-    if (MFAttemptExists()) {
-        MFLogRawC("[gate] 发现上次尝试标记 -> 本轮跳过浮窗。"
-                  "确认设备稳定后，用 Filza 删除 /var/mobile/MF-float-attempt.txt 即可重新尝试。\n");
-        return;
-    }
 
     NSDictionary *config = MFLoadConfig();
     if (config == nil) {
         MFLogRawC("[gate] 无配置 -> 完全惰性（不做任何事）\n");
         return;
     }
-    if (![config[@"enabled"] boolValue]) {
+    // 老 plist 缺 0.4.0 的新键时原地补齐，省得用户手打键名
+    MFUpgradeConfigIfNeeded(config);
+    if (!MFConfigBool(config, @"enabled", NO)) {
         MFLogRawC("[gate] enabled=false -> 完全惰性（把 /var/mobile/MultiFloat.plist 里 enabled 改成 <true/> 后 respring）\n");
         return;
     }
 
-    NSString *mode = config[@"mode"];
-    if (![mode isKindOfClass:[NSString class]] || mode.length == 0) mode = @"host";
-    MFAttemptWrite(mode.UTF8String);
-    MFLog(@"[gate] 已启用 mode=%@ target=%@", mode, config[@"targetBundleID"] ?: @"(默认 Safari)");
+    // 【0.4.0 关键改动】这里【不再】写 attempt 标记，也【不再】无条件清除它。
+    // 标记只在 hostBundleID: 里写、只在存活确认后清 —— 它现在严格属于"承载"这一件事。
+    // 0.3.0 把标记清得太早（delay+30s），导致用户后来点行时其实是无保护状态。
+
+    if (MFAttemptExists()) {
+        MFLogRawC("[gate] 检测到承载崩溃标记：本轮的自动流程照常只显示外壳；"
+                  "点应用行会被拒绝（详见 MultiFloat.log）\n");
+    }
 
     double delay = 12.0;
     id cfgDelay = config[@"showDelay"];
     if ([cfgDelay respondsToSelector:@selector(doubleValue)]) delay = [cfgDelay doubleValue];
-    MFLog(@"[gate] %.1f 秒后显示浮窗", delay);
+    MFLog(@"[gate] %.1f 秒后显示浮窗（0.4.0 不做任何自动承载）", delay);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [[MFFloatManager shared] startWithConfig:config];
-    });
-
-    // 活过 (显示 + 30) 秒 => 判定为没崩 => 清除标记，下次 respring 还能再显示
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((delay + 30.0) * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        MFAttemptClear();
-        MFLogRawC("[gate] 存活确认 -> 自解除标记已清除（本轮没有崩）\n");
     });
 }

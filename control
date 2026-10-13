@@ -1,8 +1,8 @@
 Package: com.example.multifloat
 Name: MultiFloat
-Version: 0.3.0
+Version: 0.4.0
 Architecture: iphoneos-arm64e
-Description: Multi-floating window / split-view tweak for iOS 17 (roothide / arm64e). 0.3.0 is the first real feature build: a draggable/resizable floating window that hosts a running app's scene through SpringBoard's own host view controller (SBSceneHandle -newSceneViewController + setSceneResizesHostedContext:). DISABLED BY DEFAULT - does nothing until /var/mobile/MultiFloat.plist exists with enabled=true. No hooks are installed. Log: /var/mobile/MultiFloat.log
+Description: Multi-floating window / split-view tweak for iOS 17 (roothide / arm64e). 0.4.0 fixes the 0.3.0 crash-to-safe-mode loop: (a) the auto-hosting branch is gone - the window is now shell-only and hosting is strictly user-triggered; (b) all behaviour switches are booleans, because iOS keyboard autocorrect silently turned mode=shell into mode=she'll and pushed 0.3.0 into the risky branch; (c) the crash guard marker is now written/cleared around the hosting chain itself, so a crash can never repeat and can never reach safe mode; (d) the host chain is instrumented step-by-step (S1..S7) to /var/mobile/MF-host-step.txt, so a crash is attributed to an exact step; (e) the FBScene -activateWithTransitionContext:nil call that killed 0.3.0 is removed. DISABLED BY DEFAULT - does nothing until /var/mobile/MultiFloat.plist exists with enabled=true; real hosting additionally requires hostEnabled=true. No hooks are installed. Log: /var/mobile/MultiFloat.log
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks
