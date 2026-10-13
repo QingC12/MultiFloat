@@ -609,7 +609,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             BOOL wasOn = [pv respondsToSelector:@selector(boolValue)] ? [pv boolValue] : NO;
             up[@"keepAlivePreventForeground"] = @NO;
             if (up[@"hostEnabled"] == nil) up[@"hostEnabled"] = @YES;   // 缺键补默认（0.17.0 起 YES）
-            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=18：① 预防档 fg 保活关闭"
+            MFLog(@"[cfg] ★ 迁移到 cfgVersion=18：① 预防档 fg 保活关闭"
                   @"（三轮实证零收益、每回合白付一帧闪；真黑档 L1 的 fg 保留）"
                   @"② hostEnabled 默认 YES（用户要求；原值 was %@）",
                   wasOn ? @"YES" : @"NO");
