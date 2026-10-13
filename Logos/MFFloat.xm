@@ -1625,6 +1625,16 @@ static NSInteger gMFKeepAlivePreventTicks = 0;      // 【0.12.0】连续进"预
 static NSInteger gMFKeepAlivePreventWrites = 0;     // 【0.12.0】本次预防档累计写了几次 settings
 static NSTimeInterval gMFKeepAliveLastPreventTime = 0;  // 【0.12.0】上次预防写的时间（限流）
 static NSTimeInterval gMFKeepAliveLastViewFix = 0;      // 【0.12.0】上次掰承载视图的时间（限流）
+// 【0.16.0】预防写冷却：每次"去激活回合"第 1 发要快（250ms 内），但之后的写必须隔
+// keepAlivePreventCooldownMs（默认 2s）。归档(16)：一个回合写 2~4 次，每次
+// updateSettingsWithBlock 都是一次 scene 重提交（cs 2->0->1->2）= 一帧可见的内容闪，
+// 而这些追加写并不能阻止掉层（掉了由真黑档 L1 兜底、垫底快照遮住）。
+static NSInteger gMFKeepAlivePreventCooldownMs = 2000;
+// 【0.16.0】真黑恢复后的"几何按住"窗口：presenter 在重新 hosting 时会按它自己的
+// 想法重设承载视图尺寸（归档(16) 实测 384x562 vs 目标 362x366，偏差 54%），
+// 等 500ms 节流才掰回来，用户就看到画面被拉大又弹回 = "内容闪一下"。
+// 恢复后 2s 内解除节流、逐拍掰，把错误尺寸的可见窗口压到一拍（200ms）以内。
+static NSTimeInterval gMFViewHoldUntil = 0;
 
 static NSInteger MFKeepAliveMsPerTick(void) {
     NSInteger ms = [gMFKeepAliveConfig[@"keepAliveMs"] integerValue];
@@ -1681,6 +1691,7 @@ static void MFStopSceneKeepAlive(NSString *why) {
     gMFKeepAlivePreventWrites = 0;
     gMFKeepAliveLastPreventTime = 0;
     gMFKeepAliveLastViewFix = 0;
+    gMFViewHoldUntil = 0;
 }
 
 /// 只在"尺寸真的漂了"时，把 scene.frame 纠回内容区尺寸（要写 settings，所以有节流）。
@@ -1733,7 +1744,10 @@ static void MFKeepAliveFixViewFrameIfNeeded(void) {
     if (!severe && !(dw > tol || dh > tol)) return;   // 正常的布局抖动，不管
 
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (!severe) {
+    // 【0.16.0】真黑恢复后的 2s 窗口内解除节流：presenter 刚重新 hosting、正在按它
+    // 自己的想法重设尺寸，这时候慢一拍用户就看见画面被拉大再弹回（"内容闪一下"）。
+    BOOL holding = (now < gMFViewHoldUntil);
+    if (!severe && !holding) {
         NSInteger minMs = MFConfigInt(gMFKeepAliveConfig, @"keepAliveViewFrameMs", 500);
         if (gMFKeepAliveLastViewFix > 0 &&
             (now - gMFKeepAliveLastViewFix) * 1000.0 < (double)minMs) {
@@ -1744,7 +1758,7 @@ static void MFKeepAliveFixViewFrameIfNeeded(void) {
 
     MFLog(@"[keepalive] 承载视图尺寸被系统改过（%.0fx%.0f -> %.0fx%.0f，偏差 %.0f%%%@）-> 按回内容区（只动视图，不写 settings）",
           v.bounds.size.width, v.bounds.size.height, want.width, want.height,
-          MAX(dw, dh) * 100.0, severe ? @"，严重" : @"");
+          MAX(dw, dh) * 100.0, severe ? @"，严重" : (holding ? @"，恢复后按住" : @""));
     v.frame = CGRectMake(0, 0, want.width, want.height);
 }
 
@@ -1890,6 +1904,12 @@ static void MFKeepAliveTick(void) {
                   (long)gMFKeepAliveWritesInDrop, (long)gMFLastRestoreTier,
                   (long)gMFRestoreTier1Hits, (long)gMFRestoreTier2Hits, (long)gMFRestoreTier3Hits);
         }
+        // 【0.16.0】刚从真黑恢复 -> 开 2s"几何按住"窗口：presenter 重新 hosting 时
+        // 会按自己的想法重设承载视图尺寸（归档(16) 实测偏差 54%），恢复后逐拍掰回，
+        // 把错误尺寸的可见窗口从"最长 500ms 节流 + 一拍"压到一拍以内。
+        if (gMFKeepAliveDownTicks > 0) {
+            gMFViewHoldUntil = now + 2.0;
+        }
         // 【0.12.0】预防档结束 —— 本轮最该看的一行：
         // "被去激活了 N 拍、写了 M 次状态量、图层始终没掉" = 预防成功（用户什么都感觉不到）。
         if (gMFKeepAlivePreventTicks > 0) {
@@ -1951,6 +1971,20 @@ static void MFKeepAliveTick(void) {
         if (gMFKeepAliveLastPreventTime > 0 &&
             (now - gMFKeepAliveLastPreventTime) * 1000.0 < (double)preventMs) {
             return;
+        }
+
+        // 【0.16.0】冷却：本回合已经写过 1 次的话，下一次写必须隔
+        // keepAlivePreventCooldownMs（默认 2s）。归档(16) 钉死：
+        // 每次 updateSettingsWithBlock 都是一次 scene 重提交（cs 2->0->1->2）
+        // = 一帧可见的"内容闪"；而第 2~4 发并不能阻止掉层（掉了由真黑档 L1
+        // 兜底、垫底快照遮住）。所以：第 1 发要快（上面的 preventMs=250），
+        // 追加发要慢（这里 2s）—— 把每回合的可见闪帧从 2~4 帧压到 1 帧。
+        if (gMFKeepAlivePreventWrites >= 1) {
+            NSInteger cdMs = MFConfigInt(cfg, @"keepAlivePreventCooldownMs", 2000);
+            if (cdMs > 0 && gMFKeepAliveLastPreventTime > 0 &&
+                (now - gMFKeepAliveLastPreventTime) * 1000.0 < (double)cdMs) {
+                return;   // 冷却中：只观察不动手（图层真掉会走真黑档，不受此限）
+            }
         }
 
         BOOL verbose = (gMFKeepAlivePreventTicks == 1) || (gMFKeepAlivePreventTicks % 20 == 0);
@@ -2133,6 +2167,7 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFKeepAlivePreventWrites = 0;
     gMFKeepAliveLastPreventTime = 0;
     gMFKeepAliveLastViewFix = 0;
+    gMFViewHoldUntil = 0;
     gMFKeepAliveNextHeartbeat = (NSInteger)(10000.0 / ms);
     gMFKeepAliveNextFrameCheck = (NSInteger)(1000.0 / ms);
     gMFKeepAliveStartTime = [NSDate timeIntervalSinceReferenceDate];
@@ -2158,14 +2193,16 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
 
     MFLog(@"[keepalive] 已启动守护 %.0f ms/次（bundle=%@ / 预防档=%d @ %ld ms"
           @"（差量写 + fg 保活：本机 fg 读不到时每拍发 setForeground:YES，不碰几何；"
-          @"deact 写带熔断 keepAliveDeactFuse=%ld） / "
+          @"deact 写带熔断 keepAliveDeactFuse=%ld；追加写冷却=%ld ms —— 每回合第 1 发快、"
+          @"后续发慢，因为每发 updateSettings 都是闪帧） / "
           @"预防退避=%ld 拍后至 %ld ms / 真黑恢复=分级(L1纯状态量/L2+frame/L3+DC) tiered=%d / "
           @"宽限=%ld ms / 真黑写入间隔=%ld ms / 退避上限=%ld ms / "
-          @"消闪=背景透明+剥黑底+垫底快照=%d）",
+          @"消闪=背景透明+剥黑底+垫底快照=%d+恢复后几何按住2s）",
           ms, bundleID ?: @"?",
           (int)MFConfigBool(cfg, @"keepAlivePrevent", YES),
           (long)MFConfigInt(cfg, @"keepAlivePreventMs", 250),
           (long)MFConfigInt(cfg, @"keepAliveDeactFuse", 5),
+          (long)MFConfigInt(cfg, @"keepAlivePreventCooldownMs", 2000),
           (long)MFConfigInt(cfg, @"keepAlivePreventBackoffAfter", 40),
           (long)MFConfigInt(cfg, @"keepAlivePreventBackoffMaxMs", 2000),
           (int)MFConfigBool(cfg, @"keepAliveTieredRestore", YES),

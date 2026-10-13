@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.15.0";
+    return @"0.16.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -265,6 +265,12 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAlivePreventLevel"      : @YES,          //   补 setLevel:1（只在 level != 1 时发）
         @"keepAlivePreventBackoffAfter" : @40,         //   连续多少拍还在预防档之后开始退避
         @"keepAlivePreventBackoffMaxMs" : @2000,       //   预防退避的间隔上限（永不放弃，只降频）
+        @"keepAlivePreventCooldownMs"  : @2000,        // 【0.16.0 新增】预防写冷却：同一"去激活回合"
+                                                       //   第 1 发之后的写至少隔这么久。归档(16)：
+                                                       //   每发 updateSettingsWithBlock = 一次 scene
+                                                       //   重提交 = 一帧可见的内容闪；追加发并不
+                                                       //   阻止掉层（掉了由真黑档 L1 兜底）。
+                                                       //   0 = 关冷却（回到 0.15.0 的连发，A/B 用）。
         // ---- 【0.14.0 新增】消闪三件套 ----
         @"keepAliveDeactFuse"     : @5,                //   deact 写的熔断阈值：写完读回发现没变过
                                                        //   就连续计败，达到 N 次后**永不回写 deact**
@@ -286,7 +292,7 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @16,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @17,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
@@ -294,7 +300,7 @@ void MFWriteDefaultConfigIfNeeded(void) {
     BOOL ok = [def writeToFile:path atomically:YES];
     MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / "
           @"keepAlive=true@200ms / 预防档=差量写含 setForeground: / keepAliveForeground=true / "
-          @"deact 熔断=5 / 真黑分级恢复=true）",
+          @"deact 熔断=5 / 真黑分级恢复=true / 预防冷却=2000ms）",
           path, (int)ok);
 }
 
@@ -332,8 +338,9 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAlivePreventBackoffMaxMs"] == nil ||
                         cfg[@"keepAliveDeactFuse"] == nil ||
                         cfg[@"keepAliveTieredRestore"] == nil ||
-                        cfg[@"keepAliveSnapshot"] == nil);
-    if (cur >= 16 && !missingKeys) return;
+                        cfg[@"keepAliveSnapshot"] == nil ||
+                        cfg[@"keepAlivePreventCooldownMs"] == nil);
+    if (cur >= 17 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -381,6 +388,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAliveTieredRestore"] == nil) up[@"keepAliveTieredRestore"] = @YES; // 0.14.0 新增
         // ---- 0.15.0 视觉消闪 ----
         if (up[@"keepAliveSnapshot"] == nil) up[@"keepAliveSnapshot"] = @YES;           // 0.15.0 新增
+        if (up[@"keepAlivePreventCooldownMs"] == nil) up[@"keepAlivePreventCooldownMs"] = @2000; // 0.16.0 新增
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -586,17 +594,18 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                   @"（切换掉图层的黑窗 = presenter 在画这个色）");
             MFLogS(@"[cfg]     ③ 新增 keepAliveSnapshot=YES：内容区垫最后一帧快照，"
                   @"掉图层时露出定格画面；掉图层的 200~400ms 由 L1 拉回，视觉上几乎无感");
-            up[@"cfgVersion"] = @16;
+            up[@"cfgVersion"] = @17;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@ / 垫底快照=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveSoft=%@ / keepAliveHardWrite=%@ / keepAliveGiveUpAfter=%@ / 预防=%@@%@ms / 预防硬写=%@ / keepAliveForeground=%@ / 预防发前台=%@ / deact熔断=%@ / 分级恢复=%@ / 垫底快照=%@ / 预防冷却=%@ms）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
              up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveSoft"],
              up[@"keepAliveHardWrite"], up[@"keepAliveGiveUpAfter"],
              up[@"keepAlivePrevent"], up[@"keepAlivePreventMs"], up[@"keepAlivePreventHard"],
              up[@"keepAliveForeground"], up[@"keepAlivePreventForeground"],
-             up[@"keepAliveDeactFuse"], up[@"keepAliveTieredRestore"], up[@"keepAliveSnapshot"]);
+             up[@"keepAliveDeactFuse"], up[@"keepAliveTieredRestore"], up[@"keepAliveSnapshot"],
+             up[@"keepAlivePreventCooldownMs"]);
         return;
     }
 }
