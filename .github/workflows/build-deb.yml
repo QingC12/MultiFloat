@@ -1,0 +1,75 @@
+name: build-deb
+
+# 本地无 macOS：push 到 main 即由本工作流编译并产出可安装 DEB。
+#
+# 关键设计（避免已排查到的坑）：
+#   - SDK 来源用 runner 自带 Xcode 的 iPhoneOS SDK（theos/sdks 公开 Release
+#     最高仅 iPhoneOS16.5，且不存在 iPhoneOS.sdk 这种稳定命名资产）
+#   - SDK 版本经 MF_SDK_VERSION 传给 Makefile 的 TARGET，不硬编码
+#   - 显式 rootless 打包（Dopamine / var-jb，目标 iOS 17.3.1）
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  THEOS_PACKAGE_SCHEME: rootless
+
+jobs:
+  build:
+    # macos-latest = Apple Silicon runner，可产出 arm64 / arm64e
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Provide iOS SDK
+        run: |
+          set -euo pipefail
+          SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDKVER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Xcode iPhoneOS SDK: $SDKPATH (version $SDKVER)"
+          mkdir -p "$THEOS/sdks"
+          ln -sfn "$SDKPATH" "$THEOS/sdks/iPhoneOS${SDKVER}.sdk"
+          # 一并放置 theos/sdks 最高公开版本 16.5 作为后备（失败不阻断）
+          curl -fL -o /tmp/sdk16.tar.xz \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz \
+            && tar -xJf /tmp/sdk16.tar.xz -C "$THEOS/sdks" || true
+          ls -l "$THEOS/sdks"
+          echo "MF_SDK_VERSION=$SDKVER" >> "$GITHUB_ENV"
+
+      - name: Optional packaging and signing tools
+        run: brew install dpkg ldid || true
+
+      - name: Toolchain info
+        run: |
+          echo "THEOS=${THEOS}"
+          echo "MF_SDK_VERSION=${MF_SDK_VERSION}"
+          xcodebuild -version || true
+          clang --version | head -2 || true
+
+      - name: Build package
+        run: |
+          set -euo pipefail
+          make package
+
+      - name: List packages
+        if: always()
+        run: ls -l packages || true
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiFloat-deb
+          path: packages/*.deb
+          if-no-files-found: error

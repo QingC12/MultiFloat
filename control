@@ -3,6 +3,7 @@ Name: MultiFloat
 Version: 0.1.0
 Architecture: iphoneos-arm64
 Description: Multi-floating window jailbreak tweak skeleton
-Maintainer: [VERIFY]
+Maintainer: QingC12 <QingC12@users.noreply.github.com>
+Author: QingC12
 Section: Tweaks
-Depends: [VERIFY jailbreak hook backend]
+Depends: firmware (>= 15.0)

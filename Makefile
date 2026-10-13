@@ -5,7 +5,10 @@
 ARCHS = arm64 arm64e
 
 # [VERIFY] Confirm the installed Theos SDK and deployment target.
-TARGET = iphone:clang:latest:15.0
+# CI passes the runner Xcode SDK version in via MF_SDK_VERSION; 16.5 is the
+# highest public theos/sdks release and serves as the local fallback.
+MF_SDK_VERSION ?= 16.5
+TARGET = iphone:clang:$(MF_SDK_VERSION):15.0
 
 include $(THEOS)/makefiles/common.mk
 
