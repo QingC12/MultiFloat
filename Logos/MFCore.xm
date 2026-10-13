@@ -228,7 +228,7 @@ NSString *MFStepRotateAndAnalyze(void) {
     // 无论有没有结论，都把这一轮日志留档，然后开新的一轮
     if (crashed.length > 0) {
         NSString *why = [NSString stringWithFormat:
-                         "crashedStep=%@\n说明：上一轮承载走到 %@ 之后进程消失，"
+                         @"crashedStep=%@\n说明：上一轮承载走到 %@ 之后进程消失，"
                          @"也就是说崩点就在这一步（或其内部的异步副作用）。\n"
                          @"t=%ld\n",
                          crashed, crashed, (long)time(NULL)];
