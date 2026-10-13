@@ -355,7 +355,8 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             MFLogS(@"[cfg] ★ 迁移到 cfgVersion=12：新增 keepAliveHardWrite / keepAliveBackoffAfter /"
                   @" keepAliveBackoffMaxMs（默认 true / 50 / 2000）");
             MFLogS(@"[cfg]   ★ 真黑时现在一律**全量写**（含 setLevel + setDisplayConfiguration）——"
-                  @"0.10.0 的"最小写"实测一次都拉不回来；要复现旧行为把 keepAliveHardWrite 设 false。");
+                  @"0.10.0 那种最小写（只有 idle + deact + frame）实测一次都拉不回来；"
+                  @"要复现旧行为把 keepAliveHardWrite 设 false。");
             MFLogS(@"[cfg]   ★ 0.11.0 还区分了两种黑：scene 没图层（写 settings）vs presenter 掉 hosting（只修承载）。");
             up[@"cfgVersion"] = @12;
         }
