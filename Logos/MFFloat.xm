@@ -143,6 +143,7 @@ static id MFFindHandleBySceneScan(NSString *bundleID) {
 + (instancetype)shared;
 - (void)startWithConfig:(NSDictionary *)config;
 - (void)hostBundleID:(NSString *)bundleID;
+- (void)refreshAppList;
 @end
 
 @interface MFFloatPanel : UIViewController
@@ -183,13 +184,24 @@ static char kMFRowBundleIDKey;
     [self.view addSubview:bar];
     self.titleBar = bar;
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 58, barH)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 96, barH)];
     title.text = [NSString stringWithFormat:@"MultiFloat %@", MFVersionString()];
     title.textColor = [UIColor colorWithWhite:0.95 alpha:1.0];
     title.font = [UIFont boldSystemFontOfSize:13];
     title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [bar addSubview:title];
     self.titleLabel = title;
+
+    // 刷新键：拉取"当前正在运行"的 App 列表。
+    // 没有它就只能在 respring 后才能重试，而 respring 会杀掉目标 App 的 scene。
+    UIButton *reload = [UIButton buttonWithType:UIButtonTypeCustom];
+    reload.frame = CGRectMake(w - 76, 4, 34, 28);
+    [reload setTitle:@"↻" forState:UIControlStateNormal];
+    [reload setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
+    reload.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    reload.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    [reload addTarget:self action:@selector(onReloadTapped) forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:reload];
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
     close.frame = CGRectMake(w - 42, 4, 34, 28);
@@ -251,6 +263,11 @@ static char kMFRowBundleIDKey;
 - (void)onCloseTapped {
     MFLogS(@"[ui] 关闭按钮被点（respring 可再次显示）");
     self.hostWindow.hidden = YES;
+}
+
+- (void)onReloadTapped {
+    MFLogS(@"[ui] 刷新按钮被点 -> 重拉运行中应用列表");
+    [[MFFloatManager shared] refreshAppList];
 }
 
 - (void)onDrag:(UIPanGestureRecognizer *)g {
@@ -471,7 +488,10 @@ static char kMFRowBundleIDKey;
     }
     if (handle == nil) {
         [self fail:@"找不到该 App 的运行中 scene"
-             detail:@"这个 App 现在没有活着的 scene。先手动打开它、停在应用里，然后关闭浮窗重开（或 respring）再试。"];
+             detail:@"这个 App 现在没有活着的 scene。\n"
+                    @"做法：先把目标 App 手动打开（让它在前台跑起来），"
+                    @"再点标题栏右上角的 ↻ 拉出运行中应用列表，点对应那一行重试。\n"
+                    @"（不要用 respring 重试 —— respring 会把 App 的 scene 一起杀掉。）"];
         return;
     }
 
@@ -521,7 +541,7 @@ static char kMFRowBundleIDKey;
     MFFloatPanel *panel = self.panel;
     if (panel == nil) return;
     [panel showMessage:message detail:detail];
-    [panel setStatusText:@"承载失败（详见 /var/mobile/MultiFloat.log）"];
+    [panel setStatusText:@"承载失败 · 点右上角 ↻ 拉应用列表重试"];
 }
 
 #pragma mark 应用列表
