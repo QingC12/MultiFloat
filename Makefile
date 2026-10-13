@@ -5,6 +5,12 @@
 #   - THEOS_PACKAGE_SCHEME = roothide（文件按 roothide 布局，deb 架构为 iphoneos-arm64e）
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
+#
+# 0.3.0 变更：
+#   - 从"纯空壳"变为第一个真实功能版（默认关闭）
+#   - 编译单元收敛为纯 Objective-C + Logos：Swift 骨架暂时移出构建
+#     （Swift 进 SpringBoard 是又一个未验证变量，等承载链路跑通再迁回来）
+#   - 不链接任何 substrate / ellekit：本版不装 hook
 
 ARCHS = arm64e
 THEOS_PACKAGE_SCHEME ?= roothide
@@ -18,30 +24,17 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = MultiFloat
 
 MultiFloat_FILES = \
-    Logos/SpringBoardHooks.xm \
     Logos/HookBridge.xm \
-    Swift/MultiFloatCore.swift \
-    Swift/WindowManager.swift \
-    Swift/FloatingWindow.swift \
-    Swift/SceneManager.swift \
-    Swift/LayoutEngine.swift \
-    Swift/GestureController.swift \
-    Swift/StateMachine.swift \
-    Swift/AppRegistry.swift \
-    Swift/Preferences.swift
+    Logos/MFCore.xm \
+    Logos/MFFloat.xm
+
+# 显式开启 ARC，避免 Theos 默认值在不同版本间摇摆导致内存语义不确定
+MultiFloat_CFLAGS = -fobjc-arc
 
 # [CONFIRMED] 分析的主库注入 SpringBoard
 INSTALL_TARGET_PROCESSES = SpringBoard
 
-# [VERIFY] 确认所选 SDK 中框架可用
-MultiFloat_FRAMEWORKS = Foundation UIKit CoreGraphics
-
-# [VERIFY] Theos Swift 集成变量名取决于所用 Theos/工具链
-# MultiFloat_SWIFT_BRIDGING_HEADER = Bridge/MultiFloat-Bridging-Header.h
-# MultiFloat_SWIFTFLAGS += -module-name MultiFloatCore
-
-# [VERIFY] 环境验证后再决定 Hook 后端
-# MultiFloat_LIBRARIES = substrate
-# MultiFloat_LIBRARIES = ellekit
+# QuartzCore 用于 CALayer 圆角/边框
+MultiFloat_FRAMEWORKS = Foundation UIKit CoreGraphics QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
