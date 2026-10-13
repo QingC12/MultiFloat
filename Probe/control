@@ -1,0 +1,9 @@
+Package: com.example.multifloatprobe
+Name: MultiFloatProbe
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Runtime probe for MultiFloat - dumps private API ownership, signatures and ivars to /var/mobile/Library/Logs
+Maintainer: QingC12 <QingC12@users.noreply.github.com>
+Author: QingC12
+Section: Tweaks
+Depends: firmware (>= 15.0)

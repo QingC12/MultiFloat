@@ -58,18 +58,34 @@ jobs:
           xcodebuild -version || true
           clang --version | head -2 || true
 
-      - name: Build package
+      - name: Build MultiFloat package
         run: |
           set -euo pipefail
           make package
 
+      - name: Build MultiFloatProbe package
+        run: |
+          set -euo pipefail
+          make package -C Probe
+
       - name: List packages
         if: always()
-        run: ls -l packages || true
+        run: |
+          ls -l packages || true
+          ls -l Probe/packages || true
 
-      - name: Upload DEB artifact
+      - name: Upload MultiFloat DEB
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: MultiFloat-deb
           path: packages/*.deb
+          if-no-files-found: error
+
+      - name: Upload MultiFloatProbe DEB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiFloatProbe-deb
+          path: Probe/packages/*.deb
           if-no-files-found: error
