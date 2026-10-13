@@ -1629,7 +1629,7 @@ static NSTimeInterval gMFKeepAliveLastViewFix = 0;      // 【0.12.0】上次掰
 // keepAlivePreventCooldownMs（默认 2s）。归档(16)：一个回合写 2~4 次，每次
 // updateSettingsWithBlock 都是一次 scene 重提交（cs 2->0->1->2）= 一帧可见的内容闪，
 // 而这些追加写并不能阻止掉层（掉了由真黑档 L1 兜底、垫底快照遮住）。
-static NSInteger gMFKeepAlivePreventCooldownMs = 2000;
+// （冷却值在预防分支里用 MFConfigInt 现读，不落静态变量 —— -Werror 不允许未引用的 static。）
 // 【0.16.0】真黑恢复后的"几何按住"窗口：presenter 在重新 hosting 时会按它自己的
 // 想法重设承载视图尺寸（归档(16) 实测 384x562 vs 目标 362x366，偏差 54%），
 // 等 500ms 节流才掰回来，用户就看到画面被拉大又弹回 = "内容闪一下"。
