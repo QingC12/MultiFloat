@@ -2,9 +2,13 @@
 # 目标环境：[CONFIRMED] iOS 17.3.1 / arm64e / roothide (Relaxin)
 # 只读采样：把本机真实的私有 API 归属/签名/ivar 写入 /var/mobile 下的日志。
 #
-# v0.4.0：新增「第三方浮窗类定位」「呈现链路结构 dump」「活体只读探测」
-#         「open 入口纯日志 hook」。hook 后端通过 dlsym(RTLD_DEFAULT) 运行期解析，
-#         因此**不链接**任何 substrate / ellekit 库。
+# v0.5.0：安全闸门版。
+#         - 自动段只保留两轮验证过安全的（env/类清单/selector 归属/第三方类/结构 dump）
+#         - 新增纯静态「关键 selector 全镜像归属搜索」
+#         - 活体段改为闸门文件控制 + 主线程执行 + 逐调用落盘 + 崩溃自解除
+#         - hook 段同样加闸门（默认不装）
+#         闸门文件：/var/mobile/MFProbe-live-gate.txt（内容 1..4）
+#                   /var/mobile/MFProbe-hooks-gate.txt（存在即装 hook）
 
 ARCHS = arm64e
 THEOS_PACKAGE_SCHEME ?= roothide

@@ -1,25 +1,43 @@
-// MultiFloatProbe v0.4.0 — SpringBoard 运行期探针（蓝图补采版）
+// MultiFloatProbe v0.5.0 — SpringBoard 运行期探针（安全闸门版）
 //
 // 目标环境：[CONFIRMED] iPhone 15 Pro Max / iOS 17.3.1 / arm64e / roothide (Relaxin)
 //
-// ============ v0.3.0 → v0.4.0 变更 ============
-// v0.3.0 真机结果：全程跑完、无崩溃、未进安全模式（心跳末尾 run:done，summary 有 COMPLETE）。
-// 崩因（全类 realize）已验证消除，因此本轮可以安全地扩展采集面。
+// ============ v0.4.0 真机结果（必须先读） ============
+// v0.4.0 安装后 15 秒触发安全模式。心跳证实：SpringBoard 连续崩了 3 次
+// （pid 15919 / 15943 / 15964），三次的轨迹**逐字节相同**（各 3311 行），
+// 最后一次心跳都是 stage=live:handleMap —— 即崩点 100% 确定在
+// 「段 G 活体探测 · 7.2 scene → sceneHandle 反查」里，且从未跑完到 7.3。
+// 段 E（第三方浮窗类）与段 F（结构 dump）本轮**全部完成**，数据已拿到。
 //
-// 本轮新增 4 段（都是"补蓝图盲区"）：
-//   E. 第三方浮窗类定位       —— 全镜像 objc_copyClassNamesForImage（不 realize），
-//                               查 SSFloatingManager / SSFloatingWindow / SSFloatingRootViewController
-//                               到底由哪个 dylib 提供，并列出所有非系统镜像里的浮窗类。
-//   F. 呈现链路结构 dump      —— _UIScenePresenter / UIScenePresentationManager / SBDeviceApplicationSceneEntity
-//                               等"场景→呈现"关键类的完整 ivar + 方法 + type encoding。
-//   G. 活体只读探测           —— 枚举当前活着的 FBScene，读它们的 uiPresentationManager，
-//                               并按 bundleID 找 QQ 的 scene / scene handle。只读，不创建任何对象。
-//   H. open 入口纯日志 hook   —— 通过 dlsym(RTLD_DEFAULT) 运行期解析 MSHookMessageEx，
-//                               给 SBMainWorkspace / FBSceneManager / UIScenePresentationManager
-//                               的关键方法装 passthrough hook，只记录不改变行为。
-//                               （记忆约束：不能依赖固定路径 dlopen ellekit/substrate）
+// 7.2 相对 7.1（已验证安全）只多了三件事：
+//    1) [sm existingSceneHandleForScene:sc]
+//    2) [h application] / [h persistenceIdentifier]
+//    3) [sc uiPresentationManager]      <-- 最大嫌疑
+// 其中 3) 最可疑：段 F 的结构 dump 证明 ```uiPresentationManager``` 根本不是 FBScene 自己的方法，
+// 而是**定义在 NSObject 上的一个 category 方法**（全镜像 3197 个类都"响应"它）。
+// 也就是说它不是纯取值，极可能**惰性创建/注册 UIScenePresentationManager**，
+// 而我们在**后台队列**上调用了它 —— 这正是 SpringBoard 常见的 "必须在主线程" 断言死法。
 //
-// 安全约束：不创建 scene / 不创建 presenter / 不改任何对象状态；后台队列执行，不阻塞主线程。
+// ============ v0.5.0 的应对 ============
+// 1. 【默认全安全】自动段只保留 v0.3.0 / v0.4.0 已连续两轮验证过没问题的：
+//    env / 类清单 / selector 归属（白名单 + 镜像）/ 第三方类 / 结构 dump。
+// 2. 【新增第 7 段：关键 selector 全镜像归属搜索】纯静态（只读 method list，不 realize、
+//    不创建对象），直接回答："uiPresentationManager / setResizesHostedContext: /
+//    presentationView / sceneIfExists / existingSceneHandleForPersistenceIdentifier: …
+//    这些 selector 到底是哪个类定义的、在哪个镜像里、签名是什么"。
+// 3. 【活体段改为闸门控制 + 主线程执行 + 逐调用落盘 + 自解除】
+//    - 闸门文件  /var/mobile/MFProbe-live-gate.txt  内容 = 级别 1..4；不存在 => 完全不跑。
+//    - 尝试标记  /var/mobile/MFProbe-live-attempt.txt  记录"已尝试过的级别"。
+//      进程启动时若 标记级别 == 闸门级别 => 本轮直接跳过活体段（说明上一次就是崩在这）。
+//      => 最多崩一次，永远不会再出现"崩→重启→再崩→安全模式"的循环。
+//    - 活体段一律 dispatch 到**主线程**执行（这正是 v0.4.0 的最大失误）。
+//    - 每次危险调用前后各写一条心跳 + 立即 append 到 -live.log，崩了也能精确定位到调用。
+//    - 级别按风险递增：1/2 = 已验证安全的枚举；3 = handle 反查；4 = uiPresentationManager。
+//    => 崩在 4 也照样拿到 1~3 的数据；想再采一次就在 Filza 里删掉 attempt 文件。
+// 4. 【hook 段也加闸门】/var/mobile/MFProbe-hooks-gate.txt 存在才装（默认不装）。
+// 5. 【summary 的假 COMPLETE 修掉】以前第 4 段后就写 ==== COMPLETE ====，会误判为跑完。
+//
+// 安全约束：自动段不创建任何对象、不改任何状态、不发送任何"会改状态"的消息。
 // ==========================================================================
 
 #import <Foundation/Foundation.h>
@@ -41,10 +59,25 @@ static NSString *const kOutDir  = @"/var/mobile";
 static NSString *const kSummary = @"MultiFloatProbe-summary.log";
 static NSString *const kMethods = @"MultiFloatProbe-methods.log";
 static NSString *const kThird   = @"MultiFloatProbe-thirdparty.log";
-static NSString *const kLive    = @"MultiFloatProbe-live.log";
+static NSString *const kOwners  = @"MultiFloatProbe-owners.log";
+
+#define MF_PROBE_VERSION "0.5.0"
 
 #define MF_HEARTBEAT  "/var/mobile/MultiFloatProbe-heartbeat.log"
 #define MF_HOOKLOG    "/var/mobile/MultiFloatProbe-hooks.log"
+#define MF_BOOTLOG    "/var/mobile/MultiFloatProbe-boot.log"
+#define MF_LIVELOG    "/var/mobile/MultiFloatProbe-live.log"
+
+// ---- 安全闸门（全部手动创建，缺省一律"最保守"）----
+#define MF_GATE_LIVE   "/var/mobile/MFProbe-live-gate.txt"     // 内容 1..4；不存在 => 活体段不跑
+#define MF_GATE_HOOKS  "/var/mobile/MFProbe-hooks-gate.txt"    // 存在 => 装 hook（内容忽略）
+#define MF_ATTEMPT     "/var/mobile/MFProbe-live-attempt.txt"  // 记录已尝试级别，防崩溃循环
+// 自动段的自解除标记：崩过一次后下一次启动直接跳过，成功一次后自动删除。
+// => 任何一段都不可能形成 "崩→重启→再崩" 的连锁，安全模式从结构上被排除。
+#define MF_AUTORUN_ATTEMPT "/var/mobile/MFProbe-autorun-attempt.txt"
+#define MF_OWNERS_ATTEMPT  "/var/mobile/MFProbe-owners-attempt.txt"
+#define MF_OWNERSLOG       "/var/mobile/MultiFloatProbe-owners-progress.log"
+#define MF_STATELOG        "/var/mobile/MultiFloatProbe-state.log"
 
 #pragma mark - 心跳 / 追加写（纯 POSIX，不依赖 ObjC 运行时）
 
@@ -307,6 +340,23 @@ static NSArray<NSString *> *MFDetailClasses(void) {
         @"SBFluidSwitcherGestureManager", @"SBAppLayout", @"SBDisplayItem",
         @"FBSceneManager", @"FBScene", @"UIWindowScene", @"UIWindow",
         @"SBPIPControllerCoordinator", @"SBPIPInteractionController",
+        // ---- v0.5.0 新增：补上"呈现上下文 / 宿主 / scene 定义"这几块拼图 ----
+        // 7.2 崩溃的 uiPresentationManager 到底把对象注册到哪儿，答案在这些类里
+        @"UIScenePresentationContext", @"UISceneMutablePresentationContext",
+        @"_UIScenePresentationView", @"_UIScenePresenterOwner", @"_UISceneHostingView",
+        @"UISceneHostingViewController", @"UIApplicationSceneSettings",
+        @"FBSceneWorkspace", @"FBSMutableSceneDefinition", @"FBSMutableSceneParameters",
+        @"FBSMutableSceneSettings", @"FBSMutableSceneClientSettings",
+        @"FBSMutableSceneIdentityToken", @"FBSceneIdentityToken", @"FBSSceneDefinition",
+        @"SBMainWorkspace", @"SBMainWorkspaceTransaction", @"SBMainWorkspaceTransitionRequest",
+        @"SBWorkspaceTransaction", @"SBWorkspaceEntity", @"SBWorkspaceApplicationSceneTransitionContext",
+        @"SBFluidSwitcherViewController", @"SBHomeScreenViewController",
+        @"SBDisplayIdentifier", @"SBSceneSnapshotReferenceFrame",
+        // ---- 设备上真实存在的第三方浮窗类（v0.4.0 已确认来自 ScreenshotShell.dylib）----
+        // 注意：段 E 已证明它是"截图浮动图片"，不是活体 App 浮窗；
+        //       这里 dump 它是为了抄它的取窗口/拖动窗口的写法，不再指望它给分屏链路。
+        @"SSFloatingManager", @"SSFloatingWindow", @"SSFloatingRootViewController",
+        @"ADPanelWindow", @"KayokoCompactLandscapeOverlayWindow", @"SSHistoryOverlayWindow",
     ];
 }
 
@@ -414,14 +464,14 @@ static NSArray *MFMethodKeywords(void) {
 
 static NSString *MFSectionEnv(void) {
     NSMutableString *s = [NSMutableString string];
-    [s appendString:@"==== MultiFloatProbe v0.4.0 · 环境实况 ====\n"];
+    [s appendFormat:@"==== MultiFloatProbe v%s · 环境实况 ====\n", MF_PROBE_VERSION];
     [s appendFormat:@"时间     : %@\n", [NSDate date]];
     [s appendFormat:@"进程     : %@ (pid %d)\n", [[NSProcessInfo processInfo] processName], (int)getpid()];
     [s appendFormat:@"bundle   : %@\n", [[NSBundle mainBundle] bundleIdentifier]];
     [s appendFormat:@"iOS      : %@\n", [[NSProcessInfo processInfo] operatingSystemVersionString]];
     [s appendFormat:@"osversion: %@\n", MFSysctl("kern.osversion")];
     [s appendFormat:@"设备     : %@ / %@\n", MFSysctl("hw.machine"), MFSysctl("hw.model")];
-    [s appendFormat:@"探针版本 : 0.4.0 (roothide / arm64e)\n"];
+    [s appendFormat:@"探针版本 : %s (roothide / arm64e)\n", MF_PROBE_VERSION];
 
     [s appendString:@"\n-- 关键已加载镜像 --\n"];
     uint32_t imgCount = _dyld_image_count();
@@ -621,16 +671,12 @@ static NSString *MFSectionThirdParty(void) {
 
 static NSString *MFBuildStructureReport(void) {
     NSMutableString *m = [NSMutableString string];
-    [m appendString:@"==== MultiFloatProbe v0.4.0 · 呈现链路结构 ====\n"];
+    [m appendFormat:@"==== MultiFloatProbe v%s · 呈现链路结构 ====\n", MF_PROBE_VERSION];
     NSArray *keywords = MFMethodKeywords();
     NSArray *full = MFDetailClasses();
 
     NSMutableArray *list = [NSMutableArray array];
-    [list addObjectsFromArray:full];
-    // 追加：SSFloating* 三类（若存在则完整 dump）
-    for (NSString *t in @[@"SSFloatingManager", @"SSFloatingWindow", @"SSFloatingRootViewController"]) {
-        [list addObject:t];
-    }
+    for (NSString *t in full) if (![list containsObject:t]) [list addObject:t];
 
     for (NSString *clsName in list) {
         Class cls = objc_getClass(clsName.UTF8String);
@@ -646,13 +692,146 @@ static NSString *MFBuildStructureReport(void) {
         [m appendFormat:@"类方法:\n%@\n", MFMethods(object_getClass(cls), keywords, all, 200)];
         [m appendFormat:@"实例方法:\n%@\n", MFMethods(cls, keywords, all, 900)];
     }
-    [m appendString:@"\n==== COMPLETE ====\n"];
+    [m appendString:@"\n==== 段 F 结束 ====\n"];
     return m;
 }
 
-#pragma mark - 段 7（新）：活体只读探测
+#pragma mark - 段 9（新）：关键 selector 全镜像归属搜索（纯静态）
 
-static NSMutableString *gLive = nil;
+// 这些 selector 是"浮窗分屏"唯一必须打通的接口。v0.4.0 的实例/归属查询只覆盖了
+// 白名单 64 类 + SpringBoard 镜像里的 SB/FB/BK 类，恰好漏掉了 "uiPresentationManager
+// 到底谁定义" 这种 NSObject-category 情况 —— 这里做全镜像无遗漏搜索。
+static NSArray<NSString *> *MFOwnerTargets(void) {
+    return @[
+        @"uiPresentationManager",
+        @"presentationManager",
+        @"presentationView",
+        @"_initWithScene:",
+        @"createPresenterWithIdentifier:",
+        @"createPresenterWithIdentifier:priority:",
+        @"createPresenterForLayerTarget:identifier:priority:",
+        @"modifyPresentationContext:",
+        @"modifyDefaultPresentationContext:",
+        @"setResizesHostedContext:",
+        @"resizesHostedContext",
+        @"sceneResizesHostedContext",
+        @"setSceneResizesHostedContext:",
+        @"sceneIfExists",
+        @"existingSceneHandleForScene:",
+        @"existingSceneHandleForPersistenceIdentifier:",
+        @"existingSceneHandleForSceneIdentity:",
+        @"applicationWithBundleIdentifier:",
+        @"_createSceneForApplication:withOptions:completion:",
+        @"windowScene",
+        @"_uiPresentationManager",
+        @"_setResizesHostedContext:",
+        @"_setWindowLevel:",
+    ];
+}
+
+// 全镜像 "类名 -> 镜像文件名" 映射。只用 objc_copyClassNamesForImage（不 realize）。
+static NSDictionary<NSString *, NSString *> *MFClassImageMap(void) {
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary dictionary];
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        NSString *p = [NSString stringWithUTF8String:path];
+        if (!p) continue;
+        unsigned int cnt = 0;
+        const char **names = objc_copyClassNamesForImage(path, &cnt);
+        if (!names) continue;
+        NSString *base = [p lastPathComponent];
+        for (unsigned int j = 0; j < cnt; j++) {
+            if (!names[j]) continue;
+            NSString *cn = [NSString stringWithUTF8String:names[j]];
+            if (cn && map[cn] == nil && base) map[cn] = base;
+        }
+        free((void *)names);
+    }
+    return map;
+}
+
+static NSString *MFOwnerSearchReport(void) {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"==== MultiFloatProbe v%s · 关键 selector 全镜像归属搜索 ====\n", MF_PROBE_VERSION];
+    [s appendString:@"方法：遍历全部已注册类的 class_copyMethodList；不 realize、不创建对象、不发消息。\n"];
+    [s appendString:@"(只看 \"自有方法\"，继承命中不在此列出——那正是 v0.4.0 归属查询的盲区)\n\n"];
+
+    NSArray<NSString *> *targets = MFOwnerTargets();
+    NSUInteger n = targets.count;
+    SEL *sels = (SEL *)calloc(n ? n : 1, sizeof(SEL));
+    if (!sels) return @"(calloc 失败)\n";
+    for (NSUInteger i = 0; i < n; i++) sels[i] = NSSelectorFromString(targets[i]);
+
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *owners = [NSMutableDictionary dictionary];
+    for (NSString *t in targets) owners[t] = [NSMutableArray array];
+
+    MFBeat("owners:imagemap");
+    NSDictionary<NSString *, NSString *> *imgMap = MFClassImageMap();
+    MFBeat("owners:imagemap:ok");
+
+    int numClasses = objc_getClassList(NULL, 0);
+    if (numClasses <= 0) { free(sels); return @"(objc_getClassList 返回 0)\n"; }
+    Class *classes = (Class *)calloc((size_t)numClasses, sizeof(Class));
+    if (!classes) { free(sels); return @"(类数组分配失败)\n"; }
+    numClasses = objc_getClassList(classes, numClasses);
+    [s appendFormat:@"已注册类 %d 个；类名→镜像映射 %lu 条；目标 selector %lu 个\n",
+     numClasses, (unsigned long)imgMap.count, (unsigned long)n];
+
+    MFBeat("owners:scan:begin");
+    MFAppendTo(MF_OWNERSLOG, [NSString stringWithFormat:@"[owners] scan begin, classes=%d targets=%lu\n",
+                              numClasses, (unsigned long)n]);
+    for (int i = 0; i < numClasses; i++) {
+        Class c = classes[i];
+        if (!c) continue;
+        if ((i % 500) == 0) {
+            MFBeatf("owners:scan:%d", i);
+            // 进度落盘：万一崩了，最后一行就是崩点附近的类序号
+            MFAppendTo(MF_OWNERSLOG, [NSString stringWithFormat:@"[owners] i=%d/%d name=%s\n",
+                                      i, numClasses, class_getName(c) ?: "?"]);
+        }
+        unsigned mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        if (!ms) continue;
+        for (unsigned k = 0; k < mc; k++) {
+            SEL sel = method_getName(ms[k]);
+            if (!sel) continue;
+            for (NSUInteger t = 0; t < n; t++) {
+                if (sel != sels[t]) continue;
+                const char *cn = class_getName(c);
+                NSString *owner = cn ? [NSString stringWithUTF8String:cn] : @"?";
+                if (!owner) owner = @"?";
+                const char *e = method_getTypeEncoding(ms[k]);
+                NSString *enc = e ? [NSString stringWithUTF8String:e] : @"?";
+                if (!enc) enc = @"?";
+                [owners[targets[t]] addObject:[NSString stringWithFormat:
+                    @"      %@  enc=%@  img=%@\n", owner, enc, imgMap[owner] ?: @"?"]];
+                break;
+            }
+        }
+        free(ms);
+    }
+    free(classes);
+    free(sels);
+    MFBeat("owners:scan:end");
+
+    for (NSString *t in targets) {
+        NSArray<NSString *> *list = owners[t];
+        [s appendFormat:@"\n%@\n  定义类 %lu 个:\n", t, (unsigned long)list.count];
+        if (list.count == 0) {
+            [s appendString:@"      (无类定义此 selector)\n"];
+            continue;
+        }
+        NSUInteger cap = list.count > 40 ? 40 : list.count;
+        for (NSUInteger i = 0; i < cap; i++) [s appendString:list[i]];
+        if (list.count > cap) [s appendFormat:@"      ...（共 %lu 个，已截断）\n", (unsigned long)list.count];
+    }
+    [s appendString:@"\n==== 段 9 结束 ====\n"];
+    return s;
+}
+
+#pragma mark - 段 7（新）：活体只读探测（闸门 + 分级 + 主线程 + 逐调用落盘）
 
 // 取容器元素个数（显式类型化 objc_msgSend，避免 id 返回值被当成指针）
 static NSUInteger MFCountOf(id container) {
@@ -677,121 +856,252 @@ static id MFObjectAt(id container, NSUInteger i) {
     }
 }
 
-static NSString *MFSectionLive(void) {
-    gLive = [NSMutableString string];
-    [gLive appendString:@"==== 活体只读探测（不创建任何对象）====\n"];
-    [gLive appendFormat:@"时间: %@\n\n", [NSDate date]];
+#pragma mark - 安全闸门（v0.5.0）
 
-    // --- 7.1 UIApplication.connectedScenes → 每个 window scene 的 SBSceneManager ---
-    MFBeat("live:uiapp");
+static int MFReadIntFile(const char *path, int dflt) {
+    FILE *f = fopen(path, "r");
+    if (!f) return dflt;
+    int v = dflt;
+    if (fscanf(f, "%d", &v) != 1) v = dflt;
+    fclose(f);
+    return v;
+}
+
+static void MFWriteIntFile(const char *path, int v) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d\n", v);
+    fflush(f);
+    fclose(f);
+}
+
+static BOOL MFFileExists(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+// 活体段专用日志：每条都立刻落盘（不再攒到函数返回，崩了也不丢前面已采到的数据）
+static void MFLiveLine(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (line) MFAppendTo(MF_LIVELOG, line);
+}
+
+static void MFLiveStepStart(const char *tag) {
+    MFBeatf("live:%s", tag);
+    MFLiveLine(@">>> %s\n", tag);
+}
+
+static void MFLiveStepDone(const char *tag) {
+    MFLiveLine(@"<<< %s ok\n", tag);
+    MFBeatf("live:%s:ok", tag);
+}
+
+// ---------------- L1：枚举活着的 windowScene / sceneManager（v0.4.0 的 7.1 前半，已验证安全）----
+static void MFLiveLevel1(void) {
     Class uiAppCls = objc_getClass("UIApplication");
     id uiApp = MFClassSharedInstance(uiAppCls);
     if (!uiApp) uiApp = MFObjProp((id)uiAppCls, @selector(sharedApplication));
-    [gLive appendFormat:@"UIApplication.sharedApplication = %@\n", MFClassOf(uiApp)];
+    MFLiveLine(@"UIApplication = %@\n", MFClassOf(uiApp));
 
+    MFLiveStepStart("l1.connectedScenes");
     id conn = MFObjProp(uiApp, @selector(connectedScenes));
     NSUInteger wsCount = MFCountOf(conn);
-    [gLive appendFormat:@"connectedScenes = %@ (count=%lu)\n",
-     MFClassOf(conn), (unsigned long)wsCount];
+    MFLiveLine(@"connectedScenes = %@ count=%lu\n", MFClassOf(conn), (unsigned long)wsCount);
+    MFLiveStepDone("l1.connectedScenes");
 
-    for (NSUInteger i = 0; i < wsCount && i < 12; i++) {
+    for (NSUInteger i = 0; i < wsCount && i < 8; i++) {
+        MFLiveStepStart("l1.windowScene");
         id ws = MFObjectAt(conn, i);
-        if (!ws) continue;
-        [gLive appendFormat:@"\n  [windowScene %lu] %@\n", (unsigned long)i, MFClassOf(ws)];
-        id sm = MFObjProp(ws, @selector(sceneManager));
-        [gLive appendFormat:@"      sceneManager = %@\n", MFClassOf(sm)];
-        id all = MFObjProp(sm, @selector(allScenes));
-        NSUInteger sn = MFCountOf(all);
-        [gLive appendFormat:@"      allScenes = %@ count=%lu\n", MFClassOf(all), (unsigned long)sn];
-        for (NSUInteger k = 0; k < sn && k < 80; k++) {
-            id sc = MFObjectAt(all, k);
-            if (!sc) continue;
-            [gLive appendFormat:@"        - %@ id=%@\n",
-             MFClassOf(sc), MFStrProp(sc, @selector(identifier)) ?: @"?"];
+        if (ws) {
+            MFLiveLine(@"  [windowScene %lu] %@\n", (unsigned long)i, MFClassOf(ws));
+            id sm = MFObjProp(ws, @selector(sceneManager));
+            MFLiveLine(@"      sceneManager = %@\n", MFClassOf(sm));
+            id all = MFObjProp(sm, @selector(allScenes));
+            MFLiveLine(@"      allScenes = %@ count=%lu\n",
+                       MFClassOf(all), (unsigned long)MFCountOf(all));
         }
+        MFLiveStepDone("l1.windowScene");
+    }
+}
+
+// ---------------- L2：逐个 scene 的 identifier（v0.4.0 的 7.1 后半，已验证安全）----
+static void MFLiveLevel2(void) {
+    id uiApp = MFClassSharedInstance(objc_getClass("UIApplication"));
+    id conn = MFObjProp(uiApp, @selector(connectedScenes));
+    NSUInteger wsCount = MFCountOf(conn);
+    for (NSUInteger i = 0; i < wsCount && i < 8; i++) {
+        MFLiveStepStart("l2.allScenes");
+        id ws = MFObjectAt(conn, i);
+        if (ws) {
+            id sm = MFObjProp(ws, @selector(sceneManager));
+            id all = MFObjProp(sm, @selector(allScenes));
+            NSUInteger sn = MFCountOf(all);
+            MFLiveLine(@"  windowScene %lu → allScenes %lu 个:\n", (unsigned long)i, (unsigned long)sn);
+            for (NSUInteger k = 0; k < sn && k < 80; k++) {
+                id sc = MFObjectAt(all, k);
+                if (!sc) continue;
+                MFLiveLine(@"      - %@  id=%@\n",
+                           MFClassOf(sc), MFStrProp(sc, @selector(identifier)) ?: @"?");
+            }
+        }
+        MFLiveStepDone("l2.allScenes");
+    }
+}
+
+// ---------------- L3：handle 反查 + 按 bundleID 找应用（v0.4.0 崩点前半）----
+static void MFLiveLevel3(void) {
+    // 3.1 SBApplicationController → SBApplication
+    MFLiveStepStart("l3.appController");
+    Class acc = objc_getClass("SBApplicationController");
+    id ctl = MFClassSharedInstance(acc);
+    MFLiveLine(@"SBApplicationController = %@ sharedInstance=%@\n", MFSafeClass(acc), MFClassOf(ctl));
+    if (ctl) {
+        MFLiveLine(@"  响应矩阵:\n%@", MFResponseMatrix(ctl, @[
+            @"applicationWithBundleIdentifier:", @"applications", @"allApplications",
+            @"applicationWithBundleIdentifier:createIfNecessary:",
+            @"applicationWithBundleIdentifier:ifExists:"]));
+    }
+    MFLiveStepDone("l3.appController");
+
+    for (NSString *bid in @[@"com.apple.mobilesafari", @"com.apple.Preferences", @"com.tencent.mqq"]) {
+        MFLiveStepStart("l3.app");
+        id app = nil;
+        if (ctl && [ctl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) {
+            @try {
+                app = ((id (*)(id, SEL, id))objc_msgSend)(ctl,
+                        @selector(applicationWithBundleIdentifier:), bid);
+            } @catch (NSException *e) { app = nil; }
+        }
+        MFLiveLine(@"  %@ → SBApplication = %@\n", bid, MFClassOf(app));
+        if (app) {
+            MFLiveLine(@"      响应矩阵:\n%@", MFResponseMatrix(app, @[
+                @"bundleIdentifier", @"mainSceneHandle", @"sceneHandleForMainScene",
+                @"supportsSplitView", @"supportsChamoisSceneResizing",
+                @"applicationInfo", @"processState"]));
+        }
+        MFLiveStepDone("l3.app");
     }
 
-    // --- 7.2 逐个 windowScene 做 scene→handle 反查 ---
-    MFBeat("live:handleMap");
-    [gLive appendString:@"\n---- scene → sceneHandle 反查 ----\n"];
-    for (NSUInteger i = 0; i < wsCount && i < 12; i++) {
+    // 3.2 SBSceneManagerCoordinator → 按 persistenceIdentifier 找 handle
+    MFLiveStepStart("l3.coordinator");
+    Class coCls = objc_getClass("SBSceneManagerCoordinator");
+    id co = MFClassSharedInstance(coCls);
+    MFLiveLine(@"SBSceneManagerCoordinator = %@ sharedInstance=%@\n", MFSafeClass(coCls), MFClassOf(co));
+    for (NSString *bid in @[@"com.apple.mobilesafari", @"com.tencent.mqq"]) {
+        if (co && [co respondsToSelector:@selector(existingSceneHandleForPersistenceIdentifier:)]) {
+            id h = nil;
+            @try {
+                h = ((id (*)(id, SEL, id))objc_msgSend)(co,
+                        @selector(existingSceneHandleForPersistenceIdentifier:), bid);
+            } @catch (NSException *e) { h = nil; }
+            id sc = MFObjProp(h, @selector(sceneIfExists));
+            MFLiveLine(@"  %@ → handle=%@ sceneIfExists=%@ id=%@\n",
+                       bid, MFClassOf(h), MFClassOf(sc),
+                       MFStrProp(sc, @selector(identifier)) ?: @"?");
+            if (h) {
+                MFLiveLine(@"      handle 响应矩阵:\n%@", MFResponseMatrix(h, @[
+                    @"scene", @"sceneIfExists", @"application", @"persistenceIdentifier",
+                    @"sceneIdentifier", @"displayIdentity"]));
+            }
+        } else {
+            MFLiveLine(@"  %@ → coordinator 不响应 existingSceneHandleForPersistenceIdentifier:\n", bid);
+        }
+    }
+    MFLiveStepDone("l3.coordinator");
+
+    // 3.3 逐 scene 反查 handle（v0.4.0 崩点）
+    id uiApp = MFClassSharedInstance(objc_getClass("UIApplication"));
+    id conn = MFObjProp(uiApp, @selector(connectedScenes));
+    NSUInteger wsCount = MFCountOf(conn);
+    for (NSUInteger i = 0; i < wsCount && i < 8; i++) {
+        MFLiveStepStart("l3.handleMap");
+        id ws = MFObjectAt(conn, i);
+        if (ws) {
+            id sm = MFObjProp(ws, @selector(sceneManager));
+            if (sm && [sm respondsToSelector:@selector(allScenes)]) {
+                id all = MFObjProp(sm, @selector(allScenes));
+                NSUInteger sn = MFCountOf(all);
+                for (NSUInteger k = 0; k < sn && k < 40; k++) {
+                    id sc = MFObjectAt(all, k);
+                    if (!sc) continue;
+                    id h = nil;
+                    if ([sm respondsToSelector:@selector(existingSceneHandleForScene:)]) {
+                        @try {
+                            h = ((id (*)(id, SEL, id))objc_msgSend)(sm,
+                                    @selector(existingSceneHandleForScene:), sc);
+                        } @catch (NSException *e) { h = nil; }
+                    }
+                    id app = MFObjProp(h, @selector(application));
+                    MFLiveLine(@"      scene id=%@ → handle=%@ app=%@ bid=%@ persistence=%@\n",
+                               MFStrProp(sc, @selector(identifier)) ?: @"?",
+                               MFClassOf(h), MFClassOf(app),
+                               MFStrProp(app, @selector(bundleIdentifier)) ?: @"?",
+                               MFStrProp(h, @selector(persistenceIdentifier)) ?: @"?");
+                }
+            }
+        }
+        MFLiveStepDone("l3.handleMap");
+    }
+}
+
+// ---------------- L4：uiPresentationManager（v0.4.0 最大嫌疑，放最后）----
+static void MFLiveLevel4(void) {
+    id uiApp = MFClassSharedInstance(objc_getClass("UIApplication"));
+    id conn = MFObjProp(uiApp, @selector(connectedScenes));
+    NSUInteger wsCount = MFCountOf(conn);
+    for (NSUInteger i = 0; i < wsCount && i < 8; i++) {
         id ws = MFObjectAt(conn, i);
         if (!ws) continue;
         id sm = MFObjProp(ws, @selector(sceneManager));
         if (!sm || ![sm respondsToSelector:@selector(allScenes)]) continue;
         id all = MFObjProp(sm, @selector(allScenes));
         NSUInteger sn = MFCountOf(all);
-        for (NSUInteger k = 0; k < sn && k < 80; k++) {
+        for (NSUInteger k = 0; k < sn && k < 40; k++) {
             id sc = MFObjectAt(all, k);
             if (!sc) continue;
-            NSString *sid = MFStrProp(sc, @selector(identifier));
-            id h = nil;
-            if ([sm respondsToSelector:@selector(existingSceneHandleForScene:)]) {
-                @try {
-                    h = ((id (*)(id, SEL, id))objc_msgSend)(sm, @selector(existingSceneHandleForScene:), sc);
-                } @catch (NSException *e) { h = nil; }
-            }
-            [gLive appendFormat:@"  scene id=%@ -> handle=%@\n", sid ?: @"?", MFClassOf(h)];
-            if (h) {
-                id app = MFObjProp(h, @selector(application));
-                [gLive appendFormat:@"      handle.application=%@ bid=%@ persistence=%@\n",
-                 MFClassOf(app),
-                 MFStrProp(app, @selector(bundleIdentifier)) ?: @"?",
-                 MFStrProp(h, @selector(persistenceIdentifier)) ?: @"?"];
-            }
-            // scene 的呈现管理器探测（只读，不 createPresenter）
-            for (NSString *pmSel in @[@"uiPresentationManager", @"presentationManager"]) {
-                SEL sl = NSSelectorFromString(pmSel);
-                if (![sc respondsToSelector:sl]) continue;
-                id pm = MFObjProp(sc, sl);
-                [gLive appendFormat:@"      %@ = %@  createPresenterWithIdentifier:priority:=%@  createPresenterForLayerTarget:identifier:priority:=%@\n",
-                 pmSel, MFClassOf(pm),
-                 [pm respondsToSelector:@selector(createPresenterWithIdentifier:priority:)] ? @"YES" : @"NO",
-                 [pm respondsToSelector:@selector(createPresenterForLayerTarget:identifier:priority:)] ? @"YES" : @"NO"];
+            MFLiveStepStart("l4.respondsTo");
+            MFLiveLine(@"      scene %@  responds[uiPresentationManager]=%@ responds[presentationManager]=%@\n",
+                       MFClassOf(sc),
+                       [sc respondsToSelector:@selector(uiPresentationManager)] ? @"YES" : @"NO",
+                       [sc respondsToSelector:@selector(presentationManager)] ? @"YES" : @"NO");
+            MFLiveStepDone("l4.respondsTo");
+
+            // 只对"真的定义了 uiPresentationManager 的类"动手，避免盲发消息
+            Class scCls = object_getClass(sc);
+            BOOL owns = scCls ? MFOwnsSelector(scCls, @selector(uiPresentationManager)) : NO;
+            MFLiveLine(@"      定义类 own=%@  (defcls=%@)\n",
+                       owns ? @"YES" : @"NO",
+                       MFSafeClass(MFDefiningClass(scCls, @selector(uiPresentationManager))));
+
+            MFLiveStepStart("l4.getPM");
+            id pm = MFObjProp(sc, @selector(uiPresentationManager));
+            MFLiveLine(@"      uiPresentationManager = %@\n", MFClassOf(pm));
+            MFLiveStepDone("l4.getPM");
+
+            if (pm) {
+                MFLiveStepStart("l4.pmMatrix");
+                MFLiveLine(@"      pm 响应矩阵:\n%@", MFResponseMatrix(pm, @[
+                    @"createPresenterWithIdentifier:", @"createPresenterWithIdentifier:priority:",
+                    @"createPresenterForLayerTarget:identifier:priority:",
+                    @"modifyDefaultPresentationContext:", @"scene", @"snapshotContext"]));
+                MFLiveStepDone("l4.pmMatrix");
             }
         }
     }
+}
 
-    // --- 7.3 QQ 应用对象 + 关键 selector 响应矩阵 ---
-    MFBeat("live:qq");
-    [gLive appendString:@"\n---- 目标应用（com.tencent.mqq）解析 ----\n"];
-    Class acc = objc_getClass("SBApplicationController");
-    id ctl = MFClassSharedInstance(acc);
-    [gLive appendFormat:@"SBApplicationController = %@  sharedInstance=%@\n", MFSafeClass(acc), MFClassOf(ctl)];
-    [gLive appendFormat:@"  controller 响应矩阵:\n%@", MFResponseMatrix(ctl, @[
-        @"applicationWithBundleIdentifier:", @"applications", @"allApplications",
-        @"applicationWithBundleIdentifier:createIfNecessary:", @"applicationWithBundleIdentifier:ifExists:"])];
-
-    id qq = nil;
-    if (ctl && [ctl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) {
-        @try {
-            qq = ((id (*)(id, SEL, id))objc_msgSend)(ctl, @selector(applicationWithBundleIdentifier:), @"com.tencent.mqq");
-        } @catch (NSException *e) { qq = nil; }
-    }
-    [gLive appendFormat:@"QQ SBApplication = %@  bundleIdentifier=%@\n",
-     MFClassOf(qq), MFStrProp(qq, @selector(bundleIdentifier)) ?: @"?"];
-    [gLive appendFormat:@"  SBApplication 响应矩阵:\n%@", MFResponseMatrix(qq, @[
-        @"bundleIdentifier", @"mainSceneHandle", @"sceneHandleForMainScene",
-        @"supportsMultiWindowLayoutsForSwitcherWindowManagementStyle:displayIdentity:",
-        @"supportsSplitView", @"supportsChamoisSceneResizing",
-        @"applicationInfo", @"processState"])];
-
-    // entity 构造路径的存在性（只查 respondsToSelector，不真的构造）
-    Class entCls = objc_getClass("SBDeviceApplicationSceneEntity");
-    [gLive appendFormat:@"\nSBDeviceApplicationSceneEntity = %@\n", MFSafeClass(entCls)];
-    [gLive appendFormat:@"  实例响应矩阵（对 alloc 出来的实体实例不构造，只查类方法/实例方法存在性）:\n"];
-    for (NSString *selStr in @[
-        @"initWithApplicationForMainDisplay:generatingNewPrimarySceneIfRequired:",
-        @"initWithApplication:generatingNewPrimarySceneIfRequired:sceneHandleProvider:displayIdentity:",
-        @"initWithApplication:sceneHandleProvider:displayIdentity:",
-        @"sceneHandle"]) {
-        SEL sl = NSSelectorFromString(selStr);
-        BOOL has = entCls && (class_getInstanceMethod(entCls, sl) != NULL);
-        [gLive appendFormat:@"  %@ %@\n", has ? @"YES" : @"NO ", selStr];
-    }
-
-    [gLive appendString:@"\n==== LIVE COMPLETE ====\n"];
-    return gLive;
+// ---------------- 闸门驱动 ----------------
+static void MFRunLiveLevel(int level) {
+    MFLiveLine(@"\n==== 活体段开始 level=%d pid=%d main=%d ====\n",
+               level, (int)getpid(), (int)[NSThread isMainThread]);
+    if (level >= 1) { MFLiveLine(@"[LVL 1 BEGIN]\n"); MFLiveLevel1(); MFLiveLine(@"[LVL 1 OK]\n"); }
+    if (level >= 2) { MFLiveLine(@"[LVL 2 BEGIN]\n"); MFLiveLevel2(); MFLiveLine(@"[LVL 2 OK]\n"); }
+    if (level >= 3) { MFLiveLine(@"[LVL 3 BEGIN]\n"); MFLiveLevel3(); MFLiveLine(@"[LVL 3 OK]\n"); }
+    if (level >= 4) { MFLiveLine(@"[LVL 4 BEGIN]\n"); MFLiveLevel4(); MFLiveLine(@"[LVL 4 OK]\n"); }
+    MFLiveLine(@"==== 活体段结束 level=%d ====\n", level);
+    MFBeat("live:all-done");
 }
 
 #pragma mark - 段 8（新）：open 入口纯日志 hook
@@ -934,8 +1244,8 @@ static void MFInstallOne(Class cls, SEL sel, IMP imp, IMP *old, const char *labe
 
 static void MFInstallHooks(void) {
     MFBeat("hooks:enter");
-    MFAppendTo(MF_HOOKLOG, [NSString stringWithFormat:@"\n==== MultiFloatProbe v0.4.0 hook 安装 t=%ld pid=%d ====\n",
-                            (long)time(NULL), (int)getpid()]);
+    MFAppendTo(MF_HOOKLOG, [NSString stringWithFormat:@"\n==== MultiFloatProbe v%s hook 安装 t=%ld pid=%d ====\n",
+                            MF_PROBE_VERSION, (long)time(NULL), (int)getpid()]);
 
     Class ws = objc_getClass("SBMainWorkspace");
     if (ws != Nil) {
@@ -977,8 +1287,12 @@ static void MFProbeRun(void) {
         MFBeat("run:enter");
         NSMutableString *s = [NSMutableString string];
 
-        // H 段先装 hook —— 这样探针期间的 open 请求都能被抓到
-        MFInstallHooks();
+        // H 段 hook 只在闸门文件存在时安装（默认不装：hook 会全局改变 SpringBoard 行为）
+        if (MFFileExists(MF_GATE_HOOKS)) {
+            MFInstallHooks();
+        } else {
+            MFBeat("hooks:disabled");
+        }
 
         MFBeat("sec:env");
         [s appendString:MFSectionEnv()];
@@ -999,7 +1313,8 @@ static void MFProbeRun(void) {
         NSArray *imgClasses = MFImageClassesFiltered();
         [s appendFormat:@"\n(镜像候选类 %lu 个)\n", (unsigned long)imgClasses.count];
         [s appendString:MFSectionSelectors(imgClasses, @"SpringBoard/BoardServices 镜像内 SB/FB/BK 类")];
-        [s appendString:@"\n==== COMPLETE ====\n"];
+        // 注意：这里不是全文结束，后面还有第三方类 / 结构 dump / selector 归属搜索
+        [s appendString:@"\n==== 段 1-4 结束（非全文结束，勿据此外推）====\n"];
         MFWrite(kSummary, s);
         MFBeat("ok:sel:image");
 
@@ -1013,28 +1328,78 @@ static void MFProbeRun(void) {
         MFWrite(kMethods, MFBuildStructureReport());
         MFBeat("ok:structures");
 
-        // --- G 活体只读探测（风险最高，放最后）---
-        MFBeat("sec:live");
-        MFWrite(kLive, MFSectionLive());
-        MFBeat("ok:live");
+        // --- 段 9：关键 selector 全镜像归属搜索（纯静态，无需实例）---
+        // 段 9 是唯一"要遍历全部已注册类"的新动作，单独给它一个崩溃自解除标记。
+        MFBeat("sec:owners");
+        if (MFFileExists(MF_OWNERS_ATTEMPT)) {
+            MFBeat("owners:skipped-after-crash");
+            MFAppendTo(MF_STATELOG,
+                @"[skip] 上次运行已在段 9 中断，本进程跳过段 9。\n"
+                @"       想重试：Filza 删掉 /var/mobile/MFProbe-owners-attempt.txt 后 Respring。\n");
+        } else {
+            MFWriteIntFile(MF_OWNERS_ATTEMPT, 1);
+            MFWrite(kOwners, MFOwnerSearchReport());
+            unlink(MF_OWNERS_ATTEMPT);   // 段 9 成功 => 解除
+        }
+        MFBeat("ok:owners");
 
+        // 活体段刻意不在这里跑：由 %ctor 按闸门调度到主线程
         MFBeat("run:done");
+        unlink(MF_AUTORUN_ATTEMPT);      // 整轮安全段成功 => 解除自动段的标记
     }
 }
 
 %ctor {
     MFBeat("ctor:enter");
-    // 第一轮：SpringBoard 完全启动、类注册齐全后再采样（后台队列，不阻塞主线程）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        MFProbeRun();
-    });
-    // 第二轮（仅活体段）：留出时间让用户手动打开目标 App，再抓一次它的 scene / sceneHandle
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(75.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        MFBeat("live2:enter");
-        MFWrite(@"MultiFloatProbe-live2.log", MFSectionLive());
-        MFBeat("live2:done");
-    });
+    MFAppendTo(MF_BOOTLOG, [NSString stringWithFormat:@"t=%ld pid=%d boot\n",
+                            (long)time(NULL), (int)getpid()]);
+
+    // 第一轮：安全自动段（后台队列，v0.3.0/v0.4.0 连续两轮验证不崩）。
+    // 自解除：崩过一次则下次启动直接跳过 —— 从结构上杜绝"崩→重启→再崩→安全模式"。
+    if (MFFileExists(MF_AUTORUN_ATTEMPT)) {
+        MFBeat("autorun:skipped-after-crash");
+        MFAppendTo(MF_STATELOG,
+            @"[skip] 上次启动在自动段崩过，本轮跳过自动段。\n"
+            @"       想重试：Filza 删掉 /var/mobile/MFProbe-autorun-attempt.txt 后 Respring。\n");
+    } else {
+        MFWriteIntFile(MF_AUTORUN_ATTEMPT, 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            MFProbeRun();
+        });
+    }
+
+    // 第二轮：活体段。闸门缺省关闭；崩过一次就自动不再尝试，
+    // 因此不会出现 v0.4.0 那种"崩→重启→再崩→安全模式"的连锁。
+    int gate = MFReadIntFile(MF_GATE_LIVE, 0);
+    if (gate <= 0) {
+        MFBeat("live:disabled");
+        MFAppendTo(MF_STATELOG,
+                   @"[skip] 活体段未启用：/var/mobile/MFProbe-live-gate.txt 不存在或内容 <=0\n");
+    } else {
+        if (gate > 4) gate = 4;
+        int attempted = MFReadIntFile(MF_ATTEMPT, -1);
+        if (attempted == gate) {
+            MFBeat("live:skipped-after-crash");
+            MFAppendTo(MF_STATELOG, [NSString stringWithFormat:
+                @"[skip] level=%d 上次已尝试过且本进程是新起的 —— 说明上次就是崩在活体段。\n"
+                @"       想再采一次：Filza 里删掉 /var/mobile/MFProbe-live-attempt.txt 后 Respring。\n", gate]);
+        } else {
+            // 先落"已尝试"标记再执行：即使崩了，下次启动也会自动跳过
+            MFWriteIntFile(MF_ATTEMPT, gate);
+            MFBeat("live:scheduled");
+            // ★ 主线程执行：v0.4.0 在后台队列上调 uiPresentationManager 是最大失误
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(22.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                MFRunLiveLevel(gate);
+            });
+            // 第二次采样（同级别）：留给用户手动打开目标 App 后抓它的 scene
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(80.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                MFLiveLine(@"\n==== 第二次活体采样（t+80s，应已手动打开过目标 App）====\n");
+                MFRunLiveLevel(gate);
+            });
+        }
+    }
     MFBeat("ctor:exit");
 }
