@@ -56,6 +56,22 @@
 //        本项目坚持不装 hook，所以用守护定时器（keepAlive，默认 1 秒一次）。
 //        并且守护必须**在日志里留下它拉回的证据**（状态签名变化才记一行），否则下一轮又只能猜。
 //
+//  11. 【0.9.1 新增 · 第四次踩同一个坑：先确认属性存在，再拿它下结论】
+//      归档(9) 真机：0.9.0 上线后黑屏没了，但切 App 时会闪一下（约一个守护周期）。
+//      排查时最大的坑不是"闪"，而是"fg=0 从头到尾一次都没变过"——
+//      我们连着两轮把它解释成"被 SpringBoard 改回来了 / 设了没用"，
+//      真相是 `UIMutableApplicationSceneSettings` 上**根本没有 foreground / setForeground:**
+//      （响应真实存在的是 deactivationReasons / idleModeEnabled / frame / level 那几个）。
+//      因为 MFBoolProp / MFMvBool 这些 helper 全都带 respondsToSelector 守卫，
+//      **不存在的 selector 会被静默跳过**：设了个寂寞、读了个寂寞，而且判定还因此恒为真。
+//      ⇒ 规则：任何被用作**判定依据**的属性，必须连"存在性"一起取出来并写进日志
+//        （MFBoolPropEx / MFIntPropEx / MFULLPropEx 就是为了这个），
+//        并且在能力报告里打一张 responds 矩阵。
+//      另一条量化经验：**守护周期 ≈ 用户看到的闪烁时长**。
+//        掉出检测最快只能等到下一个周期，所以周期就是黑窗的长度量级。
+//        0.9.1 把 keepAliveMs 从 1000 降到 200。
+//      还有一条：判断"黑不黑"的分水岭是 `layerManager.layers` / `hostedLayers` 是否为 0
+//        与 `contentState` 是否 != 2，**不是** presenter 的 isHosting（它全程等于 1）。
 #ifndef MF_INTERNAL_H
 #define MF_INTERNAL_H
 

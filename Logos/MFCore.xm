@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.9.0";
+    return @"0.9.1";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -101,13 +101,18 @@ NSDictionary *MFLoadConfig(void) {
 //    keepAlive      = true  ——【0.9.0 新增】承载成功后开一个守护定时器，反复把目标 scene 拉回
 //                              "可渲染"（foreground=YES / idle=NO / deactivationReasons=0 / 几何同步）。
 //                              归档(8) 的根因就是"P0 只设了一次，用户一换前台 App 就被 SB 改回去"。
-//    keepAliveMs    = 1000  ——【0.9.0 新增】守护周期（毫秒），会被夹在 300..5000。
-//    keepAliveForeground = true ——【0.9.0 新增】守护时是否把 foreground 拉回 YES。
-//                              唯一需要关掉它的场景：若"持续 foreground=YES"会让目标 App 在 SpringBoard
-//                              眼里变成可见 App（有弹成全屏的风险），把它设 false，就只清 idle/deact。
-//    keepAliveIdle  = true  ——【0.9.0 新增】守护时是否连 idleModeEnabled=NO / deactivationReasons=0
-//                              一起清。留这个开关是为了下一轮能做干净的 A/B：
-//                              若关掉它也照样不黑，说明只需要 foreground；若关掉就黑，说明元凶就是 idle。
+//    keepAliveMs    = 200   ——【0.9.1 改：1000 -> 200】守护周期（毫秒），会被夹在 50..5000。
+//                              归档(9) 实测"闪屏时长 ≈ 一个守护周期"，所以这个数字直接决定闪多久。
+//    keepAliveForeground = false ——【0.9.1 改：true -> false】
+//                              归档(9) 日志里 fg 全程恒 0 —— 真相是 settings 上**根本没有**
+//                              setForeground: / foreground（responds 守卫静默跳过），
+//                              0.9.0 的判定 `(!fg && fixFg)` 因此恒为真、每秒空拉一次。
+//                              它现在只作为日志字段（不再参与判定）；开关留着以防别的机型上真有。
+//    keepAliveIdle  = true  ——守护时是否清 idleModeEnabled=NO。
+//    keepAliveDeact = true  ——【0.9.1 新增】守护时是否清 deactivationReasons=0。
+//                              归档(9) 每次切 App 都出现 deact=32/33，且**比掉出早约 1 秒** ——
+//                              这是一次干净的预警；单独开关是为了能一轮试出"最少要保哪几项"。
+//    keepAliveLevel = true  ——【0.9.1 新增】守护时是否重设 setLevel:1 + displayConfiguration。
 //    hostStep       = 6     —— 承载链路最多走到第几步（1..6，测试用；默认走满）
 //    mode           = "shell" —— 纯展示用，**不再参与任何判断**
 //
@@ -137,17 +142,21 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   的自然尺寸就等于 scene.frame，两者宽高比必须一致
         @"allowRouteB"     : @NO,                      // presenter 失败时是否退回那个已知纯黑的宿主 VC
         @"keepAlive"       : @YES,                     // 【0.9.0 新增】承载成功后守护 scene（切 App 不再黑屏）
-        @"keepAliveMs"     : @1000,                    // 【0.9.0 新增】守护周期（毫秒）
-        @"keepAliveForeground" : @YES,                 // 【0.9.0 新增】守护时是否把 foreground 拉回 YES
-        @"keepAliveIdle"   : @YES,                     // 【0.9.0 新增】守护时是否连 idle / deactivationReasons 一起清
+        @"keepAliveMs"     : @200,                     // 【0.9.1 改】守护周期（毫秒）1000 -> 200：
+                                                       //   闪屏时长 ≈ 一个守护周期（归档(9) 实测），砍到 1/5
+        @"keepAliveForeground" : @NO,                  // 【0.9.1 改】默认 YES -> NO：
+                                                       //   本机没有 setForeground:，这一项一直是空转
+        @"keepAliveIdle"   : @YES,                     // 守护时是否清 idleModeEnabled
+        @"keepAliveDeact"  : @YES,                     // 【0.9.1 新增】单独控制 deactivationReasons=0
+        @"keepAliveLevel"  : @YES,                     // 【0.9.1 新增】单独控制 setLevel:1 + displayConfiguration
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @9,                       // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @10,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
     };
     BOOL ok = [def writeToFile:path atomically:YES];
-    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true 显示外壳 / hostEnabled=false 不承载 / hostRoute=3 / hostSceneFrame=true / keepAlive=true）", path, (int)ok);
+    MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=false / hostRoute=3 / hostSceneFrame=true / keepAlive=true@200ms / keepAliveDeact=true）", path, (int)ok);
 }
 
 /// 0.3.0 的 plist 只有 5 个键，缺 hostEnabled/hostStep。
@@ -168,8 +177,9 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"resizesHosted"] == nil || cfg[@"hostSceneFrame"] == nil ||
                         cfg[@"allowRouteB"] == nil ||
                         cfg[@"keepAlive"] == nil || cfg[@"keepAliveMs"] == nil ||
-                        cfg[@"keepAliveIdle"] == nil || cfg[@"keepAliveForeground"] == nil);
-    if (cur >= 9 && !missingKeys) return;
+                        cfg[@"keepAliveIdle"] == nil || cfg[@"keepAliveForeground"] == nil ||
+                        cfg[@"keepAliveDeact"] == nil || cfg[@"keepAliveLevel"] == nil);
+    if (cur >= 10 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -186,9 +196,11 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"hostSceneFrame"]  == nil) up[@"hostSceneFrame"]  = @YES;
         if (up[@"allowRouteB"]     == nil) up[@"allowRouteB"]     = @NO;
         if (up[@"keepAlive"]       == nil) up[@"keepAlive"]       = @YES;
-        if (up[@"keepAliveMs"]     == nil) up[@"keepAliveMs"]     = @1000;
-        if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @YES;
+        if (up[@"keepAliveMs"]     == nil) up[@"keepAliveMs"]     = @200;   // 0.9.1 新默认
+        if (up[@"keepAliveForeground"] == nil) up[@"keepAliveForeground"] = @NO;  // 0.9.1 新默认
         if (up[@"keepAliveIdle"]   == nil) up[@"keepAliveIdle"]   = @YES;
+        if (up[@"keepAliveDeact"]  == nil) up[@"keepAliveDeact"]  = @YES;
+        if (up[@"keepAliveLevel"]  == nil) up[@"keepAliveLevel"]  = @YES;
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
 
@@ -231,10 +243,28 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"cfgVersion"] = @9;
         }
 
+        // ---- 0.9 -> 0.10：修正两项"实测空转 / 误导"的默认值 + 新增两个分项开关 ----
+        // 归档(9) 真机证据：
+        //   ① settings 上没有 setForeground:（responds 静默跳过）=> keepAliveForeground 一直是空转；
+        //   ② 闪屏时长 ≈ 一个守护周期 => keepAliveMs=1000 就是"闪一下"的长度本身。
+        if (cur < 10) {
+            // 只改"还停在旧默认值"的；用户自己调过的原样尊重。
+            if (MFConfigInt(up, @"keepAliveMs", 1000) == 1000) {
+                up[@"keepAliveMs"] = @200;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveMs 1000 -> 200（闪屏 ≈ 一个守护周期，直接砍到 1/5）");
+            }
+            if (MFConfigBool(up, @"keepAliveForeground", YES)) {
+                up[@"keepAliveForeground"] = @NO;
+                MFLogS(@"[cfg] ★ 迁移：keepAliveForeground true -> false（本机没有 setForeground:，一直是空转）");
+            }
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=10：新增 keepAliveDeact / keepAliveLevel（默认 true / true）");
+            up[@"cfgVersion"] = @10;
+        }
+
         BOOL ok = [up writeToFile:path atomically:YES];
-        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveIdle=%@）",
+        MFLog(@"[cfg] 配置已升级到 cfgVersion=%@ 于 %@ ok=%d（hostRoute=%@ / hostSceneFrame=%@ / keepAlive=%@ / keepAliveMs=%@ / keepAliveForeground=%@ / keepAliveDeact=%@）",
              up[@"cfgVersion"], path, (int)ok, up[@"hostRoute"], up[@"hostSceneFrame"],
-             up[@"keepAlive"], up[@"keepAliveIdle"]);
+             up[@"keepAlive"], up[@"keepAliveMs"], up[@"keepAliveForeground"], up[@"keepAliveDeact"]);
         return;
     }
 }

@@ -6,6 +6,27 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.9.1 变更：
+#   - 0.9.0 真机（归档(9)）：**不再黑屏了，但切换 App 时会闪一下**。
+#     日志给出精确时序（同一 pid 19856、同一轮承载，每行前缀是 Unix 秒）：
+#       +8488  状态变化 -> deact=33                        ← 去激活原因出现（此刻画面还在！）
+#       +8489  状态变化 -> deact=0 cs=0 layers=0 hosted=0   ← 掉出（黑）
+#       +8490  状态变化 -> cs=1 -> cs=2 layers=2            ← 我们拉回后恢复
+#     => 黑窗 ≈ 一个守护周期（1000 ms），这就是"闪一下"的全部；
+#        而且 deact 比掉出早约 1 秒出现，是一次干净的预警。
+#   - 同时揭开一个更深的坑：`fg` 在整份日志里**从头到尾都是 0**（含 P0 刚设完后）。
+#     真相是 UIMutableApplicationSceneSettings 上**没有 setForeground: / foreground**，
+#     而所有 helper 都有 respondsToSelector 守卫 => 0.7.0 起这段逻辑一直是空转，
+#     0.9.0 的判定 `(!fg && fixFg)` 因此恒为真，每秒都在无谓地发一次 updateSettings。
+#   - 修法：① 判定只用**本机确认存在**的量（layers / contentState / deactivationReasons /
+#     idleModeEnabled），foreground 降级为纯日志字段；② 周期 1000 ms -> 200 ms；
+#     ③ 只有真的坏了才发 updateSettings（不再每秒空拉）；④ 拉回按项可选
+#     （keepAliveDeact / keepAliveIdle / keepAliveLevel / keepAliveForeground）；
+#     ⑤ 每次掉出记录持续了几个周期并换算成毫秒写日志（量化"闪了多久"）。
+#   - 能力报告新增：判定相关属性的 responds 矩阵（settings 与 FBScene 两侧）+ UIApplication
+#     的完整 ivar 列表 —— 下一版要靠 UIApplicationSceneDeactivationAssertion 让目标 scene
+#     根本不被 SpringBoard 去激活（那才是"零闪烁"的解法；现在只能事后拉回，必然闪一下）。
+#
 # 0.9.0 变更：
 #   - 0.8.0 真机（归档(8)）：**浮窗全程正常了** —— 内容对、拖 ◢ 缩放时比例也对、没触发安全模式。
 #     唯一剩下的问题：在桌面主屏时浮窗里 Safari 画面正常，一切到"设置"就变黑。
