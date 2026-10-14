@@ -6,6 +6,17 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.26.0 变更（第 29 轮：归档28 四连修）：
+#   - ① ↻/✕ 按钮点不到：容器 userInteractionEnabled=NO 会掐死整个子树触摸
+#     （UIKit hitTest 铁律）—— 容器恢复默认 YES（透明 UIView 本身不拦触摸）。
+#   - ② 承载后无圆角：外沿 pad 之后内容区四角不在窗口圆角处 ->
+#     contentArea.layer.cornerRadius=16 + masksToBounds。
+#   - ③ 缩放中出现静态图片、松手才回实时：scene.frame 只在 Ended 同步，拖动期间
+#     掉层窗口显示垫底快照定格帧 -> Changed 期间 250ms 节流同步 scene.frame。
+#   - ④ 未运行 App 仍打不开：FBSOpenApplicationService 两条路都不通 ->
+#     改 UIApplication 私有 launchApplicationWithIdentifier:suspended:NO
+#     （FrontBoardAppLauncher SB 注入版 + Stheno 同款通道；suspended:YES 不出前台）。
+#
 # 0.25.0 变更（第 28 轮：Stheno 外沿手势一比一复刻 + 未运行启动链修复）：
 #   - 归档27 反馈：移动/缩放 ✔；但"未启动的应用无法直接在浮窗中打开" +
 #     "现在这个手势并不好用" -> 要求一比一复刻 Stheno：手势在悬浮窗**外边缘**而非内部。

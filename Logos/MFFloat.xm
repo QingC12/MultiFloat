@@ -2768,12 +2768,17 @@ static char kMFRowBundleIDKey;
     content.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:content];
     self.contentArea = content;
+    // 【0.26.0 归档28 修复】承载后窗口没有圆角 —— 外沿 pad 出来后内容区四角
+    // 不在窗口圆角处，必须给内容区自己加圆角裁切。
+    content.layer.cornerRadius = 16.0;
+    content.layer.masksToBounds = YES;
 
     // ---- ↻ / ✕ 按钮：浮在内容区右上角内侧（缩小 + 低透明度，不占外沿手势区）----
+    // 【0.26.0 归档28 修复】容器绝不能 userInteractionEnabled=NO —— 那会把整个子树
+    // 的触摸全部掐死（按钮点不到的根因）。透明 UIView 默认就放行触摸，保持默认即可。
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(w - 2 * pad - 76, pad + 4, 70, 28)];
     bar.backgroundColor = [UIColor clearColor];
     bar.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    bar.userInteractionEnabled = NO;           // 容器透传，只有两个按钮可点
     [self.view addSubview:bar];
     self.titleBar = bar;
 
@@ -2915,6 +2920,7 @@ static CGFloat    gMFResizeCurW        = 0.0;   // 【0.23.1】增量式当前�
 static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日志计数
 static CGPoint    gMFResizeAnchor      = CGPointZero;  // 【0.25.0】锚角（拖动角的对角，固定不动）
 static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 12=右上 13=左下 14=右下
+static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 scene.frame 节流同步时刻
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -3002,16 +3008,33 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
              nf.origin.x, nf.origin.y);
     }
 
+    // 【0.26.0 归档28 修复】缩放中出现"静态图片"、松手才回实时画面 ——
+    // 根因：缩放中 win.frame 每拍变，但 scene.frame 只在 Ended 同步一次；
+    // 掉层窗口期间垫底快照显示定格帧（且随窗口一起被拉伸）。
+    // 修法：Changed 期间按 250ms 节流同步 scene.frame，让实时渲染跟上手指。
+    // （updateSettings 每发=一帧重提交，但缩放时画面本来就在动，可接受。）
+    if (g.state == UIGestureRecognizerStateChanged) {
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (gMFResizeLastSync == nil ||
+            now - [gMFResizeLastSync timeIntervalSinceReferenceDate] > 0.25) {
+            gMFResizeLastSync = [NSDate date];
+            [[MFFloatManager shared] syncContentGeometry];
+            MFLogS(@"[ui] resize 中 -> 节流同步 scene.frame（实时画面跟手）");
+        }
+    }
+
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
     if (g.state == UIGestureRecognizerStateEnded) {
         gMFResizeStartDate = nil;
+        gMFResizeLastSync = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
         MFLog(@"[ui] resize 结束 frame=%@ -> 同步 scene.frame", NSStringFromCGRect(win.frame));
         [[MFFloatManager shared] syncContentGeometry];
     } else if (g.state == UIGestureRecognizerStateCancelled ||
                g.state == UIGestureRecognizerStateFailed) {
         gMFResizeStartDate = nil;
+        gMFResizeLastSync = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
     }
 }
@@ -3675,33 +3698,24 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     }
 
     // 2) 未运行 -> 启动 -> 等 scene 出现 -> 承载
-    MFLogS(@"[ui] 目标未运行 -> 先启动（FBSOpenApplicationService）-> 2s 后自动承载");
+    // 【0.26.0 归档28 修复】FBSOpenApplicationService 两条路都不通（+sharedInstance 不存在、
+    // alloc/init 实例也没有 openApplicationWithBundleID...）。
+    // 改用 FrontBoardAppLauncher（SB 注入版）与 Stheno 同款通道：
+    //   [UIApplication launchApplicationWithIdentifier:suspended:]
+    // 注意 suspended:NO（launcher 源码注释：suspended 启动的 App 不会出现在前台）。
+    MFLogS(@"[ui] 目标未运行 -> 先启动（UIApplication launchApplicationWithIdentifier:）-> 2s 后自动承载");
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            Class svcCls = objc_getClass("FBSOpenApplicationService");
-            // 【0.25.0 归档27 修复】该类没有 +sharedInstance 类方法（实测
-            // unrecognized selector）—— FrontBoardServices 服务类走标准 alloc/init。
-            id svc = ((id (*)(id, SEL))objc_msgSend)((id)svcCls, @selector(alloc));
-            svc = ((id (*)(id, SEL))objc_msgSend)(svc, @selector(init));
-            if (svc == nil || ![svc respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:")]) {
-                MFLogS(@"[host] !! FBSOpenApplicationService 通道不可用 -> 请先手动打开该 App");
+            UIApplication *app = [UIApplication sharedApplication];
+            SEL launchSel = NSSelectorFromString(@"launchApplicationWithIdentifier:suspended:");
+            if (app == nil || ![app respondsToSelector:launchSel]) {
+                MFLogS(@"[host] !! UIApplication.launchApplicationWithIdentifier: 通道不可用 -> 请先手动打开该 App");
                 [self.panel showMessage:@"无法自动启动该 App"
                                  detail:@"请手动打开一次目标 App，再双击边缘条重新选择。"];
                 return;
             }
-            id opts = nil;
-            Class optCls = objc_getClass("FBSOpenApplicationOptions");
-            if (optCls && [optCls respondsToSelector:NSSelectorFromString(@"options")]) {
-                opts = ((id (*)(id, SEL))objc_msgSend)((id)optCls, NSSelectorFromString(@"options"));
-            }
-            SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:");
-            ((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, openSel, bundleID, opts, ^(NSError *err) {
-                if (err != nil) {
-                    MFLog(@"[host] 启动 %@ 返回错误：%@", bundleID, err);
-                } else {
-                    MFLog(@"[ui] 启动 %@ 已受理", bundleID);
-                }
-            });
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
+            MFLog(@"[ui] 启动 %@ 已发起（suspended=NO）", bundleID);
         } @catch (NSException *e) {
             MFLog(@"[host] !! 启动异常：%@", e);
             [self.panel showMessage:@"自动启动失败" detail:[NSString stringWithFormat:@"%@", e]];
