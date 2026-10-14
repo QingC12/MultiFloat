@@ -6,6 +6,16 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.34.0 变更（第 37 轮：归档36 反馈——左上角呼出条没出现 + 注销后不自动弹出）：
+#   - ① 根因嫌疑：挂进 SBStatusBarWindow 的视图不渲染（呼出条与浮窗容器双双
+#     不可见，症状一致）-> 浮窗 embed 默认改回 NO（cfgVersion 23 强制迁移），
+#     保留代码路径可显式 embedInStatusBar=true 重试。
+#   - ② 呼出 UI 重做（用户指定交互）：独立 UIWindow(level 1100) 右缘——
+#     半透明圆形悬浮按钮"▦"（点击 toggle、可垂直拖动）+ 右缘全高 20pt 透明热区
+#     （向左滑 >25pt toggle）。不再依赖状态栏窗口。
+#   - ③ 应用列表兜底：localizedName 为空时用 bundleID 兜底（保证"全部 APP"）。
+#   - ④ 诊断：延迟启动触发时打日志（区分"没触发"vs"startWithConfig 内部失败"）。
+#
 # 0.33.0 变更（第 36 轮：归档35 反馈"浮窗没有自动弹出" + 手势呼出器需求）：
 #   - ① 0.32.0 不自动弹出修复：embed 挂载分支加分步诊断日志（>>> E1）+ 2s 健康检查
 #     （panel.view 必须在窗口树上且可见、尺寸正常），不通过 -> 自动回退独立 UIWindow。

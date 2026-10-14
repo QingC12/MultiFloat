@@ -2825,7 +2825,8 @@ static NSDictionary *gMFBootConfig = nil; // bootstrap 时的配置快照（首�
 - (void)toggleAppList;      // 【0.23.0】手势唤出：选择器 ↔ 当前承载画面
 - (void)openOrHostBundleID:(NSString *)bundleID;   // 【0.24.0】未运行先启动再承载
 - (void)toggleFloatVisible;   // 【0.33.0】呼出条手势：显示/隐藏浮窗（关闭后无需 respring）
-- (void)summonPan:(UIPanGestureRecognizer *)g;   // 【0.33.0】呼出条下滑/右滑触发
+- (void)summonPan:(UIPanGestureRecognizer *)g;   // 【0.34.0】右缘热区左滑触发
+- (void)summonDrag:(UIPanGestureRecognizer *)g;  // 【0.34.0】悬浮按钮垂直拖动
 @end
 
 @interface MFFloatPanel : UIViewController
@@ -3399,11 +3400,23 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 - (void)summonPan:(UIPanGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateEnded) return;
     CGPoint t = [g translationInView:g.view];
-    // 下滑或右滑超过 25pt 即触发（TrollOpen 风格；避免与状态栏其他手势混淆）
-    if (t.y > 25.0 || t.x > 25.0) {
-        MFLog(@"[summon] 平移触发 t=(%.0f, %.0f)", t.x, t.y);
+    // 【0.34.0】右缘热区：向左滑超过 25pt 触发（用户指定交互）
+    if (t.x < -25.0) {
+        MFLog(@"[summon] 右缘左滑触发 t=(%.0f, %.0f)", t.x, t.y);
         [self toggleFloatVisible];
     }
+}
+
+// 【0.34.0】悬浮按钮垂直拖动（水平锁定，只上下移）
+- (void)summonDrag:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    if (v == nil || v.superview == nil) return;
+    CGPoint t = [g translationInView:v.superview];
+    CGRect f = v.frame;
+    CGFloat maxY = [UIScreen mainScreen].bounds.size.height - f.size.height - 40.0;
+    f.origin.y = MIN(MAX(f.origin.y + t.y, 40.0), MAX(maxY, 40.0));
+    v.frame = f;
+    [g setTranslation:CGPointZero inView:v.superview];
 }
 
 + (instancetype)shared {
@@ -3526,9 +3539,12 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     // —— 灵动岛可点即证）。独立 UIWindow 换成"状态栏窗口内的容器视图"。
     // fail-safe：找不到状态栏窗口 / 挂载异常 -> 回退独立 UIWindow（行为同 0.31）；
     // 配置键 embedInStatusBar=false 可整体关闭。
+    // 【0.34.0】默认改回 NO：0.32/0.33 实测挂进 SBStatusBarWindow 的视图不渲染
+    //（呼出条与浮窗容器双双不可见 = "不自动弹出"的直接嫌疑）。cfgVersion=23 迁移强制写 false。
+    // 保留代码路径，用户可在 plist 里显式 embedInStatusBar=true 重新实验。
     UIView *hostView = win;
     BOOL embedded = NO;
-    if (MFConfigBool(self.config, @"embedInStatusBar", YES)) {
+    if (MFConfigBool(self.config, @"embedInStatusBar", NO)) {
         @try {
             NSArray *wins3 = ((NSArray *(*)(id, SEL))objc_msgSend)(
                 [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
@@ -4193,7 +4209,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
             if (bid.length == 0 || [bid hasPrefix:@"com.apple.springboard"]) continue;
             if ([runningIDs containsObject:bid]) continue;    // 运行中的已在前面
             NSString *name = MFStr(proxy, NSSelectorFromString(@"localizedName"));
-            if (name.length == 0) continue;                   // 无名系统件不进列表
+            if (name.length == 0) name = bid;   // 【0.34.0】无名也显示 bundleID，保证"全部 APP"
             [installedItems addObject:@[ [NSString stringWithFormat:@"○ %@", name], bid ]];
         }
         [installedItems sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
@@ -4214,48 +4230,57 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 
 #pragma mark ========== 入口 ==========
 
-// ---- 【0.33.0】安装呼出手势条（Stheno UIStatusBarWindow 路线，零 hook，fail-safe）----
-// 位置：状态栏窗口左上角 70x44 隐形条（透明背景不挡视线）；找不到状态栏窗口
-// 则用独立小 UIWindow（level 1099）兜底。双击 / 下滑 / 右滑 -> toggleFloatVisible。
+// ---- 【0.34.0】右缘呼出 UI（独立 UIWindow，零 hook，fail-safe）----
+// 0.33.0 实测：挂进 SBStatusBarWindow 的视图（呼出条和浮窗容器）都不可见
+// —— 这是"左上角没有呼出条"+"float 不自动弹出"的共同嫌疑。本版呼出 UI
+// 全部改用独立 UIWindow（level 1100，保证可见）：
+//   ① 右缘全高 20pt 透明热区：向左滑 >25pt → toggle
+//   ② 可见悬浮按钮（半透明圆形 "▦"）：点击 toggle，垂直拖动换位
+// 浮窗本体的 embed 挂载默认改回 NO（见 MFCore cfgVersion=23 迁移）。
 static void MFInstallSummonGesture(void) {
-    if (gMFStripView != nil) return;   // 幂等：respring 前只装一次
+    if (gMFStripWin != nil) return;   // 幂等：respring 前只装一次
     @try {
-        UIWindow *sbWin = nil;
-        NSArray *wins = ((NSArray *(*)(id, SEL))objc_msgSend)(
-            [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
-        for (UIWindow *w in wins) {
-            if ([NSStringFromClass([w class]) containsString:@"StatusBar"]) { sbWin = w; break; }
-        }
-        UIView *host = nil;
-        if (sbWin != nil && sbWin.bounds.size.width > 100.0) {
-            host = sbWin;
-        } else {
-            UIWindow *fw = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 120, 100)];
-            fw.windowLevel = 1099.0;
-            fw.backgroundColor = [UIColor clearColor];
-            fw.userInteractionEnabled = YES;
-            fw.hidden = NO;
-            gMFStripWin = fw;   // 强引用保活
-            host = fw;
-            MFLogS(@"[summon] 未找到状态栏窗口 -> 呼出条走独立小 UIWindow 兜底");
-        }
-        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 70, 44)];
+        CGRect scr = [UIScreen mainScreen].bounds;
+        CGFloat W = scr.size.width, H = scr.size.height;
+        UIWindow *sw = [[UIWindow alloc] initWithFrame:CGRectMake(W - 64.0, 0.0, 64.0, H)];
+        sw.windowLevel = 1100.0;
+        sw.backgroundColor = [UIColor clearColor];
+        sw.userInteractionEnabled = YES;
+        sw.hidden = NO;
+        gMFStripWin = sw;   // 强引用保活
+
+        // 右缘滑动热区：贴右边缘 20pt 全高，透明不挡视线
+        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(44.0, 0.0, 20.0, H)];
         strip.backgroundColor = [UIColor clearColor];
         strip.userInteractionEnabled = YES;
         strip.tag = 990040;
-        UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)];
-        dt.numberOfTapsRequired = 2;
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
             initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
-        [strip addGestureRecognizer:dt];
         [strip addGestureRecognizer:pan];
-        [host addSubview:strip];
-        gMFStripView = strip;   // 强引用保活（重建守卫依据）
-        MFLog(@"[summon] 呼出条已安装 host=%@ frame=%@（双击/下滑/右滑呼出浮窗）",
-              NSStringFromClass([host class]), NSStringFromCGRect(strip.frame));
+        [sw addSubview:strip];
+
+        // 悬浮按钮：半透明圆形 "▦"，可点可垂直拖
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        btn.frame = CGRectMake(8.0, 160.0, 48.0, 48.0);
+        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+        btn.layer.cornerRadius = 24.0;
+        btn.layer.masksToBounds = YES;
+        [btn setTitle:@"▦" forState:UIControlStateNormal];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont systemFontOfSize:20.0];
+        btn.tag = 990041;
+        [btn addTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)
+                      forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(summonDrag:)];
+        [btn addGestureRecognizer:drag];
+        [sw addSubview:btn];
+
+        gMFStripView = btn;
+        MFLog(@"[summon] 右缘呼出 UI 已安装（悬浮按钮 + 右缘左滑热区）win=%@ frame=%@",
+              NSStringFromClass([sw class]), NSStringFromCGRect(sw.frame));
     } @catch (NSException *e) {
-        MFLog(@"[summon] !! 安装异常（浮窗功能不受影响，仅无呼出条）：%@", e);
+        MFLog(@"[summon] !! 安装异常（浮窗功能不受影响，仅无呼出入口）：%@", e);
     }
 }
 
@@ -4298,10 +4323,13 @@ void MFFloatBootstrap(void) {
 
     // 【0.33.0】呼出条随时可呼出浮窗（关闭后不用 respring 等 12 秒）
     gMFBootConfig = [config copy];   // 首次呼出时的配置快照
-    MFInstallSummonGesture();
+    // 【0.34.0】呼出 UI 必须主线程建窗口；独立 UIWindow 保证可见（不再挂状态栏窗口）
+    dispatch_async(dispatch_get_main_queue(), ^{ MFInstallSummonGesture(); });
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        MFLog(@"[gate] >>> 延迟启动已触发（%.1f 秒到点，若见此行但无浮窗，问题在 startWithConfig 内部）",
+              delay);
         [[MFFloatManager shared] startWithConfig:config];
     });
 }

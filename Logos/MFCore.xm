@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.33.0";
+    return @"0.34.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -302,9 +302,10 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @22,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @23,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @6,
+        @"embedInStatusBar": @NO,                      // 【0.34.0】挂载实测不可见，默认回退独立 UIWindow
         @"windowLevel"     : @1010,
         // 【0.23.0】Stheno 风交互：
         @"defaultBundleID" : @"",                      // 非空 => 浮窗出现即自动承载该 App（"默认打开"）
@@ -665,6 +666,15 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                   @"呼出条安装后关闭浮窗可随时呼出，不再依赖此延迟）");
             up[@"showDelay"]  = @6;
             up[@"cfgVersion"] = @22;
+        }
+
+        // ---- 0.33 -> 0.34：embed 挂载默认关闭（实测挂进 SBStatusBarWindow 的视图不渲染，
+        //      是"浮窗不自动弹出"+"呼出条不可见"的直接嫌疑；回退独立 UIWindow 保可用）----
+        if (cur < 23) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=23：embedInStatusBar 强制 NO"
+                  @"（0.32/0.33 挂载视图不渲染；想重新实验可在 plist 显式改 true）");
+            up[@"embedInStatusBar"] = @NO;
+            up[@"cfgVersion"] = @23;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];
