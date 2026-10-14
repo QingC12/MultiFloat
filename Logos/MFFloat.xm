@@ -2716,6 +2716,7 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 - (void)syncContentGeometry;
 - (void)refreshAppList;
 - (void)toggleAppList;      // 【0.23.0】手势唤出：选择器 ↔ 当前承载画面
+- (void)openOrHostBundleID:(NSString *)bundleID;   // 【0.24.0】未运行先启动再承载
 @end
 
 @interface MFFloatPanel : UIViewController
@@ -2723,6 +2724,8 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 @property (nonatomic, strong) UIView *titleBar;
 @property (nonatomic, strong) UIView *contentArea;
 @property (nonatomic, strong) UIView *statusBar;      // 【0.23.0】透明边缘条（移动手柄 + 选择器手势区）
+@property (nonatomic, strong) UIView *leftStrip;      // 【0.24.0】左/右透明边缘条（承载后抓边移动）
+@property (nonatomic, strong) UIView *rightStrip;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIViewController *contentVC;
@@ -2819,6 +2822,24 @@ static char kMFRowBundleIDKey;
     [bar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
     // 【0.22.0】底部条同样是移动手柄（用户需求：底部手势移动浮窗）
     [statusBar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
+    // 【0.24.0】左/右透明边缘条：承载后 App 内容占满窗口，用户摸中间只会摸到 App；
+    // 抓"任意一条边"（上/下/左/右）都能移动。宽度 16pt，不挡 App 边缘交互主体。
+    {
+        UIView *lft = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 16, h)];
+        lft.backgroundColor = [UIColor clearColor];
+        lft.autoresizingMask = UIViewAutoresizingFlexibleHeight;
+        [lft addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
+        [self.view addSubview:lft];
+        self.leftStrip = lft;
+
+        UIView *rgt = [[UIView alloc] initWithFrame:CGRectMake(w - 16, 0, 16, h - 70)];
+        // 底部留出 70pt 避开 ◢ 缩放命中区（右下角必须归缩放手势，否则被移动抢走）
+        rgt.backgroundColor = [UIColor clearColor];
+        rgt.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleLeftMargin;
+        [rgt addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
+        [self.view addSubview:rgt];
+        self.rightStrip = rgt;
+    }
     [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onResize:)]];
 
     MFLog(@"[ui] 面板就绪 %.0fx%.0f（0.23.0 无框壳）", w, h);
@@ -3058,7 +3079,7 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     NSString *bid = objc_getAssociatedObject(sender, &kMFRowBundleIDKey);
     MFLog(@"[ui] 行被点 bid=%@", bid ?: @"nil");
     if (bid.length == 0) return;
-    [[MFFloatManager shared] hostBundleID:bid];
+    [[MFFloatManager shared] openOrHostBundleID:bid];
 }
 
 @end
@@ -3129,7 +3150,8 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     // pickerGesture：0=关 / 1=双击（默认）/ 2=长按。
     {
         NSInteger pg = MFConfigInt(self.config, @"pickerGesture", 1);
-        NSArray *strips = @[ self.panel.titleBar, self.panel.statusBar ];
+        NSArray *strips = @[ self.panel.titleBar, self.panel.statusBar,
+                             self.panel.leftStrip, self.panel.rightStrip ];
         if (pg == 1 || pg == 2) {
             for (UIView *strip in strips) {
                 UIGestureRecognizer *gr = nil;
@@ -3161,7 +3183,7 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
             MFLog(@"[ui] defaultBundleID=%@ -> 0.6s 后自动承载（默认打开）", defApp);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                [[MFFloatManager shared] hostBundleID:defApp];
+                [[MFFloatManager shared] openOrHostBundleID:defApp];
             });
         }
     }
@@ -3587,6 +3609,74 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     }
 }
 
+/// 【0.24.0】选择列表行 = "打开或承载"：
+///   App 已在运行 -> 直接走承载链路；
+///   App 未运行   -> 先用 FBSOpenApplicationService 启动（进程内 SpringBoard 标准通道，
+///                   respondsToSelector + @try 兜底），2s 后 scene 出现再自动承载。
+/// 用户需求："应用没在后台运行也要能从浮窗打开"。
+- (void)openOrHostBundleID:(NSString *)bundleID {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self openOrHostBundleID:bundleID]; });
+        return;
+    }
+    if (bundleID.length == 0) return;
+
+    // 1) 是否已在运行？
+    BOOL isRunning = NO;
+    @try {
+        id controller = MFClassSharedInstance(@"SBApplicationController");
+        NSArray *running = MFIterate(MFMsg(controller, NSSelectorFromString(@"runningApplications")));
+        for (id app in running) {
+            NSString *bid = MFStr(app, NSSelectorFromString(@"bundleIdentifier"));
+            if ([bid isEqualToString:bundleID]) { isRunning = YES; break; }
+        }
+    } @catch (NSException *e) { /* 查不到就按未运行处理 */ }
+
+    if (isRunning) {
+        MFLog(@"[ui] %@ 已在运行 -> 直接承载", bundleID);
+        [self hostBundleID:bundleID];
+        return;
+    }
+
+    // 2) 未运行 -> 启动 -> 等 scene 出现 -> 承载
+    MFLogS(@"[ui] 目标未运行 -> 先启动（FBSOpenApplicationService）-> 2s 后自动承载");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            Class svcCls = objc_getClass("FBSOpenApplicationService");
+            id svc = [svcCls performSelector:NSSelectorFromString(@"sharedInstance")];
+            if (svc == nil || ![svc respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:")]) {
+                MFLogS(@"[host] !! FBSOpenApplicationService 通道不可用 -> 请先手动打开该 App");
+                [self.panel showMessage:@"无法自动启动该 App"
+                                 detail:@"请手动打开一次目标 App，再双击边缘条重新选择。"];
+                return;
+            }
+            id opts = nil;
+            Class optCls = objc_getClass("FBSOpenApplicationOptions");
+            if (optCls && [optCls respondsToSelector:NSSelectorFromString(@"options")]) {
+                opts = [optCls performSelector:NSSelectorFromString(@"options")];
+            }
+            [svc openApplicationWithBundleID:bundleID
+                                     options:opts
+                           withResultHandler:^(NSError *err) {
+                if (err != nil) {
+                    MFLog(@"[host] 启动 %@ 返回错误：%@", bundleID, err);
+                } else {
+                    MFLog(@"[ui] 启动 %@ 已受理", bundleID);
+                }
+            }];
+        } @catch (NSException *e) {
+            MFLog(@"[host] !! 启动异常：%@", e);
+            [self.panel showMessage:@"自动启动失败" detail:[NSString stringWithFormat:@"%@", e]];
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            MFLog(@"[ui] 启动等待结束 -> 承载 %@", bundleID);
+            [self hostBundleID:bundleID];
+        });
+    });
+}
+
 - (void)fail:(NSString *)message detail:(NSString *)detail {
     MFLog(@"[host] FAIL: %@", message);
     MFFloatPanel *panel = self.panel;
@@ -3612,13 +3702,42 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     NSArray *running = MFIterate(MFMsg(controller, NSSelectorFromString(@"runningApplications")));
     MFLog(@"[ui] runningApplications=%lu", (unsigned long)running.count);
 
-    NSMutableArray *items = [NSMutableArray array];
+    // 【0.24.0】用户需求："应用没在后台运行也要能选" —— 列表 = 全部已安装 App，
+    // 运行中的加 "● " 前缀并排在最前；未运行的 "○ "，点它 = 先启动再承载。
+    NSMutableSet *runningIDs = [NSMutableSet set];
+    NSMutableArray *runningItems = [NSMutableArray array];
     for (id app in running) {
         NSString *bid = MFStr(app, NSSelectorFromString(@"bundleIdentifier"));
         if (bid == nil || [bid hasPrefix:@"com.apple.springboard"]) continue;
         NSString *name = MFStr(app, NSSelectorFromString(@"displayName"));
-        [items addObject:@[ name.length > 0 ? name : bid, bid ]];
+        [runningItems addObject:@[ [NSString stringWithFormat:@"● %@", name.length > 0 ? name : bid], bid ]];
+        [runningIDs addObject:bid];
     }
+
+    NSMutableArray *installedItems = [NSMutableArray array];
+    @try {
+        id ws = [objc_getClass("LSApplicationWorkspace") performSelector:NSSelectorFromString(@"defaultWorkspace")];
+        NSArray *all = MFIterate(MFMsg(ws, NSSelectorFromString(@"allInstalledApplications")));
+        MFLog(@"[ui] allInstalledApplications=%lu", (unsigned long)all.count);
+        for (id proxy in all) {
+            NSString *bid = MFStr(proxy, NSSelectorFromString(@"applicationIdentifier"));
+            if (bid.length == 0 || [bid hasPrefix:@"com.apple.springboard"]) continue;
+            if ([runningIDs containsObject:bid]) continue;    // 运行中的已在前面
+            NSString *name = MFStr(proxy, NSSelectorFromString(@"localizedName"));
+            if (name.length == 0) continue;                   // 无名系统件不进列表
+            [installedItems addObject:@[ [NSString stringWithFormat:@"○ %@", name], bid ]];
+        }
+        [installedItems sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+            return [a.firstObject localizedCaseInsensitiveCompare:b.firstObject];
+        }];
+    } @catch (NSException *e) {
+        MFLog(@"[ui] !! LSApplicationWorkspace 不可用（%@）-> 只显示运行中列表", e);
+    }
+
+    NSMutableArray *items = [NSMutableArray arrayWithArray:runningItems];
+    [items addObjectsFromArray:installedItems];
+    MFLog(@"[ui] 应用列表：运行中 %lu + 已安装 %lu = %lu 项",
+         (unsigned long)runningItems.count, (unsigned long)installedItems.count, (unsigned long)items.count);
     [self.panel showAppList:items];
 }
 

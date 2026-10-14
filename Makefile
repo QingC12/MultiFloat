@@ -6,6 +6,16 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.24.0 变更（第 27 轮：承载后可移动 + 全量应用列表 + 未运行可启动）：
+#   - 归档26 反馈：缩放 ✔（增量式修复生效）；承载后移动手势摸不到（选择器页面正常）
+#     —— 根因：承载后 App 内容占满窗口，用户摸中间 = 摸到 App 自己；36/22pt 上下
+#     边缘条太窄抓不到。修法：左/右加 16pt 透明边缘条（四条边都能抓），
+#     右条底部留 70pt 避开 ◢ 缩放区（角落必须归缩放）。
+#   - 用户需求："应用没在后台运行也要能选"：列表 = 全部已安装 App
+#     （LSApplicationWorkspace allInstalledApplications），运行中 "● " 排前 +
+#     未运行 "○ " 按名排序；点未运行的 = FBSOpenApplicationService 先启动 ->
+#     2s 后自动承载（openOrHostBundleID，resp+@try 兜底）；defaultBundleID 同路。
+#
 # 0.23.1 变更（第 26 轮：缩放仍失效 —— 归档25 日志裁决 + 改回增量式）：
 #   - 归档25 实锤：resize 手势已触发（开始/结束日志都有），但 frame 一像素未动 ——
 #     要么 Changed 没来，要么 Changed 写了又被回写。onDrag 用相同的

@@ -1,8 +1,8 @@
 Package: com.example.multifloat
 Name: MultiFloat
-Version: 0.23.1
+Version: 0.24.0
 Architecture: iphoneos-arm64e
-Description: Multi-floating window / split-view tweak for iOS 17 (roothide / arm64e). 0.23.1 fixes the still-broken corner resize. Archive 25 proved the resize recognizer fires (begin/end logged) but the window frame never changes by a single point; the drag-to-move gesture uses the identical translationInView pattern incrementally and works, so the only functional difference - the 0.22.0 anchor-at-start plus absolute-size rewrite - is reverted to the proven incremental model: each Changed projects the incremental pan onto the original bottom-right diagonal to get a single width delta, accumulates it into the current width (min 150 pt, clamped to screen), and derives height as width / locked aspect ratio so content still never distorts. A throttled Changed log (every 4th tick: translation, delta, resulting W/H) is added so the next log definitively separates no-Changed-events from changed-but-reverted. No config changes; cfgVersion stays 20.
+Description: Multi-floating window / split-view tweak for iOS 17 (roothide / arm64e). 0.24.0: after hosting, the app content fills the whole window so the user's finger lands on the app and the move gesture never triggers (archive 26: move works in the picker page, dead after hosting). Fix: invisible 16 pt edge strips are added on the left and right so the window can be grabbed from any of the four edges; the right strip stops 70 pt above the bottom to keep the corner exclusively for the resize grip. App picking now lists ALL installed apps (LSApplicationWorkspace allInstalledApplications): running apps get a dot prefix and sort first, not-running ones sort by name, and tapping a not-running app launches it through FBSOpenApplicationService (in-process SpringBoard, respondsToSelector + try/catch guarded) and auto-hosts it 2 s later when the scene exists (openOrHostBundleID). The defaultBundleID auto-host path uses the same launch-then-host route. No new config keys; cfgVersion stays 20.
 Maintainer: QingC12 <QingC12@users.noreply.github.com>
 Author: QingC12
 Section: Tweaks
