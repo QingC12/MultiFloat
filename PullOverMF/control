@@ -1,8 +1,25 @@
 Package: com.qingc12.pullovermf
-Name: PullOverMF
-Version: 0.1.6
+Name: PullOverMF 悬浮分屏
+Version: 0.1.7
 Architecture: iphoneos-arm64e
-Description: MultiFloat personal fork of PullOver X (GPL-3.0). Floating multitask window / split view for iOS 14+ (roothide / arm64e). 0.1.6: ring picker interaction rework - the dial is no longer pinned to the screen centre. It is now summoned by the edge SWIPE only (the tap-to-summon shortcut is removed, a plain tap on the edge no longer opens the dial), it FOLLOWS your finger as it comes out, then locks in the centre of the LOWER half of the screen. Once locked, slide your finger over an icon to highlight it and LIFT your finger: the dial closes and the highlighted app opens in the float; lifting with nothing highlighted just closes the dial. New options: mfRingParkRatioY (0.72), mfRingLatchTolerance (72), mfRingSettleDelay (0.18), mfRingSummonThreshold (18). 0.1.5: ring picker geometry fix - the dial centre is now inset from the screen edge (screenWidth - radius - mfRingEdgeMargin) so the WHOLE circle is visible inside the screen instead of being cut in half; icons are arranged around the full 360-degree circle starting from the top (mfRingStartAngle) and the default icon size is reduced from 56 to 44pt (mfRingIconSize). New options: mfRingEdgeMargin (12), mfRingStartAngle (-90). 0.1.4: critical link fix - 0.1.2/0.1.3 failed to load entirely because PullOverX.mm is ObjC++ and called cross-file C functions declared without extern "C" (mangled refs __Z9MFLogRawCPKc / __Z19MFRingPickerInstallv could not be resolved by dyld, so the whole dylib was rejected: no handle, no log file). All shared C interfaces are now wrapped in extern "C". 0.1.3: Stheno-style ring picker summoned by a configurable edge-gesture strip (verified working above a full-screen app), tap an icon to open that app in the float, long-press to remove it (ringApps); plus pure-C MFLogRawC() file logging to /var/mobile/PullOverMF.log.
+Description: 个人自用的多任务悬浮分屏插件（基于 PullOver X 二次开发，GPL-3.0，仅供本人使用）。
+ 把任意 App 装进一个可移动、可缩放的悬浮窗里，边看边用；从屏幕边缘向内滑动即可呼出「圆盘选择器」，
+ 滑到哪个图标就打开哪个 App。只注入 SpringBoard，零系统手势 hook，不卡开机。
+ .
+ 【0.1.7】修复"从右下边缘触发圆盘时 SpringBoard 自动注销、而且不进安全模式"：
+ 圆盘窗口改为常驻全屏、命中交由 hitTest 判定（触发条之外一律点透给下层 App），
+ 展开/收起不再改动窗口几何；圆盘内的 App 标识符增加校验（过滤掉会让图标系统硬崩的非法标识），
+ 图标加缓存；构建延后到下一轮 runloop，并补齐 >>>/<<< 步骤日志，便于定位。
+ .
+ 【0.1.6】圆盘交互重做：只保留手势呼出（去掉点击呼出）；呼出后跟随手指，
+ 停到屏幕下半屏中心；滑到哪个图标即高亮哪个，手指离开屏幕即以浮窗打开该 App。
+ .
+ 【0.1.5】圆盘整圆显示（圆心内缩，不再有一半落在屏幕外），图标缩小到 44pt。
+ .
+ 【0.1.4】修复致命链接错误（ObjC++ 调用 C 接口未加 extern "C" 导致整个 dylib 加载失败）。
+ .
+ 上游与版权：PullOver X（作者 mlgm，GPL-3.0）/ 其上游 PullOver Pro（作者 c1d3rDev）；
+ 本分支同样以 GPL-3.0 授权，完整源码与许可见工程内 LICENSE 与 NOTICE.md。
 Maintainer: QingC12
 Author: PullOver X by mlgm / PullOver Pro by c1d3rDev / fork by QingC12 <QingC12@users.noreply.github.com>
 Section: Tweaks

@@ -18,12 +18,23 @@
 //  本实现（零 hook，确保不卡开机）：
 //    · 圆盘：完整圆形，图标沿整圈排布；可自定义 App（配置键 ringApps）。
 //    · 呼出：**只保留手势**——屏幕边缘一条透明触发区，向内滑动 >阈值 即呼出。
-//    · 交互（0.1.6 重做，用户指定）：
+//    · 交互（0.1.6 起，用户指定）：
 //        ① 手势呼出后圆盘**跟随手指**移动；
-//        ② 手指停住 / 靠近停靠点 → 圆盘**固定到屏幕下半屏中心**（不再是屏幕正中心）；
+//        ② 手指停住 / 靠近停靠点 → 圆盘**固定到屏幕下半屏中心**；
 //        ③ 手指自由滑动 → 高亮离手指最近的图标（悬停选择）；
 //        ④ **手指离开屏幕** → 自动收起圆盘；若已选中 App → 立即以浮窗打开。
-//    · 全程 MFLog 记录（含触摸来源窗口类名、悬停选中变化、固定时刻）。
+//
+//  ⚠️ 0.1.7 两处关键修复（症状：从右下边缘触发圆盘 → SpringBoard 立刻自动注销，且不进安全模式）：
+//   1) **窗口始终全屏，命中由 hitTest 决定**（PullOver 同款"点透"模型）：
+//      0.1.5/0.1.6 的窗口 frame 只有触发条那么大，展开时要在**手势回调里**把 frame 改成全屏；
+//      在手势进行中改窗口几何会惊动 SBWindowScene 的几何/手势仲裁。现在 frame 装机时一次定好，
+//      收起态由 `hitTest` 只认触发条、条外一律返回 nil（点透给下层 App），展开态整窗接管 —— 
+//      展开/收起全程**不再动窗口几何**，只切换标志位与子视图。
+//   2) **喂给图标的 bundleID 必须先验证**：SB 的最近使用列表里会混进 SBDisplayItem 的
+//      "com.xxx:default" 这类标识符，把它交给 SBIconModel / IconServices 会**硬崩 SpringBoard**
+//      （是 os_crash / trap，不是 NSException，@try 抓不住 → 表现为"一触发就注销、但不进安全模式"）。
+//      现在只保留 `isUserFacingApplicationBundleId:` 认可的真 App，并对取图标加缓存。
+//   另：展开改为**下一轮 runloop 构建**（不在建视图的手势回调里同步做重活），全程 `>>>`/`<<<` 步骤日志。
 //
 //  配置项（suite com.mlgm.pulloverx，改完 respring 生效）：
 //    mfRingEnabled      BOOL   是否启用圆盘（默认 YES）
@@ -44,7 +55,7 @@
 //    ringApps           array  bundleID 数组（自定义圆盘内容）
 //
 //  版本备注：0.1.4 及以前圆心放在屏幕边缘 → 圆一半在屏幕外；0.1.5 圆心内缩让整圆可见；
-//  0.1.6 交互重做（本文件）：去掉「点击触发区呼出」，改为手势呼出 + 跟随手指 + 停靠下半屏中心 + 悬停选择 + 松手即开。
+//  0.1.6 交互重做；0.1.7 修「触发即注销」（全屏窗口 + hitTest 点透 + bundleID 校验 + 延迟构建）。
 //
 
 #import <UIKit/UIKit.h>
@@ -57,6 +68,11 @@
 #define MF_RING_WINDOW_LEVEL 130.0
 
 static char kMFRingBundleIdKey;
+
+/// 前向声明：MFRingWindow 的 hitTest 要问 MFRingPicker（定义在下方）
+@interface MFRingPicker (MFRingHitTest)
++ (BOOL)ringWindowHitTestDecision:(UIWindow *)window point:(CGPoint)point;
+@end
 
 #pragma mark - 配置读取
 
@@ -103,27 +119,67 @@ static NSString *MFRingEdge(void) {
     return edge.lowercaseString;
 }
 
-/// 圆盘内容：配置键 ringApps（bundleID 数组）；未配置时退化为"最近使用的 App"
+/// 数值兜底：任何 NaN/Inf 都不允许进入几何计算（NaN frame = 渲染服务器直接带走进程）
+static CGFloat MFRingSafe(CGFloat value, CGFloat fallback) {
+    return isfinite(value) ? value : fallback;
+}
+
+#pragma mark - bundleID 校验（0.1.7 新增，防硬崩）
+
+/// 是否是"可以喂给图标系统"的 bundleID。
+/// ⚠️ SB 的最近使用列表里混有 SBDisplayItem 标识符（形如 "com.tencent.xin:default"）与
+///    非 App 的字符串；把它们交给 SBIconModel / IconServices 会硬崩 SpringBoard。
+static BOOL MFRingIsUsableBundleId(id value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return NO;
+    }
+    NSString *bundleId = (NSString *)value;
+    if (bundleId.length == 0) {
+        return NO;
+    }
+    if ([bundleId rangeOfString:@":"].location != NSNotFound) {
+        return NO;   // SBDisplayItem: "bundle:role"
+    }
+    if ([bundleId rangeOfString:@" "].location != NSNotFound) {
+        return NO;
+    }
+    if ([bundleId rangeOfString:@"/"].location != NSNotFound) {
+        return NO;
+    }
+    return [POApplicationHelper isUserFacingApplicationBundleId:bundleId];
+}
+
+/// 圆盘内容：配置键 ringApps（bundleID 数组）；未配置时退化为"最近使用的 App"（过滤后）
 static NSArray<NSString *> *MFRingBundleIds(void) {
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
     id configured = [MFRingDefaults() arrayForKey:@"ringApps"];
     if ([configured isKindOfClass:[NSArray class]]) {
-        for (id item in configured) {
-            if ([item isKindOfClass:[NSString class]] && [item length] > 0 && ![ids containsObject:item]) {
+        for (id item in (NSArray *)configured) {
+            if (MFRingIsUsableBundleId(item) && ![ids containsObject:item]) {
                 [ids addObject:item];
             }
         }
         if (ids.count > 0) {
+            MFLog(@"[ring] 圆盘内容来自配置 ringApps：%lu 项", (unsigned long)ids.count);
             return ids;
         }
     }
     int limit = (int)MAX(1.0, MFRingNumber(@"mfRingMaxIcons", 8));
-    NSArray *recent = [POApplicationHelper recentAppsWithCount:limit];
+    if (limit > 24) {
+        limit = 24;
+    }
+    // 多取一些原始项：过滤掉 SBDisplayItem / 非 App 之后还能凑够 limit
+    NSArray *recent = [POApplicationHelper recentAppsWithCount:limit * 3];
     for (id item in recent) {
-        if ([item isKindOfClass:[NSString class]] && [item length] > 0 && ![ids containsObject:item]) {
+        if (MFRingIsUsableBundleId(item) && ![ids containsObject:item]) {
             [ids addObject:item];
+            if ((int)ids.count >= limit) {
+                break;
+            }
         }
     }
+    MFLog(@"[ring] 圆盘内容来自最近使用：候选 %lu 项 -> 可用 %lu 项",
+          (unsigned long)recent.count, (unsigned long)ids.count);
     return ids;
 }
 
@@ -134,36 +190,85 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     MFLog(@"[ring] ringApps 已保存 %lu 项", (unsigned long)ids.count);
 }
 
+/// 图标缓存（进程内；respring 后重建）。减少对 SBIconModel / IconServices 的重复调用。
+static NSMutableDictionary<NSString *, UIImage *> *MFRingIconCache(void) {
+    static NSMutableDictionary<NSString *, UIImage *> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [NSMutableDictionary dictionary];
+    });
+    return cache;
+}
+
+static UIImage *MFRingIconForBundleId(NSString *bundleId) {
+    if (!MFRingIsUsableBundleId(bundleId)) {
+        MFLog(@"[ring] !! 跳过非法 bundleID 的图标：%@", bundleId ?: @"(nil)");
+        return nil;
+    }
+    UIImage *cached = MFRingIconCache()[bundleId];
+    if (cached != nil) {
+        return cached;
+    }
+    MFLog(@"[ring] >>> 取图标 %@", bundleId);
+    UIImage *icon = nil;
+    @try {
+        // imageForBundleId: 内部已经会退到 iconImageForIdentifier:，不必重复调
+        icon = [POApplicationHelper imageForBundleId:bundleId];
+    } @catch (NSException *exception) {
+        MFLog(@"[ring] !! 取图标异常 %@：%@", bundleId, exception);
+        icon = nil;
+    }
+    if (icon != nil) {
+        MFRingIconCache()[bundleId] = icon;
+    }
+    MFLog(@"[ring] <<< 取图标 %@ ok=%@", bundleId, icon != nil ? @"是" : @"否");
+    return icon;
+}
+
 #pragma mark - 窗口
 
+/// 圆盘窗口：命中判定完全交给 hitTest —— 
+/// 收起态只认「贴边触发条」，条外返回 nil 把触摸**点透**给下面的 App / 桌面（PullOver 同款模型）。
 @interface MFRingWindow : UIWindow
 @end
 
 @implementation MFRingWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (![MFRingPicker ringWindowHitTestDecision:self point:point]) {
+        return nil;   // 点透：本窗口不参与这次触摸
+    }
+    return [super hitTest:point withEvent:event];
+}
+
 @end
 
 #pragma mark - 圆盘选择器
 
 @interface MFRingPicker : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) MFRingWindow *window;
-@property (nonatomic, strong) UIView *triggerView;          // 贴边透明触发区（收起态）
+@property (nonatomic, strong) UIView *triggerView;              // 贴边透明触发区（常驻）
 @property (nonatomic, strong) UIPanGestureRecognizer *triggerPan;
-@property (nonatomic, strong) UIView *container;            // 展开态根视图（轻遮罩 + 圆盘）
-@property (nonatomic, strong) UIView *ringRoot;             // 圆盘整体（移动它 = 移动圆盘）
-@property (nonatomic, strong) CAShapeLayer *dialLayer;      // 圆形底盘
+@property (nonatomic, assign) CGRect triggerFrame;              // 触发条位置（屏幕坐标）
+@property (nonatomic, strong) UIView *container;                // 展开态根视图（轻遮罩 + 圆盘）
+@property (nonatomic, strong) UIView *ringRoot;                 // 圆盘整体（移动它 = 移动圆盘）
+@property (nonatomic, strong) CAShapeLayer *dialLayer;          // 圆形底盘
 @property (nonatomic, strong) NSMutableArray<UIButton *> *iconButtons;
 @property (nonatomic, assign) BOOL expanded;
-@property (nonatomic, assign) BOOL ringLatched;             // 圆盘是否已固定在停靠点
-@property (nonatomic, assign) CGPoint parkCenter;           // 停靠点（屏幕下半屏中心）
-@property (nonatomic, weak) UIButton *selectedButton;       // 悬停选中的图标
-@property (nonatomic, assign) CGPoint lastFingerPoint;      // 最近一次手指屏幕坐标
-@property (nonatomic, assign) CGPoint latchFingerPoint;     // 固定那一刻的手指坐标
-@property (nonatomic, assign) BOOL hasLatchFinger;          // 是否已记录固定时的手指位置
-@property (nonatomic, assign) NSUInteger settleGeneration;  // 手指停住计时器代次
+@property (nonatomic, assign) BOOL pendingBuild;                // 已放行展开、视图待建
+@property (nonatomic, assign) NSUInteger buildGeneration;       // 延迟构建代次（作废过期回调）
+@property (nonatomic, assign) BOOL ringLatched;                 // 圆盘是否已固定在停靠点
+@property (nonatomic, assign) CGPoint parkCenter;               // 停靠点（屏幕下半屏中心）
+@property (nonatomic, weak) UIButton *selectedButton;           // 悬停选中的图标
+@property (nonatomic, assign) CGPoint lastFingerPoint;          // 最近一次手指屏幕坐标
+@property (nonatomic, assign) CGPoint latchFingerPoint;         // 固定那一刻的手指坐标
+@property (nonatomic, assign) BOOL hasLatchFinger;              // 是否已记录固定时的手指位置
+@property (nonatomic, assign) NSUInteger settleGeneration;      // 手指停住计时器代次
 + (instancetype)shared;
 - (void)install;
 - (void)showAtPoint:(CGPoint)point;
 - (void)showRingWithAnchor:(CGPoint)point latch:(BOOL)latch;
+- (void)buildExpandedUIWithAnchor:(CGPoint)anchor latch:(BOOL)latch;
 - (void)moveRingToPoint:(CGPoint)point;
 - (void)latchToParkAnimated:(BOOL)animated;
 - (void)buildRingInContainer:(UIView *)container;
@@ -181,6 +286,21 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         instance = [[MFRingPicker alloc] init];
     });
     return instance;
+}
+
+/// 窗口命中判定：收起态只认触发条，展开态整窗接管
++ (BOOL)ringWindowHitTestDecision:(UIWindow *)window point:(CGPoint)point {
+    MFRingPicker *picker = [MFRingPicker shared];
+    if (window == nil || window != picker.window) {
+        return NO;
+    }
+    if (picker.expanded) {
+        return YES;
+    }
+    if (CGRectIsEmpty(picker.triggerFrame)) {
+        return NO;
+    }
+    return CGRectContainsPoint(picker.triggerFrame, point);
 }
 
 #pragma mark 安装
@@ -225,14 +345,15 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         window.windowLevel = MF_RING_WINDOW_LEVEL;
         window.backgroundColor = [UIColor clearColor];
         window.hidden = NO;
+        // 【0.1.7】窗口**始终全屏**，装机时定好再也不改 —— 
+        // 展开/收起不再动窗口几何，只切换 hitTest 判定与子视图。
+        window.frame = screen;
         self.window = window;
         self.iconButtons = [NSMutableArray array];
 
-        // ---- 收起态：屏幕边缘一条透明触发区（**只挂 pan，不挂 tap** —— 0.1.6 起只保留手势呼出）----
-        CGRect trigger = [self triggerFrameForScreen:screen];
-        window.frame = trigger;
-
-        UIView *triggerView = [[UIView alloc] initWithFrame:window.bounds];
+        // 收起态触发条（常驻）：窗口内的一块贴边子视图
+        self.triggerFrame = [self triggerFrameForScreen:screen];
+        UIView *triggerView = [[UIView alloc] initWithFrame:self.triggerFrame];
         triggerView.backgroundColor = [UIColor clearColor];
         triggerView.userInteractionEnabled = YES;
         triggerView.tag = 991001;
@@ -245,8 +366,8 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         [triggerView addGestureRecognizer:pan];
         self.triggerPan = pan;
 
-        MFLog(@"[ring] 圆盘选择器已安装（仅手势呼出）：触发边=%@，触发区=%@，窗口 scene=%@",
-              MFRingEdge(), NSStringFromCGRect(trigger),
+        MFLog(@"[ring] 圆盘选择器已安装（仅手势呼出）：触发边=%@，触发条=%@，窗口=全屏 %@（条外点透），scene=%@",
+              MFRingEdge(), NSStringFromCGRect(self.triggerFrame), NSStringFromCGRect(screen),
               scene != nil ? NSStringFromClass([scene class]) : @"nil(回退 frame)");
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 安装异常：%@", exception);
@@ -276,9 +397,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
 
 #pragma mark 坐标辅助
 
-/// 手指在**屏幕**坐标系里的位置。
-/// 收起态窗口 frame = 触发区（原点非 0），展开态窗口 frame = 全屏（原点 0,0），
-/// 所以统一用 "窗口 frame 原点 + 窗口内坐标" 换算，两种状态都正确。
+/// 手指在**屏幕**坐标系里的位置（窗口全屏后 origin 恒为 0，两种状态都正确）
 - (CGPoint)screenPointForGesture:(UIGestureRecognizer *)gesture {
     if (self.window == nil) {
         return CGPointZero;
@@ -288,9 +407,12 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     return CGPointMake(frame.origin.x + inWindow.x, frame.origin.y + inWindow.y);
 }
 
-/// 把圆心夹到合法范围：整圆不出屏，且**只在下半屏**
+/// 把圆心夹到合法范围：整圆不出屏，且**只在下半屏**；NaN/Inf 一律兜底
 - (CGPoint)clampRingCenter:(CGPoint)point {
     CGRect screen = [UIScreen mainScreen].bounds;
+    if (CGRectIsEmpty(screen)) {
+        return CGPointZero;
+    }
     CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
     CGFloat margin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
     CGFloat extent = radius + margin;
@@ -298,8 +420,8 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     CGFloat maxX = MAX(CGRectGetMaxX(screen) - extent, minX);
     CGFloat minY = CGRectGetMidY(screen);                       // 下半屏
     CGFloat maxY = MAX(CGRectGetMaxY(screen) - extent, minY);
-    CGFloat x = MIN(MAX(point.x, minX), maxX);
-    CGFloat y = MIN(MAX(point.y, minY), maxY);
+    CGFloat x = MIN(MAX(MFRingSafe(point.x, CGRectGetMidX(screen)), minX), maxX);
+    CGFloat y = MIN(MAX(MFRingSafe(point.y, CGRectGetMidY(screen)), minY), maxY);
     return CGPointMake(x, y);
 }
 
@@ -379,37 +501,73 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         MFLog(@"[ring] 尚未安装，忽略呼出");
         return;
     }
-    if (self.expanded) {
+    if (self.expanded || self.pendingBuild) {
+        MFLog(@"[ring] 圆盘已展开/展开中，忽略重复呼出（expanded=%d pending=%d）",
+              (int)self.expanded, (int)self.pendingBuild);
         return;
     }
     CGRect screen = [UIScreen mainScreen].bounds;
     if (CGRectIsEmpty(screen)) {
+        MFLog(@"[ring] !! 屏幕未就绪，忽略呼出");
+        return;
+    }
+
+    self.expanded = YES;
+    self.pendingBuild = YES;
+    self.ringLatched = NO;
+    self.selectedButton = nil;
+    self.hasLatchFinger = NO;
+    self.settleGeneration += 1;
+    self.buildGeneration += 1;
+    NSUInteger generation = self.buildGeneration;
+
+    CGPoint anchor = [self clampRingCenter:point];
+    CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.72), 0.5), 0.92);
+    self.parkCenter = [self clampRingCenter:CGPointMake(CGRectGetMidX(screen),
+                                                        CGRectGetHeight(screen) * ratio)];
+
+    MFLog(@"[ring] >>> 放行展开 gen=%lu 起点(%.0f,%.0f) 停靠点(%.0f,%.0f) 屏幕 %.0fx%.0f",
+          (unsigned long)generation, anchor.x, anchor.y, self.parkCenter.x, self.parkCenter.y,
+          CGRectGetWidth(screen), CGRectGetHeight(screen));
+
+    // 【0.1.7】不在手势回调里同步建视图/查 App/取图标（0.1.6 就是这么把 SpringBoard 带走的）。
+    // 先放行，等本次触摸事件处理完、下一轮 runloop 再构建；期间若被收起则用代次作废。
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil) {
+            return;
+        }
+        if (generation != strongSelf.buildGeneration || !strongSelf.expanded) {
+            MFLog(@"[ring] 展开已作废 gen=%lu（当前 %lu）",
+                  (unsigned long)generation, (unsigned long)strongSelf.buildGeneration);
+            return;
+        }
+        strongSelf.pendingBuild = NO;
+        [strongSelf buildExpandedUIWithAnchor:anchor latch:latch];
+    });
+}
+
+/// 真正建视图（已脱离手势回调）。全程 >>> / <<< 步骤日志，崩溃时能一眼定位到哪一步。
+- (void)buildExpandedUIWithAnchor:(CGPoint)anchor latch:(BOOL)latch {
+    if (self.window == nil || !self.expanded) {
         return;
     }
     @try {
-        self.expanded = YES;
-        self.ringLatched = NO;
-        self.selectedButton = nil;
-        self.hasLatchFinger = NO;
-        self.settleGeneration += 1;
-        self.window.frame = screen;
-
+        MFLog(@"[ring] >>> 建容器");
         UIView *container = [[UIView alloc] initWithFrame:self.window.bounds];
         container.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];   // 轻遮罩
         container.userInteractionEnabled = YES;
         [container addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                               action:@selector(onBackdropTap:)]];
+                                                                              action:@selector(onBackdropTap:)]];
         [self.window addSubview:container];
         self.container = container;
+        MFLog(@"[ring] <<< 建容器 ok");
 
-        // 停靠点 = 屏幕下半屏中心（用户 0.1.6 指定，不再用屏幕正中心）
-        CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.72), 0.5), 0.92);
-        self.parkCenter = [self clampRingCenter:CGPointMake(CGRectGetMidX(screen),
-                                                            CGRectGetHeight(screen) * ratio)];
-
+        MFLog(@"[ring] >>> 建圆盘");
         [self buildRingInContainer:container];
+        MFLog(@"[ring] <<< 建圆盘 ok：%lu 个图标", (unsigned long)self.iconButtons.count);
 
-        CGPoint anchor = [self clampRingCenter:point];
         self.ringRoot.center = anchor;
 
         container.alpha = 0.0;
@@ -417,11 +575,8 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
             container.alpha = 1.0;
         }];
 
-        MFLog(@"[ring] 手势呼出圆盘：跟随手指起点(%.0f,%.0f) -> 停靠点(%.0f,%.0f) | %lu 个 App 半径 %.0f 图标 %.0f",
-              anchor.x, anchor.y, self.parkCenter.x, self.parkCenter.y,
-              (unsigned long)self.iconButtons.count,
-              MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0)),
-              MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0)));
+        MFLog(@"[ring] <<< 展开完成：跟随手指(%.0f,%.0f) -> 停靠点(%.0f,%.0f)",
+              anchor.x, anchor.y, self.parkCenter.x, self.parkCenter.y);
         if (latch) {
             [self latchToParkAnimated:NO];
         }
@@ -432,6 +587,8 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
 }
 
 - (void)hide {
+    self.buildGeneration += 1;   // 作废尚未执行的构建
+    self.pendingBuild = NO;
     if (!self.expanded) {
         return;
     }
@@ -448,9 +605,6 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
 
     void (^finish)(void) = ^{
         [container removeFromSuperview];
-        if (self.window != nil) {
-            self.window.frame = [self triggerFrameForScreen:[UIScreen mainScreen].bounds];
-        }
     };
     if (container == nil) {
         finish();
@@ -475,8 +629,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     if (self.ringRoot == nil) {
         return;
     }
-    CGPoint center = [self clampRingCenter:point];
-    self.ringRoot.center = center;
+    self.ringRoot.center = [self clampRingCenter:point];
 }
 
 /// 手指停住一小会儿就把圆盘固定到停靠点（用户自然会在停靠点附近有个停顿）
@@ -484,15 +637,17 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     self.settleGeneration += 1;
     NSUInteger generation = self.settleGeneration;
     NSTimeInterval delay = MAX(0.05, MFRingNumber(@"mfRingSettleDelay", 0.18));
+    __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (generation != self.settleGeneration) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil || generation != strongSelf.settleGeneration) {
             return;
         }
-        if (!self.expanded || self.ringLatched) {
+        if (!strongSelf.expanded || strongSelf.ringLatched) {
             return;
         }
-        [self latchToParkAnimated:YES];
+        [strongSelf latchToParkAnimated:YES];
     });
 }
 
@@ -537,7 +692,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     [container addSubview:ringRoot];
     self.ringRoot = ringRoot;
 
-    // 完整圆形底盘（0.1.4 及以前是半圆；0.1.5 起整圆）
+    // 完整圆形底盘
     UIBezierPath *path = [UIBezierPath bezierPathWithOvalInRect:
                           CGRectMake(extent - radius, extent - radius, radius * 2.0, radius * 2.0)];
     CAShapeLayer *dial = [CAShapeLayer layer];
@@ -548,8 +703,11 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     [ringRoot.layer addSublayer:dial];
     self.dialLayer = dial;
 
+    MFLog(@"[ring] >>> 取圆盘内容");
     NSArray<NSString *> *bundleIds = MFRingBundleIds();
     NSUInteger count = bundleIds.count;
+    MFLog(@"[ring] <<< 取圆盘内容 ok：%lu 项", (unsigned long)count);
+
     if (count == 0) {
         UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, radius * 1.4, 60.0)];
         hint.numberOfLines = 0;
@@ -576,10 +734,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         button.layer.borderWidth = 1.0;
         button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
 
-        UIImage *icon = [POApplicationHelper imageForBundleId:bundleId];
-        if (icon == nil) {
-            icon = [POApplicationHelper iconImageForIdentifier:bundleId];
-        }
+        UIImage *icon = MFRingIconForBundleId(bundleId);
         if (icon != nil) {
             [button setImage:icon forState:UIControlStateNormal];
             button.imageView.contentMode = UIViewContentModeScaleAspectFill;
@@ -609,6 +764,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         [ringRoot addSubview:button];
         [self.iconButtons addObject:button];
     }
+    MFLog(@"[ring] <<< 图标铺好：半径 %.0f 图标 %.0f", radius, iconSize);
 }
 
 #pragma mark 悬停选择
