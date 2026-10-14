@@ -2803,6 +2803,12 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 
 @class MFFloatPanel;
 
+/// 【0.33.0 手势呼出器】状态栏窗口内的隐形呼出条（左上角 70x44，Stheno/TrollOpen 风格）
+/// 强引用持有：superview 摘除后对象仍存活，重建守卫才有效
+static UIView *gMFStripView = nil;      // 隐形呼出条（挂在状态栏窗口）
+static UIWindow *gMFStripWin = nil;     // 兜底独立小窗口（找不到状态栏窗口时）
+static NSDictionary *gMFBootConfig = nil; // bootstrap 时的配置快照（首次呼出用）
+
 @interface MFFloatManager : NSObject
 @property (nonatomic, strong) NSDictionary *config;
 @property (nonatomic, strong) MFFloatPanel *panel;
@@ -2818,6 +2824,8 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 - (void)refreshAppList;
 - (void)toggleAppList;      // 【0.23.0】手势唤出：选择器 ↔ 当前承载画面
 - (void)openOrHostBundleID:(NSString *)bundleID;   // 【0.24.0】未运行先启动再承载
+- (void)toggleFloatVisible;   // 【0.33.0】呼出条手势：显示/隐藏浮窗（关闭后无需 respring）
+- (void)summonPan:(UIPanGestureRecognizer *)g;   // 【0.33.0】呼出条下滑/右滑触发
 @end
 
 @interface MFFloatPanel : UIViewController
@@ -2982,6 +2990,57 @@ static char kMFRowBundleIDKey;
 }
 
 #pragma mark 交互
+
+// ---- 【0.33.0 手势呼出器】参考 Stheno/TrollOpen 的呼出风格 ----
+// 呼出条在状态栏窗口左上角（双击 / 下滑 / 右滑触发）。首次呼出用 bootstrap 配置快照
+// 启动浮窗；已有浮窗则切换显示/隐藏 —— 关闭后随时可呼出，不用 respring 等 12 秒。
+- (void)toggleFloatVisible {
+    @try {
+        MFFloatPanel *p = self.panel;
+        if (p == nil || p.view == nil || p.view.superview == nil) {
+            if (gMFBootConfig == nil) {
+                MFLogS(@"[summon] 无浮窗且无 bootstrap 配置快照 -> 无法呼出");
+                return;
+            }
+            MFLogS(@"[summon] 首次呼出 -> 用 bootstrap 配置启动浮窗");
+            [[MFFloatManager shared] startWithConfig:gMFBootConfig];
+            return;
+        }
+        BOOL embedded = (p.view.superview != self.window);   // 挂载模式：superview 是容器视图
+        if (embedded) {
+            UIView *host = p.hostWindow;
+            if (host == nil) { MFLogS(@"[summon] !! 挂载模式但 hostWindow 已释放 -> 忽略"); return; }
+            BOOL willShow = host.isHidden;
+            host.hidden = !willShow;
+            if (willShow && host.superview != nil) [host.superview bringSubviewToFront:host];
+            MFLog(@"[summon] 挂载模式切换 hidden=%d", (int)!willShow);
+            if (!willShow) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
+        } else {
+            BOOL willShow = self.window.isHidden;
+            self.window.hidden = !willShow;
+            if (willShow) {
+                [self.window makeKeyAndVisible];
+                if (self.window.frame.size.width < 50.0)
+                    self.window.frame = [UIScreen mainScreen].bounds;
+            } else {
+                MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
+            }
+            MFLog(@"[summon] 独立窗口模式切换 hidden=%d", (int)!willShow);
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[summon] !! toggle 异常：%@", e);
+    }
+}
+
+- (void)summonPan:(UIPanGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    CGPoint t = [g translationInView:g.view];
+    // 下滑或右滑超过 25pt 即触发（TrollOpen 风格；避免与状态栏其他手势混淆）
+    if (t.y > 25.0 || t.x > 25.0) {
+        MFLog(@"[summon] 平移触发 t=(%.0f, %.0f)", t.x, t.y);
+        [self toggleFloatVisible];
+    }
+}
 
 - (void)onCloseTapped {
     MFLogS(@"[ui] 关闭按钮被点（respring 可再次显示）");
@@ -3499,11 +3558,49 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 
     panel.hostWindow = hostView;
     if (embedded) {
+        // 【0.33.0】分步插桩 + 2s 健康检查：0.32.0 反馈"浮窗没有自动弹出"，
+        // 疑点集中在挂载模式（无日志无法归因）。健康检查不通过 -> 自动回退独立 UIWindow。
+        MFLog(@"[ui] >>> E1 挂载模式开始 win.frame=%@ sbWin.bounds 未知",
+              NSStringFromCGRect(win.frame));
         win.hidden = YES;                    // 独立 UIWindow 退场（仅保留引用）
         panel.view.frame = hostView.bounds;
         [hostView addSubview:panel.view];
-        MFLog(@"[ui] 浮窗已显示（挂载模式）frame=%@ super=%@",
-              NSStringFromCGRect(hostView.frame), NSStringFromClass([hostView.superview class]));
+        MFLog(@"[ui] <<< E1 ok panel.view.frame=%@ super=%@ hidden=%d",
+              NSStringFromCGRect(panel.view.frame),
+              panel.view.superview ? NSStringFromClass([panel.view.superview class]) : @"nil",
+              (int)panel.view.isHidden);
+        // ---- 【0.33.0】2s 健康检查：panel.view 必须已在窗口树上且可见，否则回退 ----
+        MFFloatPanel *weakPanel = panel;
+        UIWindow *weakWin = win;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                BOOL onScreen = (weakPanel.view.window != nil) && !weakPanel.view.isHidden;
+                BOOL saneSize = weakPanel.view.bounds.size.width > 50.0
+                             && weakPanel.view.bounds.size.height > 50.0;
+                if (onScreen && saneSize) {
+                    MFLog(@"[ui] 健康检查通过（挂载模式存活 2s）frame=%@",
+                          NSStringFromCGRect(weakPanel.view.frame));
+                    return;
+                }
+                MFLog(@"[ui] !! 健康检查失败 onScreen=%d saneSize=%d window=%@ bounds=%@"
+                      @" -> 自动回退独立 UIWindow",
+                      (int)onScreen, (int)saneSize,
+                      weakPanel.view.window ? NSStringFromClass([weakPanel.view.window class]) : @"nil",
+                      NSStringFromCGRect(weakPanel.view.bounds));
+                [weakPanel.view removeFromSuperview];
+                CGRect sf = [UIScreen mainScreen].bounds;
+                if (weakWin.frame.size.width < 50.0) weakWin.frame = sf;   // 防空 frame
+                weakPanel.view.frame = weakWin.bounds;
+                weakWin.rootViewController = weakPanel;
+                weakWin.hidden = NO;
+                [weakWin makeKeyAndVisible];
+                MFLog(@"[ui] 回退完成：独立 UIWindow 已显示 frame=%@",
+                      NSStringFromCGRect(weakWin.frame));
+            } @catch (NSException *e) {
+                MFLog(@"[ui] !! 健康检查异常：%@（不回退，保守维持现状）", e);
+            }
+        });
     } else {
         win.rootViewController = panel;
         win.hidden = NO;
@@ -4117,6 +4214,51 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 
 #pragma mark ========== 入口 ==========
 
+// ---- 【0.33.0】安装呼出手势条（Stheno UIStatusBarWindow 路线，零 hook，fail-safe）----
+// 位置：状态栏窗口左上角 70x44 隐形条（透明背景不挡视线）；找不到状态栏窗口
+// 则用独立小 UIWindow（level 1099）兜底。双击 / 下滑 / 右滑 -> toggleFloatVisible。
+static void MFInstallSummonGesture(void) {
+    if (gMFStripView != nil) return;   // 幂等：respring 前只装一次
+    @try {
+        UIWindow *sbWin = nil;
+        NSArray *wins = ((NSArray *(*)(id, SEL))objc_msgSend)(
+            [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
+        for (UIWindow *w in wins) {
+            if ([NSStringFromClass([w class]) containsString:@"StatusBar"]) { sbWin = w; break; }
+        }
+        UIView *host = nil;
+        if (sbWin != nil && sbWin.bounds.size.width > 100.0) {
+            host = sbWin;
+        } else {
+            UIWindow *fw = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 120, 100)];
+            fw.windowLevel = 1099.0;
+            fw.backgroundColor = [UIColor clearColor];
+            fw.userInteractionEnabled = YES;
+            fw.hidden = NO;
+            gMFStripWin = fw;   // 强引用保活
+            host = fw;
+            MFLogS(@"[summon] 未找到状态栏窗口 -> 呼出条走独立小 UIWindow 兜底");
+        }
+        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 70, 44)];
+        strip.backgroundColor = [UIColor clearColor];
+        strip.userInteractionEnabled = YES;
+        strip.tag = 990040;
+        UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)];
+        dt.numberOfTapsRequired = 2;
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
+        [strip addGestureRecognizer:dt];
+        [strip addGestureRecognizer:pan];
+        [host addSubview:strip];
+        gMFStripView = strip;   // 强引用保活（重建守卫依据）
+        MFLog(@"[summon] 呼出条已安装 host=%@ frame=%@（双击/下滑/右滑呼出浮窗）",
+              NSStringFromClass([host class]), NSStringFromCGRect(strip.frame));
+    } @catch (NSException *e) {
+        MFLog(@"[summon] !! 安装异常（浮窗功能不受影响，仅无呼出条）：%@", e);
+    }
+}
+
 void MFFloatBootstrap(void) {
     MFLogRawC("--- MFFloatBootstrap 进入 ---\n");
 
@@ -4153,6 +4295,10 @@ void MFFloatBootstrap(void) {
     id cfgDelay = config[@"showDelay"];
     if ([cfgDelay respondsToSelector:@selector(doubleValue)]) delay = [cfgDelay doubleValue];
     MFLog(@"[gate] %.1f 秒后显示浮窗（启动时不自动承载）", delay);
+
+    // 【0.33.0】呼出条随时可呼出浮窗（关闭后不用 respring 等 12 秒）
+    gMFBootConfig = [config copy];   // 首次呼出时的配置快照
+    MFInstallSummonGesture();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

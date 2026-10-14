@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.32.0";
+    return @"0.33.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -302,9 +302,9 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @21,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @22,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
-        @"showDelay"       : @12,
+        @"showDelay"       : @6,
         @"windowLevel"     : @1010,
         // 【0.23.0】Stheno 风交互：
         @"defaultBundleID" : @"",                      // 非空 => 浮窗出现即自动承载该 App（"默认打开"）
@@ -657,6 +657,14 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"defaultWidthScale"]  = up[@"defaultWidthScale"]  ?: @0.55;
             up[@"defaultHeightScale"] = up[@"defaultHeightScale"] ?: @0.72;
             up[@"cfgVersion"] = @21;
+        }
+
+        // ---- 0.32 -> 0.33：showDelay 12s -> 6s（用户反馈等待太久）----
+        if (cur < 22) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=22：showDelay 12 -> 6（浮窗更早出现；"
+                  @"呼出条安装后关闭浮窗可随时呼出，不再依赖此延迟）");
+            up[@"showDelay"]  = @6;
+            up[@"cfgVersion"] = @22;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];

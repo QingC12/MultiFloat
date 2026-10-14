@@ -6,6 +6,15 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.33.0 变更（第 36 轮：归档35 反馈"浮窗没有自动弹出" + 手势呼出器需求）：
+#   - ① 0.32.0 不自动弹出修复：embed 挂载分支加分步诊断日志（>>> E1）+ 2s 健康检查
+#     （panel.view 必须在窗口树上且可见、尺寸正常），不通过 -> 自动回退独立 UIWindow。
+#   - ② 手势呼出器（Stheno/TrollOpen 风格）：状态栏窗口左上角 70x44 隐形条
+#     （双击 / 下滑 / 右滑 >25pt -> toggleFloatVisible）；找不到状态栏窗口用
+#     独立小 UIWindow(level 1099) 兜底；首次呼出用 bootstrap 配置快照启动，
+#     已有浮窗则切换显示/隐藏 —— 关闭后随时呼出，不用 respring 等 12 秒。
+#   - ③ showDelay 12s -> 6s（cfgVersion 21->22 迁移）。
+#
 # 0.32.0 变更（第 35 轮：归档34，实时缩放 + 挂载路线 phase 1）：
 #   - ① 实时跟手缩放：Changed 中本地把承载视图对齐到内容区（50ms 节流）——
 #     活的实时内容随手指等比缩放，零 scene 写入；定格预览只作无承载兜底。
