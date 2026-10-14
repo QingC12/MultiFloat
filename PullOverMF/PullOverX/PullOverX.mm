@@ -8,6 +8,7 @@
 #include <substrate.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #import "headers.h"
 #import "FBSOrientationObserver.h"
@@ -1252,29 +1253,41 @@ static void POPosixDeleteFile(const char *path) {
     unlink(path);
 }
 
-// hook 目标：SBReachabilityGestureRecognizer._handlePullGesture:（便捷访问手势 = 底部边缘下滑）。
-// Stheno 实证路线（analysis/stheno-ring-gesture-study.md §3.1）；该手势在**任何界面**（含全屏
-// App）都由系统识别，绕开归档 38 的"触摸归属"限制。
+// hook 目标（0.2.5）：按 Stheno 逆向清单**多候选探测注册**。
+// 0.2.4 只试了 SBReachabilityGestureRecognizer/_handlePullGesture: —— iOS 17.3.1 上不存在
+// （用户日志实证"不注册"）。这里把 Stheno hook 过的类/方法逐个探测，存在哪个注册哪个；
+// hook 内部再按"触点是否在贴边触发带±60pt"决定接管或放行 —— 手势起自屏幕中部时
+// （回桌面/多任务/控制中心）系统行为完全不受影响。
 // ⚠️ 铁律 2：MFRingPicker.m 是 ObjC（C 链接），本文件是 ObjC++ —— 声明必须 extern "C"，
 // 否则 C++ 修饰名（__Z29MFRing…）未定义 → dyld 拒绝加载整个 dylib（0.2.4 自检曾抓到）。
 extern "C" {
 BOOL MFRingWantsSystemGestureSummon(void);
-void MFRingSummonFromSystemGesture(void);
+BOOL MFRingPointNearTriggerEdge(CGPoint point);
+void MFRingSummonFromSystemGestureAtPoint(CGPoint point);
 }
 
-static void (*_po_orig_SBReachability_handlePullGesture)(id, SEL, id);
+static void (*_po_orig_SystemGestureHandler)(id, SEL, id);
 
-static void _po_hook_SBReachability_handlePullGesture(id self, SEL _cmd, id gesture) {
+static void _po_hook_SystemGestureHandler(id self, SEL _cmd, id gesture) {
     @try {
-        if (MFRingWantsSystemGestureSummon()) {
-            MFRingSummonFromSystemGesture();
-            return;   // 接管本次下拉（呼出圆盘）；mfRingGestureSummon=false 可还原系统行为
+        if (MFRingWantsSystemGestureSummon() && [gesture isKindOfClass:[UIGestureRecognizer class]]) {
+            UIGestureRecognizer *recognizer = (UIGestureRecognizer *)gesture;
+            if (recognizer.state != UIGestureRecognizerStateEnded &&
+                recognizer.state != UIGestureRecognizerStateCancelled &&
+                recognizer.state != UIGestureRecognizerStateFailed) {
+                CGPoint location = [recognizer locationInView:nil];
+                if (!isnan(location.x) && !isnan(location.y) &&
+                    MFRingPointNearTriggerEdge(location)) {
+                    MFRingSummonFromSystemGestureAtPoint(location);
+                    return;   // 只接管"贴边开始"的手势；mfRingGestureSummon=false 可还原
+                }
+            }
         }
     } @catch (NSException *gestureException) {
         (void)gestureException;   // 失败放行：绝不把异常抛回系统手势代码
     }
-    if (_po_orig_SBReachability_handlePullGesture != NULL) {
-        _po_orig_SBReachability_handlePullGesture(self, _cmd, gesture);
+    if (_po_orig_SystemGestureHandler != NULL) {
+        _po_orig_SystemGestureHandler(self, _cmd, gesture);
     }
 }
 
@@ -1288,7 +1301,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // ⚠️ constructor 阶段 Foundation/UIKit 尚未就绪 —— 这里只能用纯 C 日志。
     // 0.1.2 正是在这里调用 NSDateFormatter / [UIDevice currentDevice] 把整个 tweak 拖崩，
     // 结果 dylib 加载失败、桌面连手柄都不显示。
-    MFLogRawC("=== PullOverMF 0.2.4 加载（SpringBoard）===");
+    MFLogRawC("=== PullOverMF 0.2.5 加载（SpringBoard）===");
 
     // 【MF 0.1.3】Stheno 风格圆盘选择器：延迟 2 秒安装（等屏幕就绪）。
     // 零 hook；安装失败只损失圆盘，不影响浮窗与手柄。
@@ -1298,35 +1311,70 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 【0.2.2】容量 24 + 两圈外圈铺满/内圈自适应半径 + 停靠点下移 + 触摸到达诊断。
     // 【0.2.3】宿主改为**优先状态栏窗口**（全屏 App 上也收得到触摸；找不到就退回 POXWindow，零 hook）
     //          + 圆盘大小随 App 数量自适应（50% / 85% / 100%）+ 全窗口清单诊断日志。
-    // 【0.2.4】状态栏窗口默认关闭（实测挡桌面滑动）；新增唯一 hook：便捷访问手势呼出圆盘
-    //          （带崩溃自解除 + 失败放行）；缩放锚点 8/16/24；内圈先铺满；编辑器过滤。
+    // 【0.2.4】状态栏窗口默认关闭（实测挡桌面滑动）；系统手势 hook 改多候选（见 0.2.5）。
+    // 【0.2.5】等距双圈（外圈多内圈少、无巨大空隙）+ 图标按数量分档 + 编辑器找回系统应用
+    //          + 手势 hook 多候选探测（Stheno 清单：Reachability/GrabberTongue/FluidSwitcher）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         MFRingPickerInstall();
     });
 
-    // 【0.2.4】系统手势呼出圆盘：hook 便捷访问手势（唯一新增 hook）。
+    // 【0.2.5】系统手势呼出圆盘：按 Stheno 逆向清单**多候选探测注册**。
+    // 0.2.4 的 SBReachabilityGestureRecognizer/_handlePullGesture: 在 iOS 17.3.1 不存在（日志实证）。
+    // 候选 = Stheno hook 过的类/方法；存在哪个注册哪个（共用同一 IMP，呼出幂等不叠加）。
     // 带"崩溃自解除"：注册前立标记，存活 20 秒自动撤；下次启动见标记则本轮不注册
-    // （删除 /var/mobile/PullOverMF.gestureguard 可重试）。类/方法不存在就原样放行，不注册。
+    // （删除 /var/mobile/PullOverMF.gestureguard 可重试）。
     {
-        Class reachabilityClass = objc_getClass("SBReachabilityGestureRecognizer");
-        SEL pullSelector = sel_registerName("_handlePullGesture:");
         if (POPosixFileExists(kPOGestureGuardPath)) {
-            MFLogRawC("PullOverMF 0.2.4: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
-        } else if (reachabilityClass != nil && [reachabilityClass instancesRespondToSelector:pullSelector]) {
-            POPosixWriteFile(kPOGestureGuardPath);
-            _po_orig_SBReachability_handlePullGesture = NULL;
-            MSHookMessageEx(reachabilityClass, pullSelector,
-                            (IMP)&_po_hook_SBReachability_handlePullGesture,
-                            (IMP *)&_po_orig_SBReachability_handlePullGesture);
-            MFLogRawC("PullOverMF 0.2.4: SBReachabilityGestureRecognizer._handlePullGesture: hook 已注册（崩溃自解除已布防）");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                POPosixDeleteFile(kPOGestureGuardPath);
-                MFLog(@"[ring] 系统手势 hook 已存活 20 秒，崩溃标记已撤除");
-            });
+            MFLogRawC("PullOverMF 0.2.5: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
         } else {
-            MFLogRawC("PullOverMF 0.2.4: SBReachabilityGestureRecognizer/_handlePullGesture: 不存在 -> 不注册（系统手势原样放行）");
+            static const struct { const char *className; const char *methodName; } kGestureCandidates[] = {
+                { "SBReachabilityGestureRecognizer", "_handlePullGesture:" },
+                { "SBReachabilityManager", "_handlePullGesture:" },
+                { "SBGrabberTongue", "_handlePan:" },
+                { "SBFluidSwitcherGestureManager", "_handlePan:" },
+                { "_SBFluidSwitcherPanGestureRecognizer", "_handlePan:" },
+            };
+            const int kCandidateCount = (int)(sizeof(kGestureCandidates) / sizeof(kGestureCandidates[0]));
+            int registered = 0;
+            char summary[256];
+            int summaryLen = 0;
+            summary[0] = '\0';
+            for (int i = 0; i < kCandidateCount; i++) {
+                Class targetClass = objc_getClass(kGestureCandidates[i].className);
+                SEL handlerSelector = sel_registerName(kGestureCandidates[i].methodName);
+                if (targetClass == nil || ![targetClass instancesRespondToSelector:handlerSelector]) {
+                    continue;
+                }
+                if (registered == 0) {
+                    POPosixWriteFile(kPOGestureGuardPath);   // 第一个注册成功才布防
+                }
+                _po_orig_SystemGestureHandler = NULL;
+                MSHookMessageEx(targetClass, handlerSelector,
+                                (IMP)&_po_hook_SystemGestureHandler,
+                                (IMP *)&_po_orig_SystemGestureHandler);
+                registered++;
+                int written = snprintf(summary + summaryLen, sizeof(summary) - (size_t)summaryLen,
+                                       "%s%s.%s", (registered > 1 ? " | " : ""),
+                                       kGestureCandidates[i].className, kGestureCandidates[i].methodName);
+                if (written > 0 && summaryLen + written < (int)sizeof(summary)) {
+                    summaryLen += written;
+                }
+            }
+            if (registered > 0) {
+                char line[384];
+                snprintf(line, sizeof(line),
+                         "PullOverMF 0.2.5: 手势 hook 已注册 %d 个候选（崩溃自解除已布防）: %s",
+                         registered, summary);
+                MFLogRawC(line);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    POPosixDeleteFile(kPOGestureGuardPath);
+                    MFLog(@"[ring] 系统手势 hook 已存活 20 秒，崩溃标记已撤除");
+                });
+            } else {
+                MFLogRawC("PullOverMF 0.2.5: Stheno 候选手势类/方法全部不存在 -> 不注册（系统手势原样放行）");
+            }
         }
     }
 
