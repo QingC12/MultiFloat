@@ -17,7 +17,54 @@
 #include <stdlib.h>
 #define HANDLE_EDGE_GAP 5
 #define CONTENT_EDGE_GAP 5
-#define CONTENT_CORNER_RADIUS 20
+#define CONTENT_CORNER_RADIUS 20   // 上游默认值（本 fork 改用 MFPanelCornerRadius()，见下）
+
+// ===== 【MF 0.1.1】Stheno 风格面板几何 =====
+// 上游行为：卡片宽 ≈ 整屏宽（scale 上限 1.0）且贴右缘滑入 —— 视觉上"非常大、紧贴屏幕边缘"。
+// 本 fork 改为：面板按屏宽比例缩小（默认 0.78）→ 打开后**停在屏幕正中**；圆角加大（默认 44，上游 20）。
+// 两个参数都可在 /var/mobile/Library/Preferences/com.mlgm.pulloverx.plist 里直接调整，
+// 改完 respring 生效（无需重新编译）：
+//     mfPanelWidthRatio   0.30 ~ 1.00   面板宽度占屏幕比例（默认 0.78）
+//     mfPanelCornerRadius 0    ~ 80     面板圆角（默认 44）
+#define MF_PANEL_WIDTH_RATIO_KEY      @"mfPanelWidthRatio"
+#define MF_PANEL_CORNER_RADIUS_KEY    @"mfPanelCornerRadius"
+#define MF_DEFAULT_PANEL_WIDTH_RATIO  0.78
+#define MF_DEFAULT_PANEL_CORNER_RADIUS 44.0
+
+static NSUserDefaults *MFGeometryDefaults(void) {
+    static NSUserDefaults *defaults = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        defaults = [[NSUserDefaults alloc] initWithSuiteName:@"com.mlgm.pulloverx"];
+        if (defaults == nil) {
+            defaults = [NSUserDefaults standardUserDefaults];
+        }
+    });
+    return defaults;
+}
+
+static CGFloat MFGeometryNumber(NSString *key, CGFloat fallback) {
+    id value = [MFGeometryDefaults() objectForKey:key];
+    if ([value respondsToSelector:@selector(doubleValue)]) {
+        double number = [value doubleValue];
+        if (isfinite(number) && number > 0.0) {
+            return (CGFloat)number;
+        }
+    }
+    return fallback;
+}
+
+/// 面板宽度占屏幕（画布）比例，钳制在 0.30 ~ 1.00
+static CGFloat MFPanelWidthRatio(void) {
+    CGFloat ratio = MFGeometryNumber(MF_PANEL_WIDTH_RATIO_KEY, MF_DEFAULT_PANEL_WIDTH_RATIO);
+    return MIN(MAX(ratio, 0.30), 1.00);
+}
+
+/// 面板圆角（默认 44，比上游 20 明显更圆），钳制在 0 ~ 80
+static CGFloat MFPanelCornerRadius(void) {
+    CGFloat radius = MFGeometryNumber(MF_PANEL_CORNER_RADIUS_KEY, MF_DEFAULT_PANEL_CORNER_RADIUS);
+    return MIN(MAX(radius, 0.0), 80.0);
+}
 #define CONTENT_SHADOW_OPACITY 0.28
 #define CONTENT_SHADOW_FADE_DISTANCE 12.0
 #define CLOSED_CONTENT_OFFSET_EPSILON 0.5
@@ -316,7 +363,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
     self.contentView = [[UIView alloc] initWithFrame:CGRectZero];
     self.contentView.backgroundColor = [UIColor secondarySystemBackgroundColor];
-    self.contentView.layer.cornerRadius = CONTENT_CORNER_RADIUS;
+    self.contentView.layer.cornerRadius = MFPanelCornerRadius();   // 【MF】更大更圆
     if (@available(iOS 13.0, *)) {
         self.contentView.layer.cornerCurve = kCACornerCurveContinuous;
     }
@@ -340,7 +387,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     shadowView.layer.shadowOffset = CGSizeMake(0, 1);
     shadowView.layer.shadowRadius = 8;
     shadowView.layer.shadowOpacity = 0;
-    shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds cornerRadius:CONTENT_CORNER_RADIUS].CGPath;
+    shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds cornerRadius:MFPanelCornerRadius()].CGPath;
     [keyboardZoomContainer addSubview:shadowView];
 
     [keyboardZoomContainer addSubview:self.contentView];
@@ -488,7 +535,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     shadowView.frame = keyboardZoomContainer.bounds;
     self.contentView.frame = keyboardZoomContainer.bounds;
     shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
-                                                              cornerRadius:CONTENT_CORNER_RADIUS].CGPath;
+                                                              cornerRadius:MFPanelCornerRadius()].CGPath;
     [self layoutContextView];
 }
 
@@ -2558,7 +2605,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
     CGFloat widthScale = availableCardWidth / MAX(1, logicalCanvas.width);
     CGFloat heightScale = availableCardHeight / MAX(1, logicalCanvas.height);
-    scale = MIN(1.0, MIN(widthScale, heightScale));
+    // 【MF】上限从 1.0 改为面板宽度比例：卡片整体缩小，配合下面的居中补偿 ->
+    // 打开后停在屏幕正中（Stheno 风格），不再贴着屏幕边缘铺满。
+    CGFloat mfPanelScaleCap = MFPanelWidthRatio();
+    scale = MIN(mfPanelScaleCap, MIN(widthScale, heightScale));
 
     CGFloat screenScale = UIScreen.mainScreen.scale;
     contentLayoutWidth = round(logicalCanvas.width * scale * screenScale) / screenScale;
@@ -2577,7 +2627,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [quickSwitchDragCoordinator layoutForBounds:bounds safeAreaInsets:self.view.safeAreaInsets];
 
     scrollView.frame = bounds;
-    scrollView.contentSize = CGSizeMake(CGRectGetWidth(bounds) + contentLayoutWidth + trailingInset,
+    // 【MF】居中补偿：卡片比屏幕窄时，把"滑到底"的目标再向右多推一段，
+    // 这样打开态 contentOffset.x == maximumContentOffsetX 时，卡片正好落在屏幕正中：
+    //   卡片屏幕 x = bounds.width - (contentLayoutWidth + trailingInset + mfCenteringInset)
+    //             = (bounds.width - contentLayoutWidth) / 2   ← 左右留白相等
+    CGFloat mfCenteringInset = MAX(0.0, (CGRectGetWidth(bounds) - contentLayoutWidth) / 2.0 - trailingInset);
+    scrollView.contentSize = CGSizeMake(CGRectGetWidth(bounds) + contentLayoutWidth + trailingInset + mfCenteringInset,
                                         CGRectGetHeight(bounds));
     CGFloat maximumContentOffsetX = [self maximumContentOffsetX];
     CGFloat restoredOffset = 0;
@@ -2596,6 +2651,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         ? anchoredCardBottomY - CGRectGetHeight(normalCardFrame)
         : CGRectGetMidY(bounds) - CGRectGetHeight(normalCardFrame) / 2.0;
     normalCardFrame.origin.y = round(normalCardFrame.origin.y * screenScale) / screenScale;
+
+    // 【MF】几何诊断：尺寸/圆角变化时打一行，确认"居中 + 缩小 + 圆角"是否按预期生效
+    static CGSize mfLastLoggedCardSize = {0, 0};
+    if (fabs(mfLastLoggedCardSize.width - contentLayoutWidth) > 0.5 ||
+        fabs(mfLastLoggedCardSize.height - contentLayoutHeight) > 0.5) {
+        mfLastLoggedCardSize = CGSizeMake(contentLayoutWidth, contentLayoutHeight);
+        NSLog(@"[MF] 面板几何: 卡片 %.0fx%.0f @y=%.0f | 屏幕 %.0fx%.0f | 比例 %.2f | 左右留白 %.0f | 圆角 %.0f",
+              contentLayoutWidth, contentLayoutHeight, normalCardFrame.origin.y,
+              CGRectGetWidth(bounds), CGRectGetHeight(bounds), scale,
+              MAX(0.0, (CGRectGetWidth(bounds) - contentLayoutWidth) / 2.0), MFPanelCornerRadius());
+    }
 
     BOOL horizontalMode = portraitHostedLandscapeOptimization;
     self.handle.layoutMode = horizontalMode
@@ -2666,7 +2732,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         shadowView.frame = keyboardZoomContainer.bounds;
         self.contentView.frame = keyboardZoomContainer.bounds;
         shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
-                                                                  cornerRadius:CONTENT_CORNER_RADIUS].CGPath;
+                                                                  cornerRadius:MFPanelCornerRadius()].CGPath;
     }];
     CGFloat shadowProgress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * shadowProgress;

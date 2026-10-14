@@ -1,6 +1,6 @@
 Package: com.qingc12.pullovermf
 Name: PullOverMF
-Version: 0.1.0
+Version: 0.1.1
 Architecture: iphoneos-arm64e
 Description: MultiFloat personal fork of PullOver X (GPL-3.0). Floating multitask window / split view for iOS 14+ (roothide / arm64e). Based on PullOver X by mlgm, which is based on PullOver Pro by c1d3rDev; modified by QingC12 for personal use.
 Maintainer: QingC12

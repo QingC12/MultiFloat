@@ -20,4 +20,23 @@
    指向 mediaserverd/cameracaptured；其源码 `POCameraCompatibility.m` 自带进程名判断，仍随本包编译）。
 4. 暂不构建偏好设置 bundle（`PullOverXPreferences`）；设置仍走
    `NSUserDefaults suite = com.mlgm.pulloverx`（`registerDefaults` 已提供默认值，可直接用）。
-5. 后续改动（UI/交互/分屏能力）将逐条记录在此。
+5. 外部 API（`POXExternalAPI`）与上游一致，未改动。
+
+## 0.1.1 改动（Stheno 风格面板几何）
+6. **面板缩小 + 居中显示**（对应需求："浮窗非常大且紧贴屏幕边缘 → 打开后停在屏幕正中"）：
+   - 上游：卡片宽 ≈ 整屏宽（`scale` 上限 1.0），从右缘滑入后基本铺满屏幕；
+   - 本 fork：`scale` 上限改为 `MFPanelWidthRatio()`（默认 **0.78**）→ 卡片按比例缩小，
+     `normalCardFrame` 的 y 本来就居中，于是整体停在屏幕正中；
+   - 并在 `scrollView.contentSize` 上加了**居中补偿**（`mfCenteringInset`），使"滑到底 =
+     打开态"时卡片左右留白完全相等，而不是贴住右缘。
+7. **圆角加大**：`CONTENT_CORNER_RADIUS` 20 → `MFPanelCornerRadius()`（默认 **44**），
+   且沿用 `kCACornerCurveContinuous`（连续曲率，视觉更圆润）。阴影路径同步跟随新半径。
+8. **两个参数都做成可配置**（写进 `NSUserDefaults` suite `com.mlgm.pulloverx`，改完 respring 生效，无需重编译）：
+   - `mfPanelWidthRatio`（0.30 ~ 1.00，默认 0.78）
+   - `mfPanelCornerRadius`（0 ~ 80，默认 44）
+9. 面板内承载的 App 内容由 `layoutContextView` 按 `contentView.bounds` 自动等比缩放并居中，
+   卡片变小不会造成拉伸。
+10. 新增几何诊断日志：尺寸变化时打印
+    `[MF] 面板几何: 卡片 WxH @y | 屏幕 WxH | 比例 | 左右留白 | 圆角`。
+
+11. 后续改动（UI/交互/分屏能力）将逐条记录在此。
