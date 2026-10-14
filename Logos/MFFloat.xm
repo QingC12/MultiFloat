@@ -2757,7 +2757,7 @@ static char kMFRowBundleIDKey;
     //      四角 = 缩放（锚定对角）、四边 = 移动、外沿双击 = 唤出应用列表；
     //      中间内容区完全不挡，App 自行接收触摸。
     const CGFloat pad  = 18.0;                 // 外沿宽度（Stheno edgeWidth 同类参数）
-    const CGFloat barH = 36.0, statusH = 22.0;
+    const CGFloat barH = 36.0;
     CGRect bounds = self.view.bounds;
     CGFloat w = bounds.size.width, h = bounds.size.height;
 
