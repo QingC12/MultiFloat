@@ -2847,9 +2847,41 @@ static char kMFRowBundleIDKey;
     [g setTranslation:CGPointZero inView:win];
 }
 
+// 【0.20.0】resize 误触回滚状态（归档 21 钉死的问题）：
+// 上滑/下滑回桌面的手指划过右下角 ◢，pan 手势把它当成拖动缩放 —— 浮窗被凭空
+// 拉大/缩小，松手后 syncContentGeometry 把错误尺寸写进 scene.frame（日志实测
+// 内容区在 448→605→367→432→340 之间乱跳），掉层恢复期间 App 常是挂起定格状态，
+// 挂起的最后帧按放大后的尺寸显示 = 用户看到的"画面定格成一张放大的图片"。
+static CGRect     gMFResizeStartFrame = CGRectZero;
+static NSDate    *gMFResizeStartDate  = nil;
+
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
     if (win == nil) return;
+
+    if (g.state == UIGestureRecognizerStateBegan) {
+        gMFResizeStartFrame = win.frame;
+        gMFResizeStartDate  = [NSDate date];
+    }
+
+    // 【0.20.0】误触判定：手势开始后 0.8s 内累计变化"几乎纯竖直且幅度大"
+    //（|dy|>60pt 且 |dy|>3|dx|）—— 正经拖 ◢ 是斜向/横向的，快速上下滑才是这种形状。
+    // 命中 => 立即回滚 win.frame 并废掉手势；**不调 syncContentGeometry**，
+    // scene.frame 从头到尾不被污染（Changed 期间本来也不写 scene.frame）。
+    if (gMFResizeStartDate != nil && gMFResizeStartFrame.size.width > 0) {
+        NSTimeInterval el = -[gMFResizeStartDate timeIntervalSinceNow];
+        CGFloat dx = win.frame.size.width  - gMFResizeStartFrame.size.width;
+        CGFloat dy = win.frame.size.height - gMFResizeStartFrame.size.height;
+        if (el < 0.8 && fabs(dy) > 60.0 && fabs(dy) > 3.0 * fabs(dx)) {
+            win.frame = gMFResizeStartFrame;
+            gMFResizeStartDate = nil;
+            [g setEnabled:NO];   // 废掉本次手势，后续 Changed/Ended 不再来
+            dispatch_async(dispatch_get_main_queue(), ^{ [g setEnabled:YES]; });
+            MFLogS(@"[ui] resize 手势判定为划过误触 -> 已回滚浮窗尺寸（不同步 scene.frame）");
+            return;
+        }
+    }
+
     CGPoint t = [g translationInView:win];
     CGRect f = win.frame;
     f.size.width = MAX(190.0, f.size.width + t.x);
@@ -2863,7 +2895,11 @@ static char kMFRowBundleIDKey;
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
     if (g.state == UIGestureRecognizerStateEnded) {
+        gMFResizeStartDate = nil;
         [[MFFloatManager shared] syncContentGeometry];
+    } else if (g.state == UIGestureRecognizerStateCancelled ||
+               g.state == UIGestureRecognizerStateFailed) {
+        gMFResizeStartDate = nil;
     }
 }
 
