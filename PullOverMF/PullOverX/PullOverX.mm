@@ -1235,6 +1235,9 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     if (!objc_getClass("SpringBoard")) {
         return;
     }
+    MFLog(@"=== PullOverMF 0.1.2 加载 === 设备=%s iOS=%s",
+          [UIDevice currentDevice].model.UTF8String,
+          [UIDevice currentDevice].systemVersion.UTF8String);
     POSetCameraForegroundGrantBundleIdentifier(nil);
     if (POSettingsEnabled([POApplicationHelper settings])) {
         PORegisterScreenBlankObserver();

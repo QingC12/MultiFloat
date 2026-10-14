@@ -2,4 +2,10 @@
 
 #ifdef __OBJC__
     #import <Foundation/Foundation.h>
+
+    // ===== 【MF 0.1.2】文件日志 =====
+    // 上游全项目几乎没有日志（只进 syslog，设备上取不到）。MFLog() 直接写
+    // /var/mobile/PullOverMF.log（Filza 可直接打开看），启动时 >2MB 自动轮转为 .old。
+    // 实现见 PullOverX/MFDebugLog.m。
+    void MFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 #endif

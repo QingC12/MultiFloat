@@ -65,6 +65,14 @@ static CGFloat MFPanelCornerRadius(void) {
     CGFloat radius = MFGeometryNumber(MF_PANEL_CORNER_RADIUS_KEY, MF_DEFAULT_PANEL_CORNER_RADIUS);
     return MIN(MAX(radius, 0.0), 80.0);
 }
+
+// 【MF 0.1.2】面板打开后，手柄（nub）与卡片右边缘之间的间距，默认 6pt
+#define MF_PANEL_HANDLE_GAP_KEY @"mfPanelHandleGap"
+
+static CGFloat MFPanelHandleEdgeGap(void) {
+    CGFloat gap = MFGeometryNumber(MF_PANEL_HANDLE_GAP_KEY, 6.0);
+    return MIN(MAX(gap, 0.0), 40.0);
+}
 #define CONTENT_SHADOW_OPACITY 0.28
 #define CONTENT_SHADOW_FADE_DISTANCE 12.0
 #define CLOSED_CONTENT_OFFSET_EPSILON 0.5
@@ -278,6 +286,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    MFLog(@"[ui] 面板视图就绪（PullOverMF 已加载，日志见 /var/mobile/PullOverMF.log）");
     panelBackdropView = [[UIView alloc] initWithFrame:self.view.bounds];
     panelBackdropView.backgroundColor = UIColor.blackColor;
     panelBackdropView.alpha = 0;
@@ -2223,6 +2232,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 -(void)finishPanelSnapToOpenState:(BOOL)shouldOpen{
+    MFLog(@"[panel] 吸附完成 -> %@（state=%lu，%@）", shouldOpen ? @"打开" : @"关闭",
+          (unsigned long)(shouldOpen ? POPanelStateOpen : POPanelStateClosed),
+          [self mfHandleScreenDescription]);
     scrollSnapAnimationInProgress = NO;
     interactiveHostIntentIssued = NO;
     interactiveHostResumeRequired = NO;
@@ -2331,6 +2343,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)snapPanelToOpenState:(BOOL)shouldOpen{
     POPanelState previousState = panelState;
     pendingOpenState = shouldOpen;
+    MFLog(@"[panel] 吸附请求 -> %@（from state=%lu）", shouldOpen ? @"打开" : @"关闭", (unsigned long)previousState);
 
     if (shouldOpen && previousState == POPanelStateClosed) {
         [self preparePanelForOpenPresentationIfNeeded];
@@ -2536,6 +2549,76 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self syncHorizontalQuickSwitchPresentationAnchor];
 }
 
+#pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧
+
+/// 竖屏（vertical rail）时手柄 rail 应有的"屏幕坐标 x"：
+///   · 关闭态 → 贴屏幕右缘（上游行为，不变）
+///   · 打开态 → 平移到卡片右边缘外侧，使 nub **完整显示在浮窗右边**（右手可及）
+///   中间按打开进度线性插值 —— 手柄随面板一起滑入，不会突兀跳位。
+///   注：上游竖屏分支把 rail 固定在"内容坐标"，面板滑入时会被 scrollView 一起带走
+///   （打开后手柄跑到屏幕左侧），这里就是把这个偏移补回来。
+-(CGFloat)mfVerticalHandleRailScreenX{
+    CGRect bounds = self.view.bounds;
+    CGFloat screenWidth = CGRectGetWidth(bounds);
+    CGFloat railWidth = [self handleRailWidth];
+    CGFloat closedScreenX = screenWidth - railWidth;
+    if (railWidth <= 0 || contentLayoutWidth <= 0 || contentLayoutWidth >= screenWidth - 1.0) {
+        return closedScreenX;   // 卡片接近满宽 → 无需移动（保持上游行为）
+    }
+
+    // 打开态卡片左右留白相等 → 右边缘 = (屏宽 + 卡片宽) / 2
+    CGFloat openCardRight = (screenWidth + contentLayoutWidth) / 2.0;
+    CGFloat handleWidth = CGRectGetWidth(self.handle.bounds);
+    if (handleWidth <= 0) {
+        return closedScreenX;
+    }
+
+    // nub 呈现时手柄在 rail 内右移 (railW - 可见宽)，故 nub 左边缘 = railX + railW - visibleWidth
+    CGFloat hiddenPercent = 67.0;
+    id configuredHidden = [POApplicationHelper settings][@"nubHiddenPercentage"];
+    if ([configuredHidden respondsToSelector:@selector(doubleValue)]) {
+        hiddenPercent = [configuredHidden doubleValue];
+    }
+    hiddenPercent = MIN(MAX(hiddenPercent, 0.0), 80.0);
+    CGFloat visibleWidth = handleWidth * (1.0 - hiddenPercent / 100.0);
+
+    CGFloat openScreenX = openCardRight + MFPanelHandleEdgeGap() - railWidth + visibleWidth;
+    openScreenX = MIN(MAX(openScreenX, 0.0), closedScreenX);   // 不允许比贴右缘更靠右
+
+    CGFloat maximumOffset = [self maximumContentOffsetX];
+    CGFloat progress = maximumOffset > 0
+        ? MIN(MAX(scrollView.contentOffset.x / maximumOffset, 0), 1)
+        : 0;
+    return closedScreenX + (openScreenX - closedScreenX) * progress;
+}
+
+/// 把手柄 rail 摆到上面的位置。rail 是 scrollView 的子视图（坐标属于 content），
+/// 因此要加回 contentOffset.x 才能落到期望的屏幕位置 —— 与上游 landscape 分支同一思路。
+-(void)mfUpdateVerticalHandleRailPosition{
+    if (self.handle.layoutMode != POHandleLayoutModeVerticalRail) {
+        return;
+    }
+    if (CGRectIsEmpty(handleScrollView.frame) || CGRectGetWidth(handleScrollView.frame) <= 0) {
+        return;
+    }
+    CGRect railFrame = handleScrollView.frame;
+    CGFloat contentX = [self mfVerticalHandleRailScreenX] + scrollView.contentOffset.x;
+    if (fabs(railFrame.origin.x - contentX) <= 0.25) {
+        return;   // 已在位，避免无意义的 frame 写入
+    }
+    railFrame.origin.x = contentX;
+    handleScrollView.frame = railFrame;
+}
+
+/// 手柄当前在屏幕上的可见区间（仅用于日志）
+-(NSString *)mfHandleScreenDescription{
+    CGRect handleInView = [handleScrollView convertRect:self.handle.frame toView:self.view];
+    return [NSString stringWithFormat:@"手柄屏幕 x=%.0f..%.0f（屏宽 %.0f，%@）",
+            CGRectGetMinX(handleInView), CGRectGetMaxX(handleInView),
+            CGRectGetWidth(self.view.bounds),
+            self.handle.isNubbed ? @"收起态" : @"展开态"];
+}
+
 -(void)applyLayoutPreservingHandlePosition:(BOOL)preserveHandlePosition{
     CGRect bounds = self.view.bounds;
     if (CGRectGetWidth(bounds) <= 0 || CGRectGetHeight(bounds) <= 0 || !self.handle) {
@@ -2657,7 +2740,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (fabs(mfLastLoggedCardSize.width - contentLayoutWidth) > 0.5 ||
         fabs(mfLastLoggedCardSize.height - contentLayoutHeight) > 0.5) {
         mfLastLoggedCardSize = CGSizeMake(contentLayoutWidth, contentLayoutHeight);
-        NSLog(@"[MF] 面板几何: 卡片 %.0fx%.0f @y=%.0f | 屏幕 %.0fx%.0f | 比例 %.2f | 左右留白 %.0f | 圆角 %.0f",
+        MFLog(@"[ui] 面板几何: 卡片 %.0fx%.0f @y=%.0f | 屏幕 %.0fx%.0f | 比例 %.2f | 左右留白 %.0f | 圆角 %.0f",
               contentLayoutWidth, contentLayoutHeight, normalCardFrame.origin.y,
               CGRectGetWidth(bounds), CGRectGetHeight(bounds), scale,
               MAX(0.0, (CGRectGetWidth(bounds) - contentLayoutWidth) / 2.0), MFPanelCornerRadius());
@@ -2710,6 +2793,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         self.handle.frame = handleLayoutFrame;
         quickSwitchHorizontalBarView.presentationAnchorFrame = CGRectZero;
+        // 【MF 0.1.2】把手柄摆到"关闭态=屏幕右缘 / 打开态=浮窗右侧"
+        [self mfUpdateVerticalHandleRailPosition];
     } else {
         handleScrollView.contentSize = handleScrollView.bounds.size;
         [handleScrollView setContentOffset:CGPointZero animated:NO];
@@ -3131,6 +3216,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 -(void)open{
+    MFLog(@"[panel] open() 调用（pinned=%@，state=%lu，手柄 %@）",
+          pinnedBundleId ?: @"(空)", (unsigned long)panelState, [self mfHandleScreenDescription]);
     if (pinnedBundleId.length == 0 || scaledProgrammaticCloseAnimating ||
         panelState == POPanelStateOpening || panelState == POPanelStateOpen) {
         return;
@@ -3151,6 +3238,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 -(void)close{
+    MFLog(@"[panel] close() 调用（state=%lu）", (unsigned long)panelState);
     if (panelState == POPanelStateClosed || panelState == POPanelStateClosing) {
         return;
     }
@@ -3168,6 +3256,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 #pragma mark - MHHandleDelegate
 
 -(void)handle:(POHandle *)handle didReceiveTap:(UIGestureRecognizer *)recognizer{
+    MFLog(@"[handle] 单击手柄（state=%lu，%@）", (unsigned long)panelState, [self mfHandleScreenDescription]);
     [self cancelAutoNubTimer];
     if ([self isPanelTransitioning] || scrollView.dragging || scrollView.decelerating) {
         return;
@@ -3193,6 +3282,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 -(void)handle:(POHandle *)handle didPanPanel:(UIPanGestureRecognizer *)recognizer{
     if (recognizer.state == UIGestureRecognizerStateBegan) {
+        MFLog(@"[handle] 拖动手柄开始（nubbed=%d，%@）", self.handle.isNubbed, [self mfHandleScreenDescription]);
         handlePanIntent = POHandlePanIntentNone;
         handlePanStartedNubbed = self.handle.isNubbed;
         if ([self isPanelTransitioning]) {
@@ -3324,6 +3414,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 -(void)handle:(POHandle *)handle didLongPress:(UILongPressGestureRecognizer *)recognizer{
     if (recognizer.state == UIGestureRecognizerStateBegan) {
+        MFLog(@"[handle] 长按手柄（快速切换菜单）");
         if (![self canBeginQuickSwitchSession]) {
             return;
         }
@@ -3940,6 +4031,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)scrollViewDidScroll:(UIScrollView *)sv{
     if (sv == scrollView) {
         [self updatePortraitHostedLandscapeHandleForCurrentOffset];
+        [self mfUpdateVerticalHandleRailPosition];   // 【MF 0.1.2】面板滑入/滑出时手柄跟着走
         [self updateInteractionBackdropsAnimated:NO];
 
         CGFloat shadowProgress = MIN(MAX(sv.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
@@ -4395,6 +4487,8 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
                  sceneStack:(UIView *)sceneStack
                    bundleId:(NSString *)bundleId
                  generation:(NSUInteger)generation{
+    MFLog(@"[host] 场景已发布 bid=%@ gen=%lu stack=%@", bundleId, (unsigned long)generation,
+          sceneStack != nil ? @"非空" : @"空");
     if (!sceneStack || generation != controller.currentGeneration ||
         ![bundleId isEqualToString:controller.requestedBundleId]) {
         return;
@@ -4580,6 +4674,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
 -(void)hostSessionController:(POHostSessionController *)controller
 cannotHostFrontmostBundleId:(NSString *)bundleId
                   generation:(NSUInteger)generation{
+    MFLog(@"[host] !! 无法承载 bid=%@ gen=%lu", bundleId, (unsigned long)generation);
     if ([externallyActivatedBundleId isEqualToString:bundleId]) {
         [self restoreExternallyActivatedApplicationNatively:bundleId];
         return;

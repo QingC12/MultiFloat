@@ -39,4 +39,20 @@
 10. 新增几何诊断日志：尺寸变化时打印
     `[MF] 面板几何: 卡片 WxH @y | 屏幕 WxH | 比例 | 左右留白 | 圆角`。
 
+## 0.1.2 改动（文件日志 + 手柄跟随到浮窗右侧）
+12. **新增文件日志 `MFLog()`**（`PullOverX/MFDebugLog.m`，声明在 prefix header）：
+    上游全项目几乎没有日志、且只进系统 syslog，设备上根本取不到，排查等于盲人摸象。
+    现在所有关键事件写入 **`/var/mobile/PullOverMF.log`**（Filza 直接打开看），
+    启动时超过 2MB 自动轮转为 `.old`，无缓冲写入（崩溃前最后一条也在盘上）。
+    已插桩：版本加载、视图就绪、面板几何、open()/close()、吸附请求/完成、
+    手柄单击/拖动/长按、承载成功（场景发布）/失败（无法承载）。
+13. **面板打开后手柄移到浮窗右侧**（对应需求"以便右手操作"）：
+    - 上游竖屏把手柄 rail 固定在**内容坐标**的屏幕右缘，面板滑入时会被 scrollView
+      一起带走 → 打开后手柄实际跑到了屏幕左侧；
+    - 本 fork 新增 `mfVerticalHandleRailScreenX` / `mfUpdateVerticalHandleRailPosition`：
+      按打开进度插值，关闭态贴屏幕右缘（上游行为），**打开态平移到卡片右边缘外侧**，
+      使 nub **完整显示在浮窗右边**；在 `applyLayoutPreservingHandlePosition:` 与
+      `scrollViewDidScroll:` 两处刷新（与上游 landscape 分支同一思路）。
+    - 新增配置键 `mfPanelHandleGap`（手柄与卡片右边缘的间距，默认 6pt，0~40）。
+
 11. 后续改动（UI/交互/分屏能力）将逐条记录在此。
