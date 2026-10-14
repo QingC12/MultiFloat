@@ -2,6 +2,30 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.4 核心改动 ============================
+//  ① **宿主窗口默认退回 POXWindow**（`mfRingHostWindow` 默认 2 → **0**）。
+//     0.2.3 实测（用户日志 log8）：找到的是 `SBStatusBarReusePoolWindow`（**level=0 的全屏窗口**），
+//     我们塞进去的全屏覆盖层让这扇窗口的命中判定变成"触摸黑洞"—— 带内呼出正常，
+//     **带外把桌面的触摸全吃掉 ⇒ 桌面无法滑动**（UIWindow 默认 hitTest 在所有子视图都不接时
+//     返回窗口自身，SB 事件路由便认为这个点归这扇窗口）。方案保留可用（设 2 强行开），
+//     但默认关闭，不再作为全屏 App 呼出的指望。
+//  ② **系统手势呼出（唯一新增 hook，在 PullOverX.mm）**：hook `SBReachabilityGestureRecognizer
+//     _handlePullGesture:`（便捷访问手势 = 屏幕底部边缘下滑；Stheno 实证路线）。
+//     手势触发时若 `MFRingWantsSystemGestureSummon()` 允许 → 呼出圆盘并吞掉本次便捷访问；
+//     否则原样放行。需要用户在 设置>辅助功能>触控 打开"便捷访问"（识别器才活跃）。
+//     带**崩溃自解除**标记（/var/mobile/PullOverMF.gestureguard：注册前立标记、存活 20s 自动撤；
+//     下次启动见标记则本轮不注册，删除文件可重试）。
+//  ③ **缩放锚点按用户要求重定**（阶梯+线性）：count < 8 → 50%；count < 16 → 75%；
+//     16~23 线性 75% → 100%；count ≥ 24 → 100%（`mfRingScaleCountLow/Base/High` 默认 8/16/24，
+//     `mfRingScaleBase` 默认 0.85 → 0.75）。
+//  ④ **多圈分配方向反转（用户指定）**：**内圈先铺满**，内圈装不下才往外圈填；
+//     外圈只剩 1~2 个时从内圈匀上来凑 3 个。
+//  ⑤ **应用编辑器过滤（用户反馈"好多白图标/应用不完整/混进系统里打不开的应用"）**：
+//     · 过滤系统组件：`LSApplicationProxy.applicationType` 含 "User" 才进列表；
+//     · 过滤无图标应用：取不到图标（`MFRingIconForBundleId` = nil）的不显示 —— 白图标的根源；
+//     · 用户已选的 `ringApps` 无论过滤结果如何**强制可见**；
+//     · 过滤后才截断到 200 上限（不再"先截断后过滤"导致漏 App）。
+//
 //  ============================ 0.2.3 核心改动 ============================
 //  ① **宿主窗口改为「状态栏窗口」**（`mfRingHostWindow`，默认 2=自动优先，1=强制，0=只用 POXWindow）。
 //     为什么（**实证，不是猜**）：归档 38 的证据表里，**挂在 `SBStatusBarWindow` 里的热区（tag 990042）
@@ -134,14 +158,17 @@
 //    mfRingInnerRatio   number 内圈半径比例上限 0.35~0.95（默认 0.62，仅多圈时生效）
 //    mfRingIconGap      number 图标间距估算值，pt（默认 6；越大每圈能放越少）
 //    mfRingMaxIcons     number 圆盘最多显示几个（默认 24，上限 24）
-//    mfRingHostWindow   number 圆盘/触发条的宿主窗口：2=自动(默认，优先状态栏窗口) / 1=强制状态栏窗口 /
-//                              0=只用 PullOver 窗口（0.2.2 行为）
+//    mfRingHostWindow   number 圆盘/触发条的宿主窗口：**0=只用 PullOver 窗口（0.2.4 默认）** /
+//                              2=自动优先状态栏窗口 / 1=强制状态栏窗口
+//                              （⚠️ 0.2.3 实测状态栏窗口路线会挡桌面滑动，仅供试验）
 //    mfRingScaleMin     number 图标少时圆盘缩放下限（默认 0.50 = 50%）
-//    mfRingScaleBase    number 常规数量的缩放基数（默认 0.85 = 85%）
+//    mfRingScaleBase    number 常规数量的缩放基数（默认 0.75 = 75%）
 //    mfRingScaleMax     number 图标多时的缩放上限（默认 1.00 = 100%）
-//    mfRingScaleCountLow  number 数量 ≤ 此值 → 用 mfRingScaleMin（默认 4）
-//    mfRingScaleCountBase number 数量 = 此值 → 用 mfRingScaleBase（默认 14）
-//    mfRingScaleCountHigh number 数量 ≥ 此值 → 用 mfRingScaleMax（默认 22）
+//    mfRingScaleCountLow  number 数量 < 此值 → 用 mfRingScaleMin（默认 8）
+//    mfRingScaleCountBase number 数量 < 此值 → 用 mfRingScaleBase（默认 16；此后线性涨到上限）
+//    mfRingScaleCountHigh number 数量 ≥ 此值 → 用 mfRingScaleMax（默认 24）
+//    mfRingGestureSummon BOOL  是否接管"便捷访问"手势呼出圆盘（默认 YES；hook 在 PullOverX.mm，
+//                              关掉则系统手势原样放行）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -154,7 +181,10 @@
 //  0.2.1 双圈布局 + 圆盘应用编辑器（长按边缘触发条打开，自己挑 App）；
 //  0.2.2 容量 24 + 两圈"外圈铺满 / 内圈自适应半径" + 停靠点下移 + 触摸到达诊断（diag）；
 //  **0.2.3 宿主优先挂「状态栏窗口」（全屏 App 里也能收到触摸，见文件头 0.2.3 段）
-//        + 圆盘大小随 App 数量自适应（50% / 85% / 100%）+ 全窗口清单诊断日志。**
+//        + 圆盘大小随 App 数量自适应（50% / 85% / 100%）+ 全窗口清单诊断日志。
+//  **0.2.4 宿主默认退回 POXWindow（状态栏窗口实测挡桌面滑动）+ 系统手势呼出
+//        （hook SBReachabilityGestureRecognizer，唯一新增 hook，带崩溃自解除）
+//        + 缩放锚点 8/16/24（50%/75%/100%）+ 内圈先铺满 + 编辑器过滤系统/无图标应用。**
 //
 
 #import <UIKit/UIKit.h>
@@ -477,10 +507,59 @@ static NSString *MFRingDisplayNameForBundleId(NSString *bundleId) {
 /// 编辑器用的"全部已安装 App"列表：数组元素 = @{ @"id": bundleID, @"name": 显示名 }。
 /// 只用扁平枚举（见 MFRingEnumerateInstalledBundleIds），按显示名排序。
 /// ⚠️ 会查 SB 私有数据 ⇒ 调用方必须自己 `MFRingGuardArm/Disarm`。
+///
+/// 【0.2.4】按用户反馈"好多白图标 / 应用不完整 / 混进系统里打不开的应用"重做过滤：///   ① 系统/组件过滤：`LSApplicationProxy.applicationType` 含 "User" 才要（"System" 一律跳过）；
+///   ② 无图标过滤：`MFRingIconForBundleId` 取不到图标的不显示 —— 白图标的根源；
+///   ③ 用户已选的 `ringApps` **强制可见**（不能因为过滤把自己正在用的 App 藏起来）；
+///   ④ 先过滤、后截断 limit（0.2.3 是"先截断 200 再过滤"，导致列表缺 App）。
+/// 前置声明（实现在下方"图标缓存"段）：编辑器过滤要用它判断"取不到图标的应用"
+static UIImage *MFRingIconForBundleId(NSString *bundleId);
+
 static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEditor(NSUInteger limit) {
-    NSArray<NSString *> *bundleIds = MFRingEnumerateInstalledBundleIds(limit);
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    // ① 用户已选的优先入列（强制可见）
+    for (NSString *bid in MFRingConfiguredBundleIds()) {
+        if (MFRingIsUsableBundleId(bid) && ![ids containsObject:bid]) {
+            [ids addObject:bid];
+        }
+    }
+    // ② 枚举全部安装项（limit=0 不截断），过滤后再截断
+    NSArray<NSString *> *enumerated = MFRingEnumerateInstalledBundleIds(0);
+    NSUInteger systemSkipped = 0;
+    NSUInteger noIconSkipped = 0;
+    for (NSString *bundleId in enumerated) {
+        if (limit > 0 && ids.count >= limit) {
+            break;
+        }
+        if ([ids containsObject:bundleId]) {
+            continue;
+        }
+        @try {
+            // 系统组件过滤：applicationType 是 "User" / "System" 一类的字符串；
+            // 取不到该属性时**不误杀**（保守放行，交给图标过滤兜底）
+            Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+            SEL proxySelector = NSSelectorFromString(@"applicationProxyForIdentifier:");
+            if (proxyClass && [proxyClass respondsToSelector:proxySelector]) {
+                id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, proxySelector, bundleId);
+                NSString *type = MFRingStringProperty(proxy, @[ @"applicationType" ]);
+                if (type.length > 0 && [type rangeOfString:@"User"].location == NSNotFound) {
+                    systemSkipped++;
+                    continue;
+                }
+            }
+            // 无图标过滤：取不到图标的应用大多打不开/不可见，白图标就是这样来的
+            if (MFRingIconForBundleId(bundleId) == nil) {
+                noIconSkipped++;
+                continue;
+            }
+            [ids addObject:bundleId];
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    MFLog(@"[ring] 编辑器过滤：跳过系统/非用户 %lu 个、无图标 %lu 个，入列 %lu 个",
+          (unsigned long)systemSkipped, (unsigned long)noIconSkipped, (unsigned long)ids.count);
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *apps = [NSMutableArray array];
-    for (NSString *bundleId in bundleIds) {
+    for (NSString *bundleId in ids) {
         NSString *name = MFRingDisplayNameForBundleId(bundleId);
         [apps addObject:@{ @"id": bundleId, @"name": (name.length > 0 ? name : bundleId) }];
     }
@@ -564,28 +643,28 @@ typedef struct {
     NSUInteger count;      // 【0.2.3】本次几何是按几个图标算的
 } MFRingGeometry;
 
-/// 【0.2.3】"几个 App ⇒ 圆盘多大"。三锚点分段线性：
-///   count ≤ Low            → mfRingScaleMin  (0.50)
-///   count = CountBase      → mfRingScaleBase (0.85)
-///   count ≥ CountHigh      → mfRingScaleMax  (1.00)
+/// 【0.2.4】"几个 App ⇒ 圆盘多大"（按用户要求重定锚点，阶梯 + 线性）：
+///   count <  CountLow  (默认 8)  → Min  (0.50)
+///   count <  CountBase (默认 16) → Base (0.75)
+///   CountBase ≤ count < CountHigh(默认 24) → 线性 Base → Max
+///   count ≥ CountHigh → Max (1.00)
 /// 端点值都做了合法性夹取（min ≤ base ≤ max，锚点递增），配置写错也不会算出 NaN/负半径。
 static CGFloat MFRingScaleForCount(NSUInteger count) {
     CGFloat lo = MIN(MAX(MFRingNumber(@"mfRingScaleMin", 0.50), 0.20), 1.00);
-    CGFloat base = MIN(MAX(MFRingNumber(@"mfRingScaleBase", 0.85), lo), 1.00);
+    CGFloat base = MIN(MAX(MFRingNumber(@"mfRingScaleBase", 0.75), lo), 1.00);
     CGFloat hi = MIN(MAX(MFRingNumber(@"mfRingScaleMax", 1.00), base), 1.00);
-    NSUInteger nLow = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountLow", 4.0), 1.0), 24.0);
-    NSUInteger nBase = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountBase", 14.0), (CGFloat)nLow), 24.0);
-    NSUInteger nHigh = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountHigh", 22.0), (CGFloat)nBase), 24.0);
+    NSUInteger nLow = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountLow", 8.0), 1.0), 24.0);
+    NSUInteger nBase = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountBase", 16.0), (CGFloat)nLow), 24.0);
+    NSUInteger nHigh = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountHigh", 24.0), (CGFloat)nBase), 24.0);
     CGFloat n = (CGFloat)count;
-    if (n <= (CGFloat)nLow) {
+    if (n < (CGFloat)nLow) {
         return lo;
+    }
+    if (n < (CGFloat)nBase) {
+        return base;
     }
     if (n >= (CGFloat)nHigh) {
         return hi;
-    }
-    if (n <= (CGFloat)nBase) {
-        CGFloat t = (n - (CGFloat)nLow) / MAX((CGFloat)(nBase - nLow), 1.0);
-        return lo + (base - lo) * t;
     }
     CGFloat t = (n - (CGFloat)nBase) / MAX((CGFloat)(nHigh - nBase), 1.0);
     return base + (hi - base) * t;
@@ -981,12 +1060,17 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         // 而 SB 自己普通窗口（=POXWindow 所在地）里的视图在屏幕中间/右侧一次都收不到。
         // 所以优先挂状态栏窗口；找不到、或它不是全屏（挂上去也盖不住右侧触发带）就退回 POXWindow。
         MFRingLogWindowInventory();
-        NSInteger hostMode = (NSInteger)MFRingNumber(@"mfRingHostWindow", 2.0);   // 2=自动 1=强制 0=只用 POXWindow
+        // 【0.2.4】默认 2 → **0**：0.2.3 实测找到的是 SBStatusBarReusePoolWindow（level=0 全屏窗口），
+        // 全屏覆盖层让它变成"触摸黑洞"（带外吃掉桌面触摸 ⇒ 桌面无法滑动）。方案保留、默认关闭。
+        NSInteger hostMode = (NSInteger)MFRingNumber(@"mfRingHostWindow", 0.0);   // 0=只用 POXWindow（默认） 2=自动 1=强制
         UIWindow *host = nil;
         if (hostMode != 0) {
             host = MFRingFindStatusBarWindow(screenBounds, hostMode != 1);
             if (host == nil) {
                 MFLog(@"[ring] 未找到可用的状态栏窗口（mfRingHostWindow=%ld）-> 退回 PullOver 窗口",
+                      (long)hostMode);
+            } else {
+                MFLog(@"[ring] ⚠️ mfRingHostWindow=%ld：宿主用状态栏窗口（0.2.3 实测会挡桌面滑动，仅供试验）",
                       (long)hostMode);
             }
         }
@@ -1073,7 +1157,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.3 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.4 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1659,42 +1743,41 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         count = totalCap;   // 兜底：超出所有圈的总容量时截断
     }
 
-    // ③ 分配：**外圈先铺满**，剩余按容量往里圈填。
-    //    0.2.1 是"按容量比例"分（16 个 ⇒ 外 10 内 6），结果两圈都只填一半、间隔很大；
-    //    用户要的正是"外圈铺满、内圈再开一圈"。
+    // ③【0.2.4】分配：**内圈先铺满**，内圈装不下才往外圈填（用户明确指定）。
+    //    （0.2.2/0.2.3 是外圈先铺满；用户："圆盘内的应用从内圈往外圈排放，内圈满了后再往外圈排放"）
     NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
     for (NSUInteger ring = 0; ring < rings; ring++) {
         [perRing addObject:@(0)];
     }
     NSUInteger left = count;
-    for (NSUInteger ring = 0; ring < rings && left > 0; ring++) {
-        NSUInteger cap = [ringCaps[ring] unsignedIntegerValue];
+    for (NSInteger ring = (NSInteger)rings - 1; ring >= 0 && left > 0; ring--) {
+        NSUInteger cap = [ringCaps[(NSUInteger)ring] unsignedIntegerValue];
         NSUInteger take = MIN(cap, left);
-        perRing[ring] = @(take);
+        perRing[(NSUInteger)ring] = @(take);
         left -= take;
     }
-    // 内圈只分到 1~2 个时，从外圈匀几个下来凑到 3 个 —— 否则那一个图标孤零零贴在圆心附近
+    // 外圈只分到 1~2 个时，从内圈匀几个上来凑到 3 个 —— 否则那一个图标孤零零贴在最外圈
     if (rings > 1) {
-        NSUInteger last = rings - 1;
-        NSUInteger innerCount = [perRing[last] unsignedIntegerValue];
-        if (innerCount > 0 && innerCount < 3) {
-            NSUInteger need = 3 - innerCount;
-            for (NSInteger ring = (NSInteger)last - 1; ring >= 0 && need > 0; ring--) {
-                NSUInteger have = [perRing[(NSUInteger)ring] unsignedIntegerValue];
+        NSUInteger outerCount = [perRing[0] unsignedIntegerValue];
+        if (outerCount > 0 && outerCount < 3) {
+            NSUInteger need = 3 - outerCount;
+            for (NSUInteger ring = 1; ring < rings && need > 0; ring++) {
+                NSUInteger have = [perRing[ring] unsignedIntegerValue];
                 if (have <= 4) {
-                    continue;   // 外圈自己也得留够
+                    continue;   // 内圈自己也得留够
                 }
                 NSUInteger move = MIN(need, have - 3);
-                perRing[(NSUInteger)ring] = @(have - move);
+                perRing[ring] = @(have - move);
                 need -= move;
             }
-            perRing[last] = @(innerCount + ((3 - innerCount) - need));
+            perRing[0] = @(outerCount + ((3 - outerCount) - need));
         }
     }
 
     // ④ 内圈半径**按个数自适应**：r_in = R_out × (n_in / n_out)，让两圈"弧上间距"一致。
     //    固定 0.62 比例时，6 个图标被摊在整圈上 ⇒ 间隔 35pt+，这就是"内圈间隔很大"的原因。
     //    上限仍取规划半径（不至于贴到外圈），下限 0.42×外圈（不至于挤成一团）。
+    //    【0.2.4】内圈先铺满后 n_in ≥ n_out，比值 ≥ 1 会顶到规划半径上限 —— 正是"内圈满、外圈补"的形态。
     NSMutableArray<NSNumber *> *drawnRadii = [NSMutableArray arrayWithCapacity:rings];
     CGFloat outerCount = MAX((CGFloat)[perRing[0] doubleValue], 1.0);
     for (NSUInteger ring = 0; ring < rings; ring++) {
@@ -2383,5 +2466,54 @@ void MFRingPickerInstall(void) {
         [[MFRingPicker shared] install];
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! MFRingPickerInstall 异常：%@", exception);
+    }
+}
+
+#pragma mark - 系统手势呼出（0.2.4，供 PullOverX.mm 的 SBReachability hook 调用）
+
+/// hook 回调入口①：这次便捷访问下拉要不要接管？
+/// 条件：圆盘开着 + 手势呼出开着 + 已安装 + 当前没展开/编辑器没开。
+/// ⚠️ 从 hook 里调用（手势线程=主线程），全程 @try，绝不能把异常抛回系统手势代码。
+BOOL MFRingWantsSystemGestureSummon(void) {
+    @try {
+        if (!MFRingBool(@"mfRingEnabled", YES)) {
+            return NO;
+        }
+        if (!MFRingBool(@"mfRingGestureSummon", YES)) {
+            return NO;   // 用户配置了"别接管便捷访问" → 系统手势原样放行
+        }
+        MFRingPicker *picker = [MFRingPicker shared];
+        if (picker.hostWindow == nil || picker.stripView == nil) {
+            return NO;   // 还没安装好
+        }
+        if (picker.expanded || picker.editorPanel != nil) {
+            return NO;   // 已经开着了，让系统手势照常（避免状态打架）
+        }
+        return YES;
+    } @catch (NSException *exception) {
+        (void)exception;
+        return NO;
+    }
+}
+
+/// hook 回调入口②：呼出圆盘（停靠点上方一点，随后自动固定到停靠点）。
+/// 便捷访问的"下拉"是持续手势，后续移动不归我们管 —— 圆盘 0.18s 后自动停靠，用户再点图标。
+void MFRingSummonFromSystemGesture(void) {
+    @try {
+        MFRingPicker *picker = [MFRingPicker shared];
+        UIWindow *window = picker.hostWindow;
+        if (window == nil) {
+            return;
+        }
+        CGRect bounds = window.bounds;
+        if (CGRectIsEmpty(bounds)) {
+            return;
+        }
+        CGPoint anchor = CGPointMake(CGRectGetMidX(bounds),
+                                     CGRectGetHeight(bounds) * 0.62);
+        MFLog(@"[ring] >>> 系统手势呼出（便捷访问下拉接管）");
+        [picker showAtPoint:anchor];
+    } @catch (NSException *exception) {
+        MFLog(@"[ring] !! 系统手势呼出异常：%@", exception);
     }
 }
