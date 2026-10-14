@@ -6,6 +6,17 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.21.0 变更（第 22 轮：Swift 重写第一步 —— C 桥接口 + Swift 编译链打通）：
+#   - 用户验收 0.20.0："现在似乎完美了，只有第一次出现了闪屏，后期没有出现，并且手势缩放正常。"
+#   - 本轮零行为变更，只搭通道：
+#     A. Bridge/MFBridge.h/.mm —— 承载核心对外 C 面（host/sync/refresh/ready 查询），
+#        关闭浮窗核心暂无入口，桥如实返回 -2（不造行为）；
+#     B. Swift/MFHostBridge.swift —— Swift 门面骨架（错误码枚举 + 事件观察），
+#        本轮无人调用，现有 ObjC++ 链路一行不动；
+#     C. Makefile 首次引入 Swift 编译（SWIFT_VERSION 5.0 + bridging header）——
+#        本轮最大未知风险是 Theos + roothide + arm64e 的 swiftc 链，让 CI 尽早暴露。
+#   - Swift/ 目录下其余 10-13 的旧脚手架文件（AppRegistry 等）未加入构建，保持死代码。
+#
 # 0.20.0 变更（消闪第七阶段：闪已消，剩"画面定格成一张放大的图片" —— ◢ 缩放手势误吃系统滑动）：
 #   - 用户原话（归档(21)）："第三方应用不闪了，但是画面会定格成一张放大的图片。"
 #   - 0.19.0 快照生命周期修复全部生效（日志确认：换 App 重挂/每拍置顶/2 拍归位都有）。
@@ -330,7 +341,13 @@ TWEAK_NAME = MultiFloat
 MultiFloat_FILES = \
     Logos/HookBridge.xm \
     Logos/MFCore.xm \
-    Logos/MFFloat.xm
+    Logos/MFFloat.xm \
+    Bridge/MFBridge.mm \
+    Swift/MFHostBridge.swift
+
+# 【0.21.0】首次引入 Swift 编译（roothide/theos 链路验证点）
+SWIFT_VERSION = 5.0
+MultiFloat_SWIFT_BRIDGING_HEADER = Bridge/MultiFloat-Bridging-Header.h
 
 # 显式开启 ARC，避免 Theos 默认值在不同版本间摇摆导致内存语义不确定
 MultiFloat_CFLAGS = -fobjc-arc
