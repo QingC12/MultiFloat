@@ -6,6 +6,18 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.36.0 变更（第 39 轮：归档35 日志——呼出 UI 已安装但不可见 / 可见性真因 + 前台手势新路线）：
+#   - ① 呼出窗口不可见真因：浮窗窗口是 initWithWindowScene: 建的（能显示），
+#     0.34/0.35 的呼出窗口用 initWithFrame:（无 scene -> 不渲染、不接触摸）。
+#     -> 呼出窗口改用 MFMainWindowScene() 创建，同一窗口内按钮/热区随之可见。
+#   - ② 状态栏窗口严格挑选 MFStatusBarWindowStrict()：排除 SBStatusBarReusePoolWindow
+#     （隐藏复用池 —— 0.33 embed"挂上了却看不见"的真凶）与隐藏窗口，取 level 最高者。
+#   - ③ 触控镜像层 MFInstallSDTouchOverlay()：把浮窗 8 个抓手热区（4 边移动/4 角缩放，
+#     tag 复用 panel 的 onDrag:/onResize:）+ 右缘呼出热区镜像进真实状态栏窗口，
+#     0.2s 定时同步几何、浮窗隐藏时自动隐藏。用于验证 Stheno 假说：
+#     状态栏窗口在前台 App 之上仍保触摸路由 —— 成立则 App 前台移动/缩放有解。
+#   - ④ 呼出触发去抖 0.4s（两条热区并存时避免双触发）；summonPan 日志记录来源窗口。
+#
 # 0.35.0 变更（第 38 轮：归档36 日志实证——呼出 UI 装不上的真因）：
 #   - 日志铁证：bootstrap 阶段 `[UIScreen mainScreen]` 为 nil，创建 UIWindow 抛
 #     "returning nil screen from mainScreen is not allowed!" -> 0.33（以及同样

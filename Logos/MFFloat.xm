@@ -2811,6 +2811,7 @@ static NSDictionary *gMFBootConfig = nil; // bootstrap 时的配置快照（首�
 static NSInteger gMFSummonTries = 0;      // 【0.35.0】呼出 UI 安装重试计数
 
 static void MFInstallSummonGesture(void);   // 【0.35.0】前向声明（Manager 内也要调用）
+static void MFInstallSDTouchOverlay(void);  // 【0.36.0】前向声明（Manager 内也要调用）
 
 @interface MFFloatManager : NSObject
 @property (nonatomic, strong) NSDictionary *config;
@@ -2847,6 +2848,9 @@ static void MFInstallSummonGesture(void);   // 【0.35.0】前向声明（Manage
 - (void)showMessage:(NSString *)message detail:(NSString *)detail;
 - (void)showAppList:(NSArray<NSArray<NSString *> *> *)items;
 - (void)attachContentViewController:(UIViewController *)vc;
+// 【0.36.0】几何抓手（供状态栏窗口内的镜像热区复用，tag 语义一致：边 1~4 / 角 11~14）
+- (void)onDrag:(UIPanGestureRecognizer *)g;
+- (void)onResize:(UIPanGestureRecognizer *)g;
 /// 0.6.0：直接把一个 UIView 挂进内容区（Route A2 的 presentationView 走这里）
 - (void)attachContentView:(UIView *)view;
 @end
@@ -3363,6 +3367,14 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 // 呼出条在状态栏窗口左上角（双击 / 下滑 / 右滑触发）。首次呼出用 bootstrap 配置快照
 // 启动浮窗；已有浮窗则切换显示/隐藏 —— 关闭后随时可呼出，不用 respring 等 12 秒。
 - (void)toggleFloatVisible {
+    // 【0.36.0】同一物理手势可能被两条热区（独立窗口 + 状态栏窗口镜像）同时命中 -> 去抖
+    static NSTimeInterval sLastToggle = 0.0;
+    NSTimeInterval nowT = [NSDate timeIntervalSinceReferenceDate];
+    if (nowT - sLastToggle < 0.4) {
+        MFLogS(@"[summon] 触发被去抖（0.4s 内已有一次）");
+        return;
+    }
+    sLastToggle = nowT;
     @try {
         MFFloatPanel *p = self.panel;
         if (p == nil || p.view == nil || p.view.superview == nil) {
@@ -3405,7 +3417,8 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     CGPoint t = [g translationInView:g.view];
     // 【0.34.0】右缘热区：向左滑超过 25pt 触发（用户指定交互）
     if (t.x < -25.0) {
-        MFLog(@"[summon] 右缘左滑触发 t=(%.0f, %.0f)", t.x, t.y);
+        MFLog(@"[summon] 右缘左滑触发 t=(%.0f, %.0f) 来源=%@(tag=%ld)",
+              t.x, t.y, NSStringFromClass([g.view.window class]), (long)g.view.tag);
         [self toggleFloatVisible];
     }
 }
@@ -3632,6 +3645,10 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     }
 
     self.window = win;
+
+    // 【0.36.0】此时 panel 已建、窗口已显示 -> 安装状态栏窗口触控镜像层
+    //（App 前台手势验证点；状态栏窗口不可用则内部静默跳过）
+    MFInstallSDTouchOverlay();
     // ---- 0.4.0：绝不在启动时自动承载 ----
     // 0.3.0 的崩循环就是因为"启动即自动承载"。现在只出外壳 + 应用列表，
     // 承载必须由用户点某一行显式触发（点之前一定先过两道闸门）。
@@ -4249,6 +4266,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 //   "returning nil screen from mainScreen is not allowed!" -> 呼出 UI 永远装不上。
 //   → 屏幕未就绪 / 抛异常时 1s 后重试（最多 40 次），并在浮窗启动时二次安装。
 static void MFInstallSummonGesture(void);   // 前向声明（重试用）
+static void MFInstallSDTouchOverlay(void);  // 【0.36.0】状态栏窗口触控镜像层（前向声明）
 
 static void MFScheduleSummonRetry(void) {
     if (gMFSummonTries >= 40) {
@@ -4257,7 +4275,10 @@ static void MFScheduleSummonRetry(void) {
     }
     gMFSummonTries++;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MFInstallSummonGesture(); });
+                   dispatch_get_main_queue(), ^{
+        MFInstallSummonGesture();
+        MFInstallSDTouchOverlay();   // 浮窗已建 + 状态栏窗口就绪后才真正装上
+    });
 }
 
 static void MFInstallSummonGesture(void) {
@@ -4271,7 +4292,19 @@ static void MFInstallSummonGesture(void) {
         }
         CGRect scr = scrObj.bounds;
         CGFloat W = scr.size.width, H = scr.size.height;
-        UIWindow *sw = [[UIWindow alloc] initWithFrame:CGRectMake(W - 64.0, 0.0, 64.0, H)];
+        // 【0.36.0 关键修复】浮窗窗口是 initWithWindowScene: 建的（所以能显示），
+        // 而 0.34/0.35 的呼出窗口用的是 initWithFrame: —— 无 windowScene 的窗口
+        // 在 SB 里既不渲染也不接触摸（归档35 日志：已安装但用户看不到、滑不动）。
+        UIWindowScene *sScene = MFMainWindowScene();
+        UIWindow *sw = nil;
+        if (sScene != nil) {
+            sw = [[UIWindow alloc] initWithWindowScene:sScene];
+        } else {
+            sw = [[UIWindow alloc] initWithFrame:CGRectMake(W - 64.0, 0.0, 64.0, H)];
+        }
+        if (sw == nil) { MFScheduleSummonRetry(); return; }
+        sw.frame = CGRectMake(W - 64.0, 0.0, 64.0, H);
+        MFLog(@"[summon] 呼出窗口 scene=%@", sScene ? NSStringFromClass([sScene class]) : @"nil(回退 frame)");
         sw.windowLevel = 1100.0;
         sw.backgroundColor = [UIColor clearColor];
         sw.userInteractionEnabled = YES;
@@ -4311,6 +4344,146 @@ static void MFInstallSummonGesture(void) {
     } @catch (NSException *e) {
         MFLog(@"[summon] !! 安装异常（1s 后重试）：%@", e);
         MFScheduleSummonRetry();
+    }
+}
+
+// ---- 【0.36.0】真实状态栏窗口（严格挑选）----
+// 归档35 日志实证：0.33 的 embed 挂进了 SBStatusBarReusePoolWindow（隐藏的复用池窗口），
+// 所以"挂上了却看不见"。本函数排除 ReusePool / 隐藏窗口，取 level 最高的那个
+//（真机为 SBStatusBarWindow level=999 —— Stheno UIStatusBarWindowHook 的同款对象）。
+static UIWindow *MFStatusBarWindowStrict(void) {
+    UIWindow *best = nil;
+    double bestLv = -1.0;
+    @try {
+        NSArray *wins = ((NSArray *(*)(id, SEL))objc_msgSend)(
+            [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
+        for (UIWindow *w in wins) {
+            NSString *cn = NSStringFromClass([w class]);
+            if (![cn containsString:@"StatusBar"]) continue;
+            if ([cn containsString:@"ReusePool"]) continue;   // 隐藏的复用池：绝不可用
+            if (w.isHidden) continue;
+            if (w.bounds.size.width < 100.0) continue;
+            if (w.windowLevel > bestLv) { bestLv = w.windowLevel; best = w; }
+        }
+        MFLog(@"[summon] 状态栏窗口挑选 -> %@ level=%.0f bounds=%@",
+              best ? NSStringFromClass([best class]) : @"nil",
+              bestLv, best ? NSStringFromCGRect(best.bounds) : @"-");
+    } @catch (NSException *e) {
+        MFLog(@"[summon] !! 状态栏窗口枚举异常：%@", e);
+    }
+    return best;
+}
+
+// ---- 【0.36.0】触控镜像层：把浮窗的 8 个抓手热区（4 边移动 / 4 角缩放）+ 右缘呼出热区
+//      镜像进真实状态栏窗口 ----
+// 目的（Stheno 假说验证）：状态栏窗口在**前台 App 之上仍保触摸路由**（灵动岛可点即证）。
+// 浮窗本体留在独立窗口（可见性有保证），只在状态栏窗口里放一层"透明抓手"——
+// 手势直接复用 panel 的 onDrag:/onResize:（tag 语义一致，几何数学完全共用）。
+// fail-safe：状态栏窗口找不到/安装异常 -> 什么都不做（桌面功能不受影响）。
+static NSMutableArray *gMFOverlayViews = nil;
+static NSTimer *gMFOverlayTimer = nil;
+static UIView *gMFOverlayStrip = nil;
+
+static void MFUpdateTouchOverlay(void) {
+    if (gMFOverlayViews == nil || gMFOverlayTimer == nil) return;
+    if (gMFOverlayStrip != nil && gMFOverlayStrip.isHidden) gMFOverlayStrip.hidden = NO;
+    @try {
+        MFFloatPanel *panel = [[MFFloatManager shared] panel];
+        UIView *host = panel.hostWindow;
+        BOOL show = (panel != nil) && (host != nil) && (!host.isHidden)
+                 && (panel.view.superview != nil);
+        if (!show) {
+            for (UIView *v in gMFOverlayViews) v.hidden = YES;
+            return;
+        }
+        UIView *probe = (UIView *)gMFOverlayViews.firstObject;
+        CGRect r = CGRectZero;
+        if ([host isKindOfClass:[UIWindow class]]) {
+            r = [(UIWindow *)host convertRect:host.bounds toWindow:probe.window];
+        } else {
+            r = [host convertRect:host.bounds toView:probe.superview];
+        }
+        CGFloat w = r.size.width, h = r.size.height;
+        if (w < 60.0 || h < 60.0) {
+            for (UIView *v in gMFOverlayViews) v.hidden = YES;
+            return;
+        }
+        const CGFloat pad = 18.0;
+        CGFloat x = r.origin.x, y = r.origin.y;
+        // 顺序与安装一致：4 边（上/下/左/右）-> 4 角（左上/右上/左下/右下）
+        CGRect rects[8] = {
+            CGRectMake(x + pad,     y,           w - 2 * pad, pad),
+            CGRectMake(x + pad,     y + h - pad, w - 2 * pad, pad),
+            CGRectMake(x,           y + pad,     pad,         h - 2 * pad),
+            CGRectMake(x + w - pad, y + pad,     pad,         h - 2 * pad),
+            CGRectMake(x,           y,           pad,         pad),
+            CGRectMake(x + w - pad, y,           pad,         pad),
+            CGRectMake(x,           y + h - pad, pad,         pad),
+            CGRectMake(x + w - pad, y + h - pad, pad,         pad),
+        };
+        NSUInteger n = MIN((NSUInteger)8, gMFOverlayViews.count);
+        for (NSUInteger i = 0; i < n; i++) {
+            UIView *v = gMFOverlayViews[i];
+            v.frame = rects[i];
+            v.hidden = NO;
+        }
+    } @catch (NSException *e) {
+        // 静默：镜像层同步失败不该影响任何主流程
+    }
+}
+
+static void MFInstallSDTouchOverlay(void) {
+    if (gMFOverlayViews != nil) return;   // 幂等
+    MFFloatPanel *panel = [[MFFloatManager shared] panel];
+    if (panel == nil) return;             // 浮窗还没建：等 startWithConfig 之后再来
+    UIWindow *sb = MFStatusBarWindowStrict();
+    if (sb == nil) {
+        MFLogS(@"[summon] 无可用状态栏窗口 -> 触控镜像层跳过（App 前台手势仍无解，但桌面正常）");
+        return;
+    }
+    @try {
+        NSMutableArray *arr = [NSMutableArray array];
+        NSInteger edgeTags[4]   = {1, 2, 3, 4};        // 上/下/左/右（onDrag: 不看 tag）
+        NSInteger cornerTags[4] = {11, 12, 13, 14};    // 左上/右上/左下/右下（onResize: 靠它）
+        for (int i = 0; i < 4; i++) {
+            UIView *v = [[UIView alloc] initWithFrame:CGRectZero];
+            v.backgroundColor = [UIColor clearColor];
+            v.tag = edgeTags[i];
+            v.hidden = YES;
+            [v addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:panel
+                                                                          action:@selector(onDrag:)]];
+            [sb addSubview:v];
+            [arr addObject:v];
+        }
+        for (int i = 0; i < 4; i++) {
+            UIView *v = [[UIView alloc] initWithFrame:CGRectZero];
+            v.backgroundColor = [UIColor clearColor];
+            v.tag = cornerTags[i];
+            v.hidden = YES;
+            [v addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:panel
+                                                                          action:@selector(onResize:)]];
+            [sb addSubview:v];
+            [arr addObject:v];
+        }
+        // 右缘呼出热区（与独立窗口里那条互为备份；tag 990042 用于日志区分来源）
+        UIView *strip = [[UIView alloc] initWithFrame:
+                         CGRectMake(sb.bounds.size.width - 20.0, 0.0, 20.0, sb.bounds.size.height)];
+        strip.backgroundColor = [UIColor clearColor];
+        strip.tag = 990042;
+        [strip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                        action:@selector(summonPan:)]];
+        [sb addSubview:strip];
+        gMFOverlayStrip = strip;
+
+        gMFOverlayViews = arr;
+        gMFOverlayTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *t) {
+            MFUpdateTouchOverlay();
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:gMFOverlayTimer forMode:NSRunLoopCommonModes];
+        MFLog(@"[summon] ★ 触控镜像层已装进 %@（level=%.0f，8 抓手 + 右缘热区）—— App 前台手势验证点",
+              NSStringFromClass([sb class]), sb.windowLevel);
+    } @catch (NSException *e) {
+        MFLog(@"[summon] !! 触控镜像层安装异常：%@", e);
     }
 }
 
