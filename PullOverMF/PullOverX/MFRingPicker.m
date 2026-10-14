@@ -2,6 +2,20 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.1 核心改动 ============================
+//  ① **圆盘变双圈**（`mfRingRings` 默认 2）：图标沿「外圈 + 内圈」两层同心圆排布，
+//     容量 `mfRingMaxIcons` 默认 8 → **16**（上限 24），外/内圈按各自周长按比例分图标，
+//     内圈半径 = 外圈半径 × `mfRingInnerRatio`(0.62)。装得下时才用一圈（自动收敛）。
+//  ② **用户自选圆盘 App（本轮重点）**：`MFRingPicker` 新增一个**全屏应用编辑器**。
+//     · 入口：**长按贴边触发条约 0.7 秒**（不改动"贴边左滑呼出圆盘"的手势）。
+//     · 面板：网格列出**全部已安装 App**（图标 + 中文名），点击即加入/移出圆盘，
+//       「完成」把结果写入 `ringApps` 并立刻生效（下次呼出即为新列表）。
+//     · 为什么不做 Stheno 那种「设置」面板：Stheno 用独立 `SthenoPreference.bundle`
+//       （SwiftUI + PSListController），需要在「设置」里改完再 respring；本 fork 改成
+//       **在 SpringBoard 里直接编辑**，改完即时可见，零 respring。
+//     · 内容来源优先级：`ringApps`（**用户写过就用它，哪怕写的是空数组**）> `ringAppsAuto`。
+//  ③ 图标默认尺寸维持 44pt；新增 `mfRingIconGap`(8) 参与"每圈能放几个"的间距估算。
+//
 //  ============================ 0.2.0 核心改动 ============================
 //  **找到并修掉"边缘一滑就黑屏注销"的唯一根因：属性 setter 死递归。**（见第 1179 行注释）
 //
@@ -72,15 +86,20 @@
 //    mfRingParkRatioY   number 停靠点纵向比例（默认 0.72 = 下半屏中心）
 //    mfRingLatchTolerance number 手指靠近停靠点多少 pt 即固定（默认 72）
 //    mfRingSettleDelay  number 手指停住多久自动固定，秒（默认 0.18）
-//    mfRingMaxIcons     number 圆盘最多显示几个（默认 8，上限 12）
+//    mfRingRings        number 圆盘圈数 1~3（默认 2；装得下时自动收敛为 1 圈）
+//    mfRingInnerRatio   number 内圈半径比例 0.35~0.95（默认 0.62，仅多圈时生效）
+//    mfRingIconGap      number 图标间距估算值，pt（默认 8；越大每圈能放越少）
+//    mfRingMaxIcons     number 圆盘最多显示几个（默认 16，上限 24）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
-//    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**）
+//    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
+//                              长按边缘触发条打开编辑器即会写入这里）
 //    ringAppsAuto       array  自动枚举出的 App 列表（本 fork 自己维护，别手改）
 //
 //  版本备注：0.1.4 及以前圆心在屏幕边缘（半圆出屏）；0.1.5 整圆可见；0.1.6 交互重做；
 //  0.1.7 全屏窗口 + hitTest 点透；0.1.8 触摸路径零 SB 查询 + 图标延后 + 崩溃降级；
 //  0.1.9 删掉自建窗口，改挂 PullOver 既有窗口（POXWindow，保留）；
-//  **0.2.0 修掉四版崩溃的真凶 —— setter 死递归（见文件头 0.2.0 段）。**
+//  0.2.0 修掉四版崩溃的真凶 —— setter 死递归（见文件头 0.2.0 段）；
+//  **0.2.1 双圈布局 + 圆盘应用编辑器（长按边缘触发条打开，自己挑 App）。**
 //
 
 #import <UIKit/UIKit.h>
@@ -92,6 +111,15 @@
 #import "POApplicationHelper.h"
 
 #define MF_RING_GUARD_PATH   "/var/mobile/PullOverMF.ringguard"
+
+// 【0.2.1】圆盘应用编辑器（全屏网格）
+#define MF_RING_EDITOR_TAG       991010   // 面板根视图
+#define MF_RING_EDITOR_SCROLL    991011   // 滚动容器
+#define MF_RING_EDITOR_ICON      991012   // cell 里的图标视图
+#define MF_RING_EDITOR_LABEL     991013   // cell 里的名称标签
+#define MF_RING_EDITOR_CHECK     991014   // cell 右上角"已选"角标
+#define MF_RING_EDITOR_DONE      991015   // 「完成」按钮
+#define MF_RING_EDITOR_MAX_APPS  200      // 编辑器最多列出多少个 App（防爆）
 
 static char kMFRingBundleIdKey;
 
@@ -328,16 +356,28 @@ static NSArray<NSString *> *MFRingEnumerateInstalledBundleIds(NSUInteger limit) 
 
 #pragma mark - 圆盘内容（触摸路径上只读缓存，绝不查 SB）
 
+/// 圆盘最多显示几个（0.2.1：默认 8 → 16，上限 12 → 24）
+static NSUInteger MFRingMaxIcons(void) {
+    return (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 16.0), 1.0), 24.0);
+}
+
+/// 用户是否**亲手设置过**圆盘内容。写过（哪怕写的是空数组）就必须尊重用户的选择，
+/// 不再回落到自动枚举 —— 否则"我把圆盘清空"会变成"又冒出一堆你不想要的 App"。
+static BOOL MFRingUserListSet(void) {
+    return ([MFRingDefaults() objectForKey:@"ringApps"] != nil);
+}
+
 /// 你手动指定的圆盘内容（配置 ringApps）—— 纯字符串过滤，不查 SB
 static NSArray<NSString *> *MFRingConfiguredBundleIds(void) {
     return MFRingFilterBundleIds([MFRingDefaults() arrayForKey:@"ringApps"], 0);
 }
 
-/// 圆盘最终内容：**配置 > 自动枚举缓存 > 空**。只读内存 / NSUserDefaults。
+/// 圆盘最终内容：**用户配置 > 自动枚举缓存 > 空**。只读内存 / NSUserDefaults。
 static NSArray<NSString *> *MFRingBundleIds(void) {
-    NSArray<NSString *> *configured = MFRingConfiguredBundleIds();
-    NSUInteger limit = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 8), 1.0), 12.0);
-    if (configured.count > 0) {
+    NSUInteger limit = MFRingMaxIcons();
+    if (MFRingUserListSet()) {
+        // 写过就以用户为准（空数组 ⇒ 圆盘空，显示"长按边缘添加"提示）
+        NSArray<NSString *> *configured = MFRingConfiguredBundleIds();
         if (configured.count > limit) {
             return [configured subarrayWithRange:NSMakeRange(0, limit)];
         }
@@ -351,6 +391,49 @@ static NSArray<NSString *> *MFRingBundleIds(void) {
     }
     return @[];
 }
+
+/// App 的中文/本地化名称（取不到就退化成 bundleID 末段）。全部包 @try。
+static NSString *MFRingDisplayNameForBundleId(NSString *bundleId) {
+    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+        return @"?";
+    }
+    @try {
+        Class proxyClass = NSClassFromString(@"LSApplicationProxy");
+        SEL proxySelector = NSSelectorFromString(@"applicationProxyForIdentifier:");
+        if (proxyClass && [proxyClass respondsToSelector:proxySelector]) {
+            id proxy = ((id (*)(id, SEL, id))objc_msgSend)(proxyClass, proxySelector, bundleId);
+            for (NSString *name in @[ @"localizedShortName", @"localizedName", @"itemName" ]) {
+                SEL selector = NSSelectorFromString(name);
+                if (![proxy respondsToSelector:selector]) {
+                    continue;
+                }
+                id value = ((id (*)(id, SEL))objc_msgSend)(proxy, selector);
+                if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+                    return (NSString *)value;
+                }
+            }
+        }
+    } @catch (__unused NSException *exception) {
+    }
+    return [bundleId lastPathComponent];
+}
+
+/// 编辑器用的"全部已安装 App"列表：数组元素 = @{ @"id": bundleID, @"name": 显示名 }。
+/// 只用扁平枚举（见 MFRingEnumerateInstalledBundleIds），按显示名排序。
+/// ⚠️ 会查 SB 私有数据 ⇒ 调用方必须自己 `MFRingGuardArm/Disarm`。
+static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEditor(NSUInteger limit) {
+    NSArray<NSString *> *bundleIds = MFRingEnumerateInstalledBundleIds(limit);
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *apps = [NSMutableArray array];
+    for (NSString *bundleId in bundleIds) {
+        NSString *name = MFRingDisplayNameForBundleId(bundleId);
+        [apps addObject:@{ @"id": bundleId, @"name": (name.length > 0 ? name : bundleId) }];
+    }
+    [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] localizedStandardCompare:b[@"name"]];
+    }];
+    return apps;
+}
+
 
 /// 把自动枚举结果固化：进程内缓存 + 落盘到 ringAppsAuto（下次启动免枚举）
 static void MFRingStoreAutoBundleIds(NSArray<NSString *> *ids) {
@@ -421,6 +504,14 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 @property (nonatomic, assign) CGPoint latchFingerPoint;        // 固定那一刻的手指坐标
 @property (nonatomic, assign) BOOL hasLatchFinger;             // 是否已记录固定时的手指位置
 @property (nonatomic, assign) NSUInteger settleGeneration;     // 手指停住计时器代次
+// 【0.2.1】圆盘应用编辑器（长按边缘触发条打开）
+@property (nonatomic, strong) UIView *editorPanel;             // 全屏编辑面板
+@property (nonatomic, strong) UIScrollView *editorScroll;      // 面板里的滚动容器
+@property (nonatomic, strong) NSMutableOrderedSet<NSString *> *editorSelection;  // 已选 bundleID（有序）
+@property (nonatomic, strong) NSMutableArray<UIView *> *editorCells;             // 网格 cell（顺序填图标）
+@property (nonatomic, strong) UILabel *editorCountLabel;       // "已选 N 个"
+@property (nonatomic, assign) NSUInteger editorIconGeneration;  // 编辑器图标填充代次
+@property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
 + (instancetype)shared;
 - (void)install;
 - (UIView *)hitTestViewForPoint:(CGPoint)point;
@@ -428,6 +519,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 - (CGRect)triggerFrameForBounds:(CGRect)bounds;
 - (BOOL)pointBelongsToPullOverHandle:(CGPoint)point;
 - (void)onStripPan:(UIPanGestureRecognizer *)gesture;
+- (void)onStripLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)showAtPoint:(CGPoint)point;
 - (void)moveRingToPoint:(CGPoint)point;
 - (void)latchToParkAnimated:(BOOL)animated;
@@ -443,6 +535,17 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 - (void)openFloatWithBundleId:(NSString *)bundleId;
 - (CGPoint)clampRingCenter:(CGPoint)point;
 - (void)hide;
+// 【0.2.1】应用编辑器
+- (void)openEditor;
+- (void)buildEditorPanelWithApps:(NSArray<NSDictionary<NSString *, NSString *> *> *)apps;
+- (void)fillEditorIcons:(NSArray<UIView *> *)cells
+              fromIndex:(NSUInteger)index
+             generation:(NSUInteger)generation;
+- (void)onEditorCellTapped:(UIButton *)button;
+- (void)onEditorDone:(UIButton *)sender;
+- (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected;
+- (void)refreshEditorCount;
+- (void)closeEditorSaving:(BOOL)saving;
 @end
 
 #pragma mark - 容器（展开态）：点空白收起
@@ -545,7 +648,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
             MFLog(@"[ring] ⚠️ 检测到崩溃标记 %s —— 进入**降级模式**：不再枚举 App、不抓图标，"
                   @"只用配置/缓存 + 首字母图标。删除该文件可重新尝试。", MF_RING_GUARD_PATH);
         }
-        gMFRingAutoBundleIds = MFRingFilterBundleIds([MFRingDefaults() arrayForKey:@"ringAppsAuto"], 12);
+        gMFRingAutoBundleIds = MFRingFilterBundleIds([MFRingDefaults() arrayForKey:@"ringAppsAuto"], 24);
         if (gMFRingAutoBundleIds.count > 0) {
             MFLog(@"[ring] 载入上次的自动列表：%lu 项", (unsigned long)gMFRingAutoBundleIds.count);
         }
@@ -564,9 +667,19 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         pan.delegate = self;
         [strip addGestureRecognizer:pan];
         self.stripPan = pan;
+
+        // 【0.2.1】长按触发条 = 打开「选择圆盘应用」编辑器。
+        // 与 pan 互不干扰：手指不动 → pan 不会 begin（pan 需要位移），长按 0.7s 胜出。
+        UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(onStripLongPress:)];
+        longPress.minimumPressDuration = 0.7;
+        longPress.delegate = self;
+        [strip addGestureRecognizer:longPress];
+        self.stripLongPress = longPress;
+
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.0 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
+        MFLog(@"[ring] 0.2.1 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
               @"交互=%d 控制器=%@ | 触发边=%@ 触发条=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               NSStringFromCGRect(bounds), host.windowLevel, (int)host.hidden,
               (int)host.userInteractionEnabled,
@@ -575,6 +688,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
               (unsigned long)MFRingConfiguredBundleIds().count,
               (unsigned long)gMFRingAutoBundleIds.count,
               gMFRingDegraded ? @"是" : @"否");
+        MFLog(@"[ring] 圆盘编辑器入口：长按贴边触发条 0.7 秒（mfRingRings=%.0f 圈，"
+              @"最多 %.0f 个图标）",
+              MFRingNumber(@"mfRingRings", 2.0), MFRingNumber(@"mfRingMaxIcons", 16.0));
 
         // 触摸路径零 SB 查询 ⇒ 列表在安装后延后算一次
         [self scheduleAutoBundleIdEnumeration];
@@ -654,28 +770,38 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
 /// 返回本次触摸该落到的视图；返回 nil = 原样交回 PullOver（既有行为零改变）。
 - (UIView *)hitTestViewForPoint:(CGPoint)point {
-    UIView *window = self.hostWindow;
+    UIWindow *window = self.hostWindow;
     if (window == nil) {
         return nil;
     }
     [self refreshHostGeometryIfNeeded];
+
+    // 【0.2.1】编辑器面板优先（覆盖全屏的模态层）：
+    // 返回**最深**命中视图 —— cell 按钮靠 target/action 被点到；
+    // 滚动视图的 pan 手势挂在祖先上，仍能收到落在子视图上的触摸，所以滚动不受影响。
+    UIView *panel = self.editorPanel;
+    if (panel != nil) {
+        @try {
+            CGPoint inPanel = [panel convertPoint:point fromView:window];
+            UIView *deep = [panel hitTest:inPanel withEvent:nil];
+            return deep ?: panel;
+        } @catch (__unused NSException *exception) {
+            return panel;
+        }
+    }
 
     if (self.expanded) {
         UIView *container = self.container;
         if (container == nil) {
             return nil;
         }
-        // 展开态：让图标按钮能正常被点到（返回最深的那层按钮），其余一律当"空白"处理
+        // 展开态：返回容器里最深的那层 —— 圆盘图标是 UIButton（可点），
+        // 其余（含圆盘底盘）落到容器 = "空白"，抬手即收起。
         @try {
             CGPoint inContainer = [container convertPoint:point fromView:window];
             UIView *deep = [container hitTest:inContainer withEvent:nil];
-            for (UIView *view = deep; view != nil; view = view.superview) {
-                if ([view isKindOfClass:[UIButton class]]) {
-                    return view;
-                }
-                if (view == container) {
-                    break;
-                }
+            if (deep != nil) {
+                return deep;
             }
         } @catch (__unused NSException *exception) {
         }
@@ -754,6 +880,18 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         }
         return;
     }
+}
+
+#pragma mark - 应用编辑器入口（长按触发条）
+
+/// 长按贴边触发条 → 打开「选择圆盘应用」编辑器。
+/// 与"贴边左滑呼出圆盘"完全并存：手指不动 0.7s 才会走到这里。
+- (void)onStripLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    MFLog(@"[ring] 长按触发条 -> 打开应用编辑器");
+    [self openEditor];
 }
 
 #pragma mark 坐标辅助
@@ -855,6 +993,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
 - (void)hide {
     self.buildGeneration += 1;   // 作废尚未执行的图标填充
+    if (self.editorPanel != nil) {
+        [self closeEditorSaving:NO];   // 【0.2.1】编辑器开着就一并收起（不保存）
+    }
     if (!self.expanded) {
         return;
     }
@@ -968,9 +1109,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
     if (count == 0) {
         NSString *text = gMFRingDegraded
-            ? @"圆盘里还没有 App\n（当前为降级模式：自动枚举已停用）\n在 com.mlgm.pulloverx.plist 里设置 ringApps 即可"
-            : @"圆盘里还没有 App\n正在后台枚举已安装应用，稍后从边缘再滑一次";
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, radius * 1.6, 80.0)];
+            ? @"圆盘里还没有 App\n（降级模式：自动枚举已停用）\n长按屏幕边缘可自己挑选 App"
+            : @"圆盘里还没有 App\n长按屏幕边缘（触发条）约 1 秒\n即可自己挑选要放在圆盘上的 App";
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, radius * 1.9, 110.0)];
         hint.numberOfLines = 0;
         hint.textAlignment = NSTextAlignmentCenter;
         hint.text = text;
@@ -981,46 +1122,120 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         return;
     }
 
-    // 图标放在圆周内侧一圈。**先铺"首字母"占位**，真图标延后贴（见 scheduleIconFillWithGeneration:）
-    CGFloat iconRadius = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
+    // 【0.2.1】多圈（同心圆）布局：**先铺"首字母"占位**，真图标延后贴
     CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);   // 默认从正上方开始
+    CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 8.0));
     CGPoint localCenter = CGPointMake(extent, extent);
-    for (NSUInteger index = 0; index < count; index++) {
-        NSString *bundleId = bundleIds[index];
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
-        button.bounds = CGRectMake(0.0, 0.0, iconSize, iconSize);
-        button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-        button.layer.cornerRadius = iconSize / 2.0;
-        button.layer.masksToBounds = YES;
-        button.layer.borderWidth = 1.0;
-        button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
 
-        NSString *initial = (bundleId.length > 0)
-            ? [[bundleId lastPathComponent] substringToIndex:1].uppercaseString : @"?";
-        [button setTitle:initial forState:UIControlStateNormal];
-        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        button.titleLabel.font = [UIFont boldSystemFontOfSize:iconSize * 0.4];
-
-        objc_setAssociatedObject(button, &kMFRingBundleIdKey, bundleId, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [button addTarget:self action:@selector(onIconTapped:) forControlEvents:UIControlEventTouchUpInside];
-        UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
-            initWithTarget:self action:@selector(onIconLongPressed:)];
-        longPress.minimumPressDuration = 0.5;
-        [button addGestureRecognizer:longPress];
-
-        // 沿整圈均匀铺开
-        CGFloat angleDegrees = startAngle
-            + 360.0 * (CGFloat)index / (CGFloat)MAX((NSUInteger)1, count)
-            + rotation;
-        CGFloat angle = angleDegrees * M_PI / 180.0;
-        button.center = CGPointMake(localCenter.x + iconRadius * cos(angle),
-                                   localCenter.y + iconRadius * sin(angle));
-
-        [ringRoot addSubview:button];
-        [self.iconButtons addObject:button];
+    // ① 算出每一圈的半径（由外到内）与该圈最多能放几个
+    NSUInteger desiredRings = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingRings", 2.0), 1.0), 3.0);
+    CGFloat innerRatio = MIN(MAX(MFRingNumber(@"mfRingInnerRatio", 0.62), 0.35), 0.95);
+    NSMutableArray<NSNumber *> *ringRadii = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *ringCaps = [NSMutableArray array];
+    for (NSUInteger ring = 0; ring < desiredRings; ring++) {
+        CGFloat ringRadius;
+        if (ring == 0) {
+            ringRadius = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
+        } else {
+            ringRadius = [ringRadii[ring - 1] doubleValue] * innerRatio;
+            if (ringRadius < iconSize * 1.15) {
+                break;   // 内圈塞不下图标就不再加圈
+            }
+        }
+        [ringRadii addObject:@(ringRadius)];
+        double cap = floor((2.0 * M_PI * ringRadius) / MAX(iconSize + gap, 1.0));
+        [ringCaps addObject:@(MAX(cap, 1.0))];
     }
-    MFLog(@"[ring] <<< 图标铺好：半径 %.0f 图标 %.0f 起始角 %.0f",
-          radius, iconSize, startAngle);
+
+    // ② 装得下就收敛为一圈（少量 App 时单圈更好看）；否则丢掉容量太小的内圈
+    if (count <= [ringCaps[0] unsignedIntegerValue]) {
+        if (ringRadii.count > 1) {
+            [ringRadii removeObjectsInRange:NSMakeRange(1, ringRadii.count - 1)];
+            [ringCaps removeObjectsInRange:NSMakeRange(1, ringCaps.count - 1)];
+        }
+    } else {
+        while (ringCaps.count > 1 && [ringCaps.lastObject unsignedIntegerValue] < 3) {
+            [ringRadii removeLastObject];
+            [ringCaps removeLastObject];
+        }
+    }
+    NSUInteger rings = ringRadii.count;
+    NSUInteger totalCap = 0;
+    for (NSNumber *cap in ringCaps) {
+        totalCap += [cap unsignedIntegerValue];
+    }
+    if (count > totalCap && totalCap > 0) {
+        count = totalCap;   // 兜底：超出所有圈的总容量时截断
+    }
+
+    // ③ 按各圈容量比例把 count 分到各圈，余数从外圈往里补
+    NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
+    for (NSUInteger ring = 0; ring < rings; ring++) {
+        [perRing addObject:@(0)];
+    }
+    NSUInteger left = count;
+    for (NSUInteger ring = 0; ring < rings && left > 0; ring++) {
+        NSUInteger cap = [ringCaps[ring] unsignedIntegerValue];
+        NSUInteger share = (NSUInteger)floor((double)count * (double)cap / (double)MAX(totalCap, (NSUInteger)1));
+        share = MIN(share, MIN(cap, left));
+        perRing[ring] = @(share);
+        left -= share;
+    }
+    for (NSUInteger ring = 0; ring < rings && left > 0; ring++) {
+        NSUInteger cap = [ringCaps[ring] unsignedIntegerValue];
+        NSUInteger current = [perRing[ring] unsignedIntegerValue];
+        NSUInteger add = MIN(left, cap - current);
+        perRing[ring] = @(current + add);
+        left -= add;
+    }
+
+    // ④ 逐圈铺图标 —— 先铺"首字母"占位，真图标延后贴
+    NSUInteger placed = 0;
+    NSMutableArray<NSString *> *layoutLog = [NSMutableArray array];
+    for (NSUInteger ring = 0; ring < rings && placed < count; ring++) {
+        CGFloat iconRadius = [ringRadii[ring] doubleValue];
+        NSUInteger ringCount = [perRing[ring] unsignedIntegerValue];
+        for (NSUInteger slot = 0; slot < ringCount && placed < count; slot++, placed++) {
+            NSString *bundleId = bundleIds[placed];
+            UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+            button.bounds = CGRectMake(0.0, 0.0, iconSize, iconSize);
+            button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+            button.layer.cornerRadius = iconSize / 2.0;
+            button.layer.masksToBounds = YES;
+            button.layer.borderWidth = 1.0;
+            button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+
+            NSString *initial = (bundleId.length > 0)
+                ? [[bundleId lastPathComponent] substringToIndex:1].uppercaseString : @"?";
+            [button setTitle:initial forState:UIControlStateNormal];
+            [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            button.titleLabel.font = [UIFont boldSystemFontOfSize:iconSize * 0.4];
+
+            objc_setAssociatedObject(button, &kMFRingBundleIdKey, bundleId, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [button addTarget:self action:@selector(onIconTapped:) forControlEvents:UIControlEventTouchUpInside];
+            UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
+                initWithTarget:self action:@selector(onIconLongPressed:)];
+            longPress.minimumPressDuration = 0.5;
+            [button addGestureRecognizer:longPress];
+
+            // 内圈错开半格，视觉上更匀称
+            CGFloat stagger = (ring % 2 == 1) ? (180.0 / (CGFloat)MAX(ringCount, (NSUInteger)1)) : 0.0;
+            CGFloat angleDegrees = startAngle + stagger
+                + 360.0 * (CGFloat)slot / (CGFloat)MAX(ringCount, (NSUInteger)1)
+                + rotation;
+            CGFloat angle = angleDegrees * M_PI / 180.0;
+            button.center = CGPointMake(localCenter.x + iconRadius * cos(angle),
+                                       localCenter.y + iconRadius * sin(angle));
+
+            [ringRoot addSubview:button];
+            [self.iconButtons addObject:button];
+        }
+        [layoutLog addObject:[NSString stringWithFormat:@"第%lu圈(r=%.0f/%lu个)",
+                              (unsigned long)(ring + 1), iconRadius, (unsigned long)ringCount]];
+    }
+    MFLog(@"[ring] <<< 图标铺好：%.0f 个图标 / %lu 圈 [%@] 图标 %.0f 起始角 %.0f",
+          (double)placed, (unsigned long)rings,
+          [layoutLog componentsJoinedByString:@" "], iconSize, startAngle);
 }
 
 /// 延后抓取真图标。危险动作 ⇒ 立闸门，走完并存活才撤。
@@ -1095,6 +1310,304 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     [self scheduleIconFillWithGeneration:self.buildGeneration];
 }
 
+#pragma mark - 圆盘应用编辑器（0.2.1）
+
+/// 打开「选择圆盘应用」。会做一次已安装 App 枚举 + 名称查询 —— 属危险动作，全程闸门保护。
+- (void)openEditor {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self openEditor]; });
+        return;
+    }
+    if (self.editorPanel != nil) {
+        return;   // 已开着
+    }
+    UIWindow *window = self.hostWindow;
+    if (window == nil || self.stripView == nil) {
+        MFLog(@"[ring] 尚未安装，忽略打开编辑器");
+        return;
+    }
+    MFLog(@"[ring] >>> 打开应用编辑器：枚举已安装 App（最多 %d 个）", (int)MF_RING_EDITOR_MAX_APPS);
+    MFRingGuardArm();
+    NSArray<NSDictionary<NSString *, NSString *> *> *apps = MFRingInstalledAppsForEditor(MF_RING_EDITOR_MAX_APPS);
+    MFRingGuardDisarm();
+    MFLog(@"[ring] <<< 编辑器 App 列表：%lu 个", (unsigned long)apps.count);
+    if (apps.count == 0) {
+        MFLog(@"[ring] !! 枚举为空，无法打开编辑器");
+        return;
+    }
+    // 以"当前圆盘实际显示的内容"作为初始勾选（所见即所选）
+    self.editorSelection = [NSMutableOrderedSet orderedSetWithArray:MFRingBundleIds()];
+    [self buildEditorPanelWithApps:apps];
+}
+
+/// 构建全屏编辑面板：标题 + 计数 + 网格（图标/名称/勾选角标）+「完成」。
+- (void)buildEditorPanelWithApps:(NSArray<NSDictionary<NSString *, NSString *> *> *)apps {
+    UIWindow *window = self.hostWindow;
+    if (window == nil) {
+        return;
+    }
+    CGRect bounds = self.hostBounds;
+    if (CGRectIsEmpty(bounds)) {
+        bounds = window.bounds;
+    }
+    CGFloat width = CGRectGetWidth(bounds);
+    CGFloat height = CGRectGetHeight(bounds);
+    if (width <= 0.0 || height <= 0.0) {
+        MFLog(@"[ring] !! 编辑器：宿主尺寸无效，放弃");
+        return;
+    }
+
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, height)];
+    panel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.87];
+    panel.opaque = NO;
+    panel.userInteractionEnabled = YES;
+    panel.tag = MF_RING_EDITOR_TAG;
+    [window addSubview:panel];
+    self.editorPanel = panel;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 46.0, width - 130.0, 30.0)];
+    title.text = @"选择圆盘中的应用";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont boldSystemFontOfSize:19.0];
+    [panel addSubview:title];
+
+    UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
+    done.tag = MF_RING_EDITOR_DONE;
+    done.frame = CGRectMake(width - 86.0, 44.0, 70.0, 34.0);
+    done.backgroundColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+    done.layer.cornerRadius = 17.0;
+    done.titleLabel.font = [UIFont boldSystemFontOfSize:15.0];
+    [done setTitle:@"完成" forState:UIControlStateNormal];
+    [done setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [done addTarget:self action:@selector(onEditorDone:) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:done];
+
+    UILabel *countLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 78.0, width - 36.0, 18.0)];
+    countLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    countLabel.font = [UIFont systemFontOfSize:11.5];
+    [panel addSubview:countLabel];
+    self.editorCountLabel = countLabel;
+
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, 100.0, width, height - 100.0)];
+    scroll.backgroundColor = [UIColor clearColor];
+    scroll.opaque = NO;
+    scroll.alwaysBounceVertical = YES;
+    scroll.tag = MF_RING_EDITOR_SCROLL;
+    [panel addSubview:scroll];
+    self.editorScroll = scroll;
+
+    const NSUInteger columns = 4;
+    const CGFloat sideInset = 8.0;
+    const CGFloat cellW = floor((width - sideInset * 2.0) / (CGFloat)columns);
+    const CGFloat cellH = 100.0;
+    const CGFloat iconSize = 62.0;
+    self.editorCells = [NSMutableArray array];
+
+    NSMutableOrderedSet<NSString *> *selection = self.editorSelection;
+    for (NSUInteger index = 0; index < apps.count; index++) {
+        NSDictionary<NSString *, NSString *> *app = apps[index];
+        NSString *bundleId = app[@"id"];
+        NSString *name = app[@"name"];
+
+        NSUInteger column = index % columns;
+        NSUInteger row = index / columns;
+        UIButton *cell = [UIButton buttonWithType:UIButtonTypeCustom];
+        cell.frame = CGRectMake(sideInset + column * cellW, row * cellH, cellW, cellH);
+        cell.backgroundColor = [UIColor clearColor];
+        cell.layer.cornerRadius = 12.0;
+        cell.layer.masksToBounds = YES;
+        objc_setAssociatedObject(cell, &kMFRingBundleIdKey, bundleId, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [cell addTarget:self action:@selector(onEditorCellTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+        UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake(0.0, 0.0, iconSize, iconSize)];
+        iconView.tag = MF_RING_EDITOR_ICON;
+        iconView.center = CGPointMake(cellW / 2.0, 6.0 + iconSize / 2.0);
+        iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        iconView.layer.cornerRadius = 14.0;
+        iconView.layer.masksToBounds = YES;
+        iconView.contentMode = UIViewContentModeScaleAspectFit;
+        [cell addSubview:iconView];
+
+        UILabel *placeholder = [[UILabel alloc] initWithFrame:iconView.bounds];
+        placeholder.tag = MF_RING_EDITOR_LABEL;
+        placeholder.text = (name.length > 0) ? [name substringToIndex:1] : @"?";
+        placeholder.textAlignment = NSTextAlignmentCenter;
+        placeholder.textColor = [UIColor whiteColor];
+        placeholder.font = [UIFont boldSystemFontOfSize:24.0];
+        [iconView addSubview:placeholder];
+
+        UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(1.0, 6.0 + iconSize + 3.0,
+                                                                      cellW - 2.0, 28.0)];
+        nameLabel.text = name;
+        nameLabel.textAlignment = NSTextAlignmentCenter;
+        nameLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+        nameLabel.font = [UIFont systemFontOfSize:10.5];
+        nameLabel.numberOfLines = 2;
+        [cell addSubview:nameLabel];
+
+        UIView *check = [[UIView alloc] initWithFrame:CGRectMake(iconView.center.x + iconSize / 2.0 - 11.0,
+                                                                 3.0, 22.0, 22.0)];
+        check.tag = MF_RING_EDITOR_CHECK;
+        check.backgroundColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+        check.layer.cornerRadius = 11.0;
+        check.userInteractionEnabled = NO;
+        UILabel *tick = [[UILabel alloc] initWithFrame:check.bounds];
+        tick.text = @"✓";
+        tick.textAlignment = NSTextAlignmentCenter;
+        tick.textColor = [UIColor whiteColor];
+        tick.font = [UIFont boldSystemFontOfSize:14.0];
+        [check addSubview:tick];
+        [cell addSubview:check];
+
+        [scroll addSubview:cell];
+        [self.editorCells addObject:cell];
+        [self applyEditorCellVisual:cell selected:[selection containsObject:bundleId]];
+    }
+
+    NSUInteger rows = (apps.count + columns - 1) / columns;
+    scroll.contentSize = CGSizeMake(width, (CGFloat)rows * cellH + 24.0);
+    [self refreshEditorCount];
+    MFLog(@"[ring] 编辑器已打开：%lu 个 App / %lu 行 × %lu 列，当前已选 %lu 个",
+          (unsigned long)apps.count, (unsigned long)rows, (unsigned long)columns,
+          (unsigned long)selection.count);
+
+    // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
+    if (MFRingBool(@"mfRingFetchIcons", YES) && !gMFRingDegraded) {
+        self.editorIconGeneration += 1;
+        NSUInteger generation = self.editorIconGeneration;
+        [self fillEditorIcons:[self.editorCells copy] fromIndex:0 generation:generation];
+    } else {
+        MFLog(@"[ring] 编辑器跳过图标抓取（mfRingFetchIcons=false 或降级模式）");
+    }
+}
+
+/// 分批（每轮 8 个）抓取编辑器图标。闸门逐批 arm/disarm，任何一批崩了下次进降级模式。
+- (void)fillEditorIcons:(NSArray<UIView *> *)cells
+              fromIndex:(NSUInteger)index
+             generation:(NSUInteger)generation {
+    if (self.editorPanel == nil || generation != self.editorIconGeneration) {
+        return;   // 编辑器已关 / 已被更新的填充取代
+    }
+    NSUInteger total = cells.count;
+    if (index >= total) {
+        MFLog(@"[ring] <<< 编辑器图标抓取完成（%lu 个）", (unsigned long)total);
+        return;
+    }
+    NSUInteger end = MIN(index + 8, total);
+    MFRingGuardArm();
+    for (NSUInteger i = index; i < end; i++) {
+        UIView *cell = cells[i];
+        if (cell.superview == nil) {
+            continue;
+        }
+        NSString *bundleId = objc_getAssociatedObject(cell, &kMFRingBundleIdKey);
+        UIImage *icon = MFRingIconForBundleId(bundleId);
+        if (icon == nil) {
+            continue;
+        }
+        UIImageView *iconView = (UIImageView *)[cell viewWithTag:MF_RING_EDITOR_ICON];
+        if (iconView == nil) {
+            continue;
+        }
+        iconView.image = icon;
+        [cell viewWithTag:MF_RING_EDITOR_LABEL].hidden = YES;
+    }
+    MFRingGuardDisarm();
+    if (end >= total) {
+        MFLog(@"[ring] <<< 编辑器图标抓取完成（%lu 个）", (unsigned long)total);
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf fillEditorIcons:cells fromIndex:end generation:generation];
+    });
+}
+
+/// 点击 cell = 加入 / 移出圆盘
+- (void)onEditorCellTapped:(UIButton *)button {
+    NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
+    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+        return;
+    }
+    NSMutableOrderedSet<NSString *> *selection = self.editorSelection;
+    if (selection == nil) {
+        return;
+    }
+    BOOL selected;
+    if ([selection containsObject:bundleId]) {
+        [selection removeObject:bundleId];
+        selected = NO;
+        MFLog(@"[ring] 编辑器移出 %@（剩 %lu）", bundleId, (unsigned long)selection.count);
+    } else {
+        NSUInteger cap = MFRingMaxIcons();
+        if (selection.count >= cap) {
+            MFLog(@"[ring] 编辑器已达上限 %lu 个，先移出一些再加", (unsigned long)cap);
+            @try {
+                UIImpactFeedbackGenerator *feedback =
+                    [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [feedback impactOccurred];
+            } @catch (__unused NSException *exception) {
+            }
+            return;
+        }
+        [selection addObject:bundleId];
+        selected = YES;
+        MFLog(@"[ring] 编辑器加入 %@（共 %lu）", bundleId, (unsigned long)selection.count);
+    }
+    [self applyEditorCellVisual:button selected:selected];
+    [self refreshEditorCount];
+}
+
+- (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected {
+    if (cell == nil) {
+        return;
+    }
+    [cell viewWithTag:MF_RING_EDITOR_CHECK].hidden = !selected;
+    cell.backgroundColor = selected ? [UIColor colorWithWhite:1.0 alpha:0.10] : [UIColor clearColor];
+    UIView *iconView = [cell viewWithTag:MF_RING_EDITOR_ICON];
+    iconView.layer.borderWidth = selected ? 2.0 : 0.0;
+    iconView.layer.borderColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0].CGColor;
+}
+
+- (void)refreshEditorCount {
+    UILabel *label = self.editorCountLabel;
+    if (label == nil) {
+        return;
+    }
+    label.text = [NSString stringWithFormat:@"已选 %lu 个（最多 %lu 个）· 点图标加入/移出",
+                  (unsigned long)self.editorSelection.count, (unsigned long)MFRingMaxIcons()];
+}
+
+- (void)onEditorDone:(UIButton *)sender {
+    (void)sender;
+    [self closeEditorSaving:YES];
+}
+
+/// 关闭编辑器。saving=YES ⇒ 把当前勾选写入 `ringApps`（下次呼出即为新列表）。
+- (void)closeEditorSaving:(BOOL)saving {
+    UIView *panel = self.editorPanel;
+    if (panel == nil) {
+        return;
+    }
+    self.editorIconGeneration += 1;   // 作废尚未执行的图标填充
+    if (saving) {
+        NSArray<NSString *> *selected = [self.editorSelection.array copy];
+        MFRingWriteBundleIds(selected);
+        MFLog(@"[ring] 编辑器已保存：圆盘应用 %lu 个 -> %@",
+              (unsigned long)selected.count,
+              selected.count > 0 ? [selected componentsJoinedByString:@", "] : @"(空)");
+        MFLog(@"[ring] 下次呼出圆盘即使用新列表（不用 respring）");
+    } else {
+        MFLog(@"[ring] 编辑器已关闭（未保存）");
+    }
+    self.editorPanel = nil;
+    self.editorScroll = nil;
+    self.editorCountLabel = nil;
+    self.editorSelection = nil;
+    self.editorCells = nil;
+    [panel removeFromSuperview];
+}
+
 #pragma mark 自动枚举（安装后延后执行，绝不在触摸路径）
 
 - (void)scheduleAutoBundleIdEnumeration {
@@ -1105,8 +1618,8 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (gMFRingListing) {
         return;
     }
-    if (MFRingConfiguredBundleIds().count > 0) {
-        MFLog(@"[ring] 已有 ringApps 配置，跳过自动枚举");
+    if (MFRingUserListSet()) {
+        MFLog(@"[ring] 用户已设置过 ringApps，跳过自动枚举");
         return;
     }
     if (gMFRingAutoBundleIds.count > 0) {
@@ -1124,7 +1637,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
             gMFRingListing = NO;
             return;
         }
-        NSUInteger limit = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 8), 1.0), 12.0);
+        NSUInteger limit = MFRingMaxIcons();
         MFLog(@"[ring] >>> 枚举已安装 App（扁平遍历，最多 %lu 项）", (unsigned long)limit);
         MFRingGuardArm();
         NSArray<NSString *> *ids = MFRingEnumerateInstalledBundleIds(limit);
