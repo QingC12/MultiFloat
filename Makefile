@@ -6,6 +6,17 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.30.0 变更（第 33 轮：归档32，Stheno 式实时缩放）：
+#   - ① 实时缩放复刻 Stheno（dylib 实证 _dragScale/baseScaleLast/finalScale/containerScale）：
+#     拖动中 contentArea 用 transform 等比缩放（锚点=钉死对角），画面实时跟手、
+#     零 scene 写入；松手 transform 归零 + 一次 scene.frame 同步 + 800ms 确认。
+#     Ended/Cancelled/误触回滚均复位 transform。
+#   - ② 缩到最小卡屏：scene 失效停守护后挂自愈观察（0.5s x30），scene 复活即
+#     自动重挂守护 + 同步几何（MFStartHealWatch）。
+#   - ③ windowLevel 提升找到目标了：MFClassSharedInstance(UIStatusBarWindow) 真机
+#     返回 nil（日志 level=-1）—— 改枚举 UIApplication.windows（类名含 StatusBar
+#     优先，否则全进程最高 level），浮窗提到它 +100（Stheno UIStatusBarWindowHook 式）。
+#
 # 0.29.0 变更（第 32 轮：归档31 破案）：
 #   - ① 触摸失效真正根因 = 拖动期间的 scene.frame 写入本身：归档31 日志实锤
 #     presenter isActive=0 isHosting=0 isInvalidated=1，isValid 连续 3+ 拍 NO

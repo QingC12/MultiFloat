@@ -1927,6 +1927,61 @@ static void MFSnapshotPadUpdate(NSDictionary *cfg) {
 
 /// 守护定时器的一次心跳。
 /// 【注意】这里**故意不写** MFStepMark —— 步骤日志是给人肉回传用的，几秒一行会把它冲垮。
+// 【0.30.0 自愈观察】归档32："缩到最小后画面卡死，放大也不恢复"。
+// 链路：缩到最小/快速缩放 -> scene 失效（isValid 连续 NO）-> 守护停止 ->
+// 无人再把 scene 拉回来 -> hosting 死 -> 内容冻结，直到用户换 App。
+// 修法：守护因 scene 失效停止时，挂一个 0.5s x30 的观察定时器；
+// scene 一复活就自动重启守护 + 同步几何（用户无感自愈）。
+static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictionary *cfg); // 前向声明（自愈重挂用）
+static id          gMFHealTimer       = nil;   // 实际是 NSTimer，类型写 id 避免前向声明
+static id          gMFHealWatchScene  = nil;
+static id          gMFHealWatchApp    = nil;
+static NSString   *gMFHealWatchBid    = nil;
+static NSDictionary *gMFHealWatchCfg  = nil;
+static NSInteger   gMFHealTries       = 0;
+
+static void MFStartHealWatch(id scene, id app, NSString *bundleID, NSDictionary *cfg) {
+    if (gMFHealTimer != nil) { [(NSTimer *)gMFHealTimer invalidate]; gMFHealTimer = nil; }
+    gMFHealWatchScene = scene;
+    gMFHealWatchApp = app;
+    gMFHealWatchBid = [bundleID copy];
+    gMFHealWatchCfg = [cfg copy];
+    gMFHealTries = 0;
+    __block NSInteger tries = 0;
+    gMFHealTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        if (gMFKeepAliveScene != nil) {   // 用户已重挂新目标 -> 观察退出
+            [t invalidate]; gMFHealTimer = nil;
+            MFLogS(@"[heal] 新守护已启动 -> 自愈观察退出");
+            return;
+        }
+        tries = ++gMFHealTries;
+        BOOL valid = NO;
+        @try {
+            valid = MFBoolProp(gMFHealWatchScene, NSSelectorFromString(@"isValid"));
+        } @catch (NSException *e) { valid = NO; }
+        if (!valid) {
+            if (tries >= 30) {
+                [t invalidate]; gMFHealTimer = nil;
+                MFLogS(@"[heal] 15s 内 scene 未自愈 -> 放弃自愈（点 ↻ 重新拉列表重挂）");
+            }
+            return;
+        }
+        [t invalidate]; gMFHealTimer = nil;
+        MFLogS(@"[heal] scene 已自愈 -> 重启守护（修缩到最小后的卡屏）");
+        MFStartSceneKeepAlive(gMFHealWatchScene, gMFHealWatchApp, gMFHealWatchBid, gMFHealWatchCfg);
+        // 几何同步走 manager（其 @interface 在本函数之后才声明，用 msgSend 免前向依赖）
+        @try {
+            id mgr = ((id (*)(id, SEL))objc_msgSend)(
+                (id)objc_getClass("MFFloatManager"), NSSelectorFromString(@"shared"));
+            if (mgr != nil) {
+                ((void (*)(id, SEL))objc_msgSend)(mgr, NSSelectorFromString(@"syncContentGeometry"));
+            }
+        } @catch (NSException *e) { }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:(NSTimer *)gMFHealTimer forMode:NSRunLoopCommonModes];
+    MFLogS(@"[heal] 已挂自愈观察（0.5s x30，scene 复活即重挂守护+同步几何）");
+}
+
 static void MFKeepAliveTick(void) {
     id scene = gMFKeepAliveScene;
     if (scene == nil) { MFStopSceneKeepAlive(@"scene 引用为空"); return; }
@@ -1946,8 +2001,13 @@ static void MFKeepAliveTick(void) {
             MFLogS(@"[keepalive] scene.isValid 瞬时 NO（掉层窗口期常见）-> 跳过本拍，继续观察");
         }
         if (sInvalidTicks >= 3) {
-            MFLogS(@"[keepalive] scene 连续 3 拍失效 -> 停止守护；点 ↻ 重新拉应用列表再点一次应用名即可重挂");
+            MFLogS(@"[keepalive] scene 连续 3 拍失效 -> 停止守护；挂自愈观察，复活即重挂");
+            id deadScene = scene;                       // stop 会清引用，先抓快照
+            id deadApp = gMFKeepAliveApp;
+            NSString *deadBid = gMFKeepAliveBundleID;
+            NSDictionary *deadCfg = gMFKeepAliveConfig;
             MFStopSceneKeepAlive(@"scene 失效");
+            MFStartHealWatch(deadScene, deadApp, deadBid, deadCfg);   // 【0.30.0】修卡屏
         }
         return;
     }
@@ -2256,6 +2316,10 @@ static void MFKeepAliveTick(void) {
 /// 开启守护。承载成功后调用；已在守护别的 scene 时会先停掉旧的。
 static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictionary *cfg) {
     MFStopSceneKeepAlive(@"换守护目标");
+    if (gMFHealTimer != nil) {   // 【0.30.0】新守护启动 -> 自愈观察退出
+        [(NSTimer *)gMFHealTimer invalidate];
+        gMFHealTimer = nil;
+    }
 
     if (scene == nil) return;
     if (!MFConfigBool(cfg, @"keepAlive", YES)) {
@@ -2947,6 +3011,31 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
 static CGPoint    gMFResizeAnchor      = CGPointZero;  // 【0.25.0】锚角（拖动角的对角，固定不动）
 static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 12=右上 13=左下 14=右下
 
+// 【0.30.0 Stheno 式实时缩放】归档32 用户明确：松手才显示实时大小不可接受。
+// Stheno.dylib 实证：_dragScale / baseScaleLast / finalScale / containerScale
+// —— 拖动中用 transform 缩放容器，画面实时跟随，松手才落最终尺寸。
+// 复刻：拖动中 contentArea 用 transform 等比缩放（锚点=被拖角的对角），
+// 零 scene 写入（presenter 安然无恙）；松手 transform 归零 + 一次 scene.frame 同步。
+static BOOL       gMFLiveAnchorSet     = NO;   // 本次手势是否已把锚点移到钉死对角
+
+/// 把内容区的实时缩放复位（transform 归恒等 + 锚点回中心，带 position 补偿）。
+static void MFContentLiveScaleReset(void) {
+    UIView *area = (UIView *)gMFCurrentContentArea;
+    if (![area isKindOfClass:[UIView class]]) return;
+    CALayer *ly = area.layer;
+    CGPoint ap = ly.anchorPoint;
+    if (gMFLiveAnchorSet && !(ap.x == 0.5 && ap.y == 0.5)) {
+        CGSize bs = area.bounds.size;
+        CGPoint oldPos = ly.position;
+        CGPoint c = CGPointMake(0.5, 0.5);
+        ly.anchorPoint = c;
+        ly.position = CGPointMake(oldPos.x - (c.x - ap.x) * bs.width,
+                                  oldPos.y - (c.y - ap.y) * bs.height);
+    }
+    if (!CGAffineTransformIsIdentity(area.transform)) area.transform = CGAffineTransformIdentity;
+    gMFLiveAnchorSet = NO;
+}
+
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
     if (win == nil) return;
@@ -2956,6 +3045,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
         gMFResizeStartDate  = [NSDate date];
         gMFResizeCurW       = win.frame.size.width;
         gMFResizeTick       = 0;
+        MFContentLiveScaleReset();   // 【0.30.0】上一手势若异常结束没复位，这里兜底
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
@@ -2986,6 +3076,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
             win.frame = gMFResizeStartFrame;
             gMFResizeStartDate = nil;
             gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
+            MFContentLiveScaleReset();   // 【0.30.0】实时缩放一起回滚
             [g setEnabled:NO];   // 废掉本次手势，后续 Changed/Ended 不再来
             dispatch_async(dispatch_get_main_queue(), ^{ [g setEnabled:YES]; });
             MFLogS(@"[ui] resize 手势判定为划过误触 -> 已回滚浮窗尺寸（不同步 scene.frame）");
@@ -3033,22 +3124,50 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
              nf.origin.x, nf.origin.y);
     }
 
-    // 【0.29.0 归档31 破案】触摸失效的真正根因不在守护，而在**拖动期间的 scene.frame 写入本身**：
-    // 归档31 日志实锤 resize 期间 `presenter isActive=0 isHosting=0 isInvalidated=1`，
-    // 且 isValid 连续 3+ 拍 NO（真失效 >600ms，3 拍规则扛不住）——
-    // 高频 updateSettings(frame) 把 presenter 打成 invalidated → hosting 死 → 触摸死。
-    // 修法：Changed 期间**一个字节都不写**（不碰 scene.settings、也不动承载视图 frame）
-    // —— 拖动中内容保持旧尺寸（不拉伸、不裁切、不掉层），松手后一次精确同步。
-    // 【0.26~0.28 的节流同步路线（250ms/120ms）就此废弃：它换来的"实时跟手"
-    //  是以 presenter 失效为代价的，得不偿失。】
-    // 拖动中：只改浮窗窗口自身 frame（上面 win.frame = nf，纯本地 view 操作，
-    // 无任何 scene.settings 写入）。内容区与 scene 的几何在 Ended 统一对齐。
+    // 【0.29.0 归档31 破案】拖动期间的 scene.frame 写入会把 presenter 打成
+    // isInvalidated=1（hosting 死 → 触摸死）。Changed 期间零 scene 写入是底线。
+    // 【0.30.0 Stheno 式实时缩放】归档32 用户明确不要"松手才变"。
+    // Stheno.dylib 实证 _dragScale/baseScaleLast/finalScale/containerScale ——
+    // 拖动中 transform 缩放容器、画面实时跟随、松手才落最终尺寸。
+    // 复刻：把 contentArea 用 transform 等比缩放（锚点=钉死的对角），
+    // 画面实时跟手且零 scene 写入；松手 transform 归零 + 一次精确同步。
+    if (g.state == UIGestureRecognizerStateChanged) {
+        UIView *area = (UIView *)gMFCurrentContentArea;
+        if ([area isKindOfClass:[UIView class]] && gMFResizeStartFrame.size.width > 0.5) {
+            CGFloat s = newW / gMFResizeStartFrame.size.width;
+            if (s > 0.05 && s < 20.0) {
+                // 首拍：把锚点从中心移到钉死对角（补 position，frame 不跳）
+                if (!gMFLiveAnchorSet) {
+                    CGPoint ap = CGPointZero;
+                    switch (gMFResizeCorner) {
+                        case 11: ap = CGPointMake(1, 1); break;  // 拖左上 -> 钉右下
+                        case 12: ap = CGPointMake(0, 1); break;  // 拖右上 -> 钉左下
+                        case 13: ap = CGPointMake(1, 0); break;  // 拖左下 -> 钉右上
+                        default: ap = CGPointMake(0, 0); break;  // 拖右下 -> 钉左上
+                    }
+                    CALayer *ly = area.layer;
+                    CGSize bs = area.bounds.size;
+                    CGPoint oldAP = ly.anchorPoint;
+                    CGPoint oldPos = ly.position;
+                    CGPoint newPos = CGPointMake(oldPos.x + (ap.x - oldAP.x) * bs.width,
+                                                 oldPos.y + (ap.y - oldAP.y) * bs.height);
+                    ly.anchorPoint = ap;
+                    ly.position = newPos;
+                    gMFLiveAnchorSet = YES;
+                    MFLog(@"[ui] 实时缩放启动 scale 基准=%.0f 锚点=(%.0f,%.0f)（Stheno _dragScale 式）",
+                          gMFResizeStartFrame.size.width, ap.x, ap.y);
+                }
+                area.transform = CGAffineTransformMakeScale(s, s);
+            }
+        }
+    }
 
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
     if (g.state == UIGestureRecognizerStateEnded) {
         gMFResizeStartDate = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
+        MFContentLiveScaleReset();   // 【0.30.0】transform 归位（写真实尺寸前必须归零）
         MFLog(@"[ui] resize 结束 frame=%@ -> 同步 scene.frame", NSStringFromCGRect(win.frame));
         [[MFFloatManager shared] syncContentGeometry];
         // 【0.29.0】800ms 后补一次精确同步：updateSettings 异步生效（400~800ms），
@@ -3063,6 +3182,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
                g.state == UIGestureRecognizerStateFailed) {
         gMFResizeStartDate = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
+        MFContentLiveScaleReset();   // 【0.30.0】取消也要归位（否则内容停在被缩放态）
     }
 }
 
@@ -3257,18 +3377,37 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     // 证明 0.28 的自动提升因 cfgLevel!=nil 从未执行）——1010 视为未配置，照常自动提。
     @try {
         if (cfgLevel == nil || level == 1010.0) {
-            id sbw = MFClassSharedInstance(@"UIStatusBarWindow");
-            double sbLevel = -1;
-            if ([sbw respondsToSelector:@selector(windowLevel)]) {
-                sbLevel = [(UIWindow *)sbw windowLevel];
+            // 【0.30.0 归档32 修复】0.29 用 MFClassSharedInstance(@"UIStatusBarWindow")
+            // 找不到实例（日志 `statusBar windowLevel=-1`）—— Stheno 是 hook 到
+            // UIStatusBarWindow 实例再 setWindowLevel: 的。改枚举进程内所有窗口：
+            // 优先找类名含 StatusBar 的窗口；找不到就用全进程最高 windowLevel。
+            double sbLevel = -1.0;
+            NSString *srcName = nil;
+            // windows 属性已废弃（-Werror 会炸），走 msgSend 取
+            NSArray *wins = nil;
+            @try {
+                wins = ((NSArray *(*)(id, SEL))objc_msgSend)(
+                    [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
+            } @catch (NSException *e2) { wins = nil; }
+            double maxLevel = -1.0;
+            for (UIWindow *w in wins) {
+                double lv = w.windowLevel;
+                if (lv > maxLevel) maxLevel = lv;
+                NSString *cn = NSStringFromClass([w class]);
+                if ([cn containsString:@"StatusBar"] && lv > sbLevel) {
+                    sbLevel = lv;
+                    srcName = cn;
+                }
             }
+            if (sbLevel < 0) { sbLevel = maxLevel; srcName = @"(全进程最高窗口)"; }
+            MFLog(@"[ui] 窗口枚举 %lu 个：StatusBar/最高 level=%.0f（%@）",
+                  (unsigned long)wins.count, sbLevel, srcName ?: @"nil");
             if (sbLevel > 0 && sbLevel + 100.0 > level) {
                 level = sbLevel + 100.0;
-                MFLog(@"[ui] windowLevel 自动提升 -> %.0f（UIStatusBarWindow.level=%.0f，修 App 前台手势失效）",
-                      level, sbLevel);
+                MFLog(@"[ui] windowLevel 自动提升 -> %.0f（修 App 前台手势失效，Stheno setWindowLevel: 式）",
+                      level);
             } else {
-                MFLog(@"[ui] statusBar windowLevel=%.0f 不可用/未超过，浮窗维持 level=%.0f",
-                      sbLevel, level);
+                MFLog(@"[ui] 未找到可超越的窗口层级 -> 浮窗维持 level=%.0f", level);
             }
         }
     } @catch (NSException *e) {
