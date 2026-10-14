@@ -1,0 +1,68 @@
+name: build-pullovermf
+
+# PullOverMF = MultiFloat 项目对 PullOver-X 的个人 fork（GPL-3.0）
+# 与 build-deb.yml 相同环境（roothide/theos + Xcode SDK + Procursus ldid），
+# 但构建 PullOverMF 目录里的 tweak（原上游为 Xcode 工程，这里已 Theos 化）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'PullOverMF/**'
+      - '.github/workflows/build-pullovermf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  THEOS_PACKAGE_SCHEME: roothide
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos (roothide fork)
+        run: |
+          set -euo pipefail
+          export THEOS="$HOME/theos"
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Provide iOS SDK
+        run: |
+          set -euo pipefail
+          SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SDKVER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          mkdir -p "$THEOS/sdks"
+          ln -sfn "$SDKPATH" "$THEOS/sdks/iPhoneOS${SDKVER}.sdk"
+          echo "MF_SDK_VERSION=$SDKVER" >> "$GITHUB_ENV"
+
+      - name: Install packaging + signing tools
+        run: |
+          set -euo pipefail
+          brew install dpkg || true
+          curl -fL -o /tmp/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
+          chmod +x /tmp/ldid && sudo mv /tmp/ldid /usr/local/bin/ldid && sudo chmod +x /usr/local/bin/ldid
+          ldid -v || true
+
+      - name: Build PullOverMF package
+        run: make package -C PullOverMF
+
+      - name: List packages
+        if: always()
+        run: ls -l PullOverMF/packages || true
+
+      - name: Verify DEB (arch / roothide layout / ad-hoc signature)
+        if: success()
+        run: python3 MultiFloat/scripts/verify_deb.py PullOverMF/packages/*.deb
+
+      - name: Upload PullOverMF DEB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PullOverMF-deb
+          path: PullOverMF/packages/*.deb
+          if-no-files-found: warn
