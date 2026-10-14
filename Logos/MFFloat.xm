@@ -2991,57 +2991,6 @@ static char kMFRowBundleIDKey;
 
 #pragma mark 交互
 
-// ---- 【0.33.0 手势呼出器】参考 Stheno/TrollOpen 的呼出风格 ----
-// 呼出条在状态栏窗口左上角（双击 / 下滑 / 右滑触发）。首次呼出用 bootstrap 配置快照
-// 启动浮窗；已有浮窗则切换显示/隐藏 —— 关闭后随时可呼出，不用 respring 等 12 秒。
-- (void)toggleFloatVisible {
-    @try {
-        MFFloatPanel *p = self.panel;
-        if (p == nil || p.view == nil || p.view.superview == nil) {
-            if (gMFBootConfig == nil) {
-                MFLogS(@"[summon] 无浮窗且无 bootstrap 配置快照 -> 无法呼出");
-                return;
-            }
-            MFLogS(@"[summon] 首次呼出 -> 用 bootstrap 配置启动浮窗");
-            [[MFFloatManager shared] startWithConfig:gMFBootConfig];
-            return;
-        }
-        BOOL embedded = (p.view.superview != self.window);   // 挂载模式：superview 是容器视图
-        if (embedded) {
-            UIView *host = p.hostWindow;
-            if (host == nil) { MFLogS(@"[summon] !! 挂载模式但 hostWindow 已释放 -> 忽略"); return; }
-            BOOL willShow = host.isHidden;
-            host.hidden = !willShow;
-            if (willShow && host.superview != nil) [host.superview bringSubviewToFront:host];
-            MFLog(@"[summon] 挂载模式切换 hidden=%d", (int)!willShow);
-            if (!willShow) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
-        } else {
-            BOOL willShow = self.window.isHidden;
-            self.window.hidden = !willShow;
-            if (willShow) {
-                [self.window makeKeyAndVisible];
-                if (self.window.frame.size.width < 50.0)
-                    self.window.frame = [UIScreen mainScreen].bounds;
-            } else {
-                MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
-            }
-            MFLog(@"[summon] 独立窗口模式切换 hidden=%d", (int)!willShow);
-        }
-    } @catch (NSException *e) {
-        MFLog(@"[summon] !! toggle 异常：%@", e);
-    }
-}
-
-- (void)summonPan:(UIPanGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateEnded) return;
-    CGPoint t = [g translationInView:g.view];
-    // 下滑或右滑超过 25pt 即触发（TrollOpen 风格；避免与状态栏其他手势混淆）
-    if (t.y > 25.0 || t.x > 25.0) {
-        MFLog(@"[summon] 平移触发 t=(%.0f, %.0f)", t.x, t.y);
-        [self toggleFloatVisible];
-    }
-}
-
 - (void)onCloseTapped {
     MFLogS(@"[ui] 关闭按钮被点（respring 可再次显示）");
     // 【0.9.0】浮窗都关了就别再守护了 —— 守护是"为了让已经挂上去的画面不掉"，
@@ -3405,6 +3354,57 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 #pragma mark ========== 浮窗管理器实现 ==========
 
 @implementation MFFloatManager
+
+// ---- 【0.33.0 手势呼出器】参考 Stheno/TrollOpen 的呼出风格 ----
+// 呼出条在状态栏窗口左上角（双击 / 下滑 / 右滑触发）。首次呼出用 bootstrap 配置快照
+// 启动浮窗；已有浮窗则切换显示/隐藏 —— 关闭后随时可呼出，不用 respring 等 12 秒。
+- (void)toggleFloatVisible {
+    @try {
+        MFFloatPanel *p = self.panel;
+        if (p == nil || p.view == nil || p.view.superview == nil) {
+            if (gMFBootConfig == nil) {
+                MFLogS(@"[summon] 无浮窗且无 bootstrap 配置快照 -> 无法呼出");
+                return;
+            }
+            MFLogS(@"[summon] 首次呼出 -> 用 bootstrap 配置启动浮窗");
+            [[MFFloatManager shared] startWithConfig:gMFBootConfig];
+            return;
+        }
+        BOOL embedded = (p.view.superview != self.window);   // 挂载模式：superview 是容器视图
+        if (embedded) {
+            UIView *host = p.hostWindow;
+            if (host == nil) { MFLogS(@"[summon] !! 挂载模式但 hostWindow 已释放 -> 忽略"); return; }
+            BOOL willShow = host.isHidden;
+            host.hidden = !willShow;
+            if (willShow && host.superview != nil) [host.superview bringSubviewToFront:host];
+            MFLog(@"[summon] 挂载模式切换 hidden=%d", (int)!willShow);
+            if (!willShow) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
+        } else {
+            BOOL willShow = self.window.isHidden;
+            self.window.hidden = !willShow;
+            if (willShow) {
+                [self.window makeKeyAndVisible];
+                if (self.window.frame.size.width < 50.0)
+                    self.window.frame = [UIScreen mainScreen].bounds;
+            } else {
+                MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
+            }
+            MFLog(@"[summon] 独立窗口模式切换 hidden=%d", (int)!willShow);
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[summon] !! toggle 异常：%@", e);
+    }
+}
+
+- (void)summonPan:(UIPanGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;
+    CGPoint t = [g translationInView:g.view];
+    // 下滑或右滑超过 25pt 即触发（TrollOpen 风格；避免与状态栏其他手势混淆）
+    if (t.y > 25.0 || t.x > 25.0) {
+        MFLog(@"[summon] 平移触发 t=(%.0f, %.0f)", t.x, t.y);
+        [self toggleFloatVisible];
+    }
+}
 
 + (instancetype)shared {
     static MFFloatManager *instance = nil;
