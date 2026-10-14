@@ -23,6 +23,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// 【0.21.0 fix4】C++ 链接保护：本头文件会被 .mm 以 ObjC++ 上下文包含，
+// 不加 extern "C" 时函数被 C++ mangling，Swift 桥接按 C 符号找不到（CI 实证）。
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // ---- 通知名 ----
 FOUNDATION_EXPORT NSString * const MFBridgeHostDidCompleteNotification;
 FOUNDATION_EXPORT NSString * const MFBridgeGeometryDidSyncNotification;
@@ -50,5 +56,9 @@ int MFBridgeRefreshAppList(void);
 /// 【桩】关闭浮窗 + 停守护 —— 核心暂无对应入口，0.21.x+ 再接
 /// @return 恒为 -2
 int MFBridgeClosePanel(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 NS_ASSUME_NONNULL_END
