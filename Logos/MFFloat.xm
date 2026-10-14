@@ -1817,19 +1817,24 @@ static double       gMFPadLastTime = 0;     // 快照节流
 // ⇒ 必须临时置顶。恢复判定（layers>0，由 render server 报告）成立时图层已重建，
 // 再留 2 拍缓冲防"恢复判定与可见性之间的小空窗"。
 static BOOL        gMFPadRaised     = NO;  // 快照当前是否在最上层
-static NSInteger   gMFPadLowerAtTick = 0;  // 恢复后到这个 tick 才归位（0 = 无待归位）
+static NSInteger   gMFHealthyTicks  = 0;   // 【0.19.0】连续健康拍数（≥2 才归位；真黑拍清零）
 
-/// 把快照提到内容区最上层（幂等）。真黑第 1 拍调用。
+/// 把快照提到内容区最上层。**每个真黑拍都调用、每次都重新置前** ——
+/// 归档(20) 钉死：系统恢复 hosting 时会把 presentationView 重新插回快照之上，
+/// 只置顶一次守不住；置顶后掉层、恢复、再掉层，快照每拍都要重新爬回最上层。
+/// 日志只在"从未置顶 -> 置顶"这一刻打（避免每拍刷屏）。
 static void MFSnapshotPadRaise(NSDictionary *cfg) {
     if (cfg != nil && !MFConfigBool(cfg, @"keepAliveSnapshotMask", YES)) return;
-    if (gMFPadView == nil || gMFPadView.superview == nil || gMFPadRaised) return;
+    if (gMFPadView == nil || gMFPadView.superview == nil) return;
     @try {
         UIView *area = gMFPadView.superview;
         gMFPadView.frame = area.bounds;      // 对齐内容区（autoresizing 已兜底，双保险）
         gMFPadView.hidden = NO;
         [area bringSubviewToFront:gMFPadView];
-        gMFPadRaised = YES;
-        MFLogS(@"[pres] 消闪：快照已置顶遮盖（掉层期间显示最后一帧定格画面）");
+        if (!gMFPadRaised) {
+            gMFPadRaised = YES;
+            MFLogS(@"[pres] 消闪：快照已置顶遮盖（掉层期间显示最后一帧定格画面）");
+        }
     } @catch (NSException *e) { }
 }
 
@@ -1881,14 +1886,19 @@ static void MFSnapshotPadUpdate(NSDictionary *cfg) {
             [area drawViewHierarchyInRect:area.bounds afterScreenUpdates:NO];
         }];
         if (img == nil) return;
-        if (gMFPadView == nil) {
+        // 【0.19.0 修复】重建条件不能只看 gMFPadView == nil：
+        // attachContentView 换 App 时 clearContentArea 会把快照一起 removeFromSuperview，
+        // 对象活着但 superview 变 nil —— 归档(20) 里酷安会话 15 次真黑零遮盖的根因。
+        // superview 不对（被摘/挂在旧区）都必须重挂。
+        if (gMFPadView == nil || gMFPadView.superview != area) {
+            if (gMFPadView != nil) [gMFPadView removeFromSuperview];
             gMFPadView = [[UIImageView alloc] initWithFrame:area.bounds];
             gMFPadView.userInteractionEnabled = NO;
             gMFPadView.autoresizingMask =
                 UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             [area addSubview:gMFPadView];
             [area sendSubviewToBack:gMFPadView];   // 垫在最底，承载视图盖在它上面
-            MFLogS(@"[pres] 垫底快照视图已建立（内容区 index 0）");
+            MFLogS(@"[pres] 垫底快照视图已建立/重挂（内容区 index 0）");
         }
         gMFPadView.image = img;
     } @catch (NSException *e) {
@@ -1942,19 +1952,19 @@ static void MFKeepAliveTick(void) {
         // 把错误尺寸的可见窗口从"最长 500ms 节流 + 一拍"压到一拍以内。
         if (gMFKeepAliveDownTicks > 0) {
             gMFViewHoldUntil = now + 2.0;
-            // 【0.18.0】安排快照归位：等 2 拍（render server 确认新内容可见）再送回底层。
-            if (gMFPadRaised) {
-                gMFPadLowerAtTick = gMFKeepAliveTicks + 2;
-            }
         }
-        // 【0.18.0】到点归位：render server 已建好新图层（hosted>0 且 cs=2）才送回，
-        // 条件不满足就顺延（下一拍再试，永不放弃）。
-        if (gMFPadRaised && gMFPadLowerAtTick > 0 &&
-            gMFKeepAliveTicks >= gMFPadLowerAtTick) {
-            if (hosted > 0 && (!h.hasCs || h.cs == 2)) {
+        // 【0.19.0】快照归位：**连续 2 个健康拍**（render server 确认新内容可见）才送回底层。
+        // 归档(20) 修复：旧版"恢复拍设 ticks+2"会被下一个健康拍反复重置 ——
+        // 切出切回密集时无限顺延（实测置顶 8 秒不归位），期间掉层又不能重新置顶，
+        // 快照被系统重新插层埋掉 = 白闪回归。现在真黑拍清零计数，连稳 2 拍必归位。
+        if (gMFPadRaised) {
+            gMFHealthyTicks += 1;
+            if (gMFHealthyTicks >= 2 && hosted > 0 && (!h.hasCs || h.cs == 2)) {
                 MFSnapshotPadLower();
-                gMFPadLowerAtTick = 0;
+                gMFHealthyTicks = 0;
             }
+        } else {
+            gMFHealthyTicks = 0;
         }
         // 【0.12.0】预防档结束 —— 本轮最该看的一行：
         // "被去激活了 N 拍、写了 M 次状态量、图层始终没掉" = 预防成功（用户什么都感觉不到）。
@@ -2097,6 +2107,9 @@ static void MFKeepAliveTick(void) {
     // L1 拉回异步 400~800ms；垫底快照盖不住上层 presentationView 的可见异常
     //（黑/白/半渲染）⇒ 置顶遮盖，恢复后归位。宽限期内不置顶（那时画面还没出来，
     // 置顶反而显示上一个 App 的定格画面）。
+    // 【0.19.0】每个真黑拍都重新置前（系统恢复 hosting 会把 presentationView
+    // 重新插回快照之上，置顶一次守不住）+ 健康计数清零。
+    gMFHealthyTicks = 0;
     MFSnapshotPadRaise(cfg);
 
     // ---- 【0.11.0 关键】先分清"是谁黑了"，再决定动不动 scene settings ----
@@ -2235,9 +2248,15 @@ static void MFStartSceneKeepAlive(id scene, id app, NSString *bundleID, NSDictio
     gMFViewHoldUntil = 0;
     gMFTierWriteDownTick = -1;    // 【0.17.0】
     gMFTierLastWritten = 0;
-    gMFPadRaised = NO;            // 【0.18.0】新会话快照回到底层
-    gMFPadLowerAtTick = 0;
-    MFSnapshotPadLower();         // 若上个会话把快照留在了顶层，先归位
+    // 【0.19.0】快照彻底作废：旧会话的快照可能已脱离视图树（或内容还是上个 App），
+    // 置 nil 强制下一个健康拍在当前内容区重建；只清 image 不够（归档(20) 教训）。
+    if (gMFPadView != nil) {
+        [gMFPadView removeFromSuperview];
+        gMFPadView = nil;
+    }
+    gMFPadRaised = NO;
+    gMFHealthyTicks = 0;
+    MFSnapshotPadLower();         // 兜底（若上个会话把快照留在了顶层）
     gMFKeepAliveNextHeartbeat = (NSInteger)(10000.0 / ms);
     gMFKeepAliveNextFrameCheck = (NSInteger)(1000.0 / ms);
     gMFKeepAliveStartTime = [NSDate timeIntervalSinceReferenceDate];
@@ -3343,8 +3362,16 @@ static char kMFRowBundleIDKey;
 
     // 【0.15.0 消闪】剥掉承载视图的自带黑底（配合 P3b 的未承载背景色=透明 +
     // 垫底快照：切换 App 掉图层的那 200~400ms 里，用户看到的是"画面定格"而不是黑）。
-    // gMFPadView 属于上一轮的旧快照：换 App 后立即作废，等健康拍重新抓。
-    if (gMFPadView != nil) { gMFPadView.image = nil; }
+    // 【0.19.0 修复】attachContentView -> clearContentArea 会把 gMFPadView 一起
+    // removeFromSuperview，而旧代码只清 image、视图对象还活着（superview=nil），
+    // 导致 MFSnapshotPadUpdate 永不重建、MFSnapshotPadRaise 永远静默早退 ——
+    // 归档(20)：换 App 后 15 次真黑零遮盖的根因。这里显式置 nil 强制作废重建。
+    if (gMFPadView != nil) {
+        [gMFPadView removeFromSuperview];
+        gMFPadView = nil;
+        gMFPadRaised = NO;
+        gMFHealthyTicks = 0;
+    }
     MFStripPresentationBlack();
 
     // ---------- P6：把 presenter / 图层宿主的真实状态写下来 ----------
