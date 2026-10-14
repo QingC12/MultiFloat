@@ -6,6 +6,19 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.25.0 变更（第 28 轮：Stheno 外沿手势一比一复刻 + 未运行启动链修复）：
+#   - 归档27 反馈：移动/缩放 ✔；但"未启动的应用无法直接在浮窗中打开" +
+#     "现在这个手势并不好用" -> 要求一比一复刻 Stheno：手势在悬浮窗**外边缘**而非内部。
+#   - Stheno 逆向实证（Stheno.dylib 字符串）：SthenoWindow + FatWindowControlView /
+#     EdgeBarControlView / WindowGestureControlView + _cardTrim/_edgeWidth +
+#     PanGestureSubType（一个 pan 按触点位置分：角=缩放、边=移动、中间=穿透）+
+#     finalCardCorner（锚角缩放）。
+#   - 修法①外沿热区：窗口 = 内容区 + 四周 18pt 透明 trim；四边=移动、
+#     四角=锚角缩放（对角钉死，尺寸仍增量式勿回退）、外沿双击=唤出应用列表；
+#     中间内容区完全不挡 App 触摸；◢/内部边缘条全部退场，↻/✕ 缩小浮在内容区右上。
+#   - 修法②启动链：FBSOpenApplicationService 没有 +sharedInstance（归档27 实测
+#     unrecognized selector）-> 改 alloc/init（FrontBoardServices 服务类标准用法）。
+#
 # 0.24.0 变更（第 27 轮：承载后可移动 + 全量应用列表 + 未运行可启动）：
 #   - 归档26 反馈：缩放 ✔（增量式修复生效）；承载后移动手势摸不到（选择器页面正常）
 #     —— 根因：承载后 App 内容占满窗口，用户摸中间 = 摸到 App 自己；36/22pt 上下

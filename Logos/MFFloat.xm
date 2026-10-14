@@ -2723,9 +2723,9 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 @property (nonatomic, weak) UIWindow *hostWindow;
 @property (nonatomic, strong) UIView *titleBar;
 @property (nonatomic, strong) UIView *contentArea;
-@property (nonatomic, strong) UIView *statusBar;      // 【0.23.0】透明边缘条（移动手柄 + 选择器手势区）
-@property (nonatomic, strong) UIView *leftStrip;      // 【0.24.0】左/右透明边缘条（承载后抓边移动）
-@property (nonatomic, strong) UIView *rightStrip;
+@property (nonatomic, strong) UIView *statusBar;      // 【0.25.0】已隐藏（保留对象兼容旧引用）
+@property (nonatomic, strong) NSArray<UIView *> *edgeViews;    // 【0.25.0】外沿 4 边热区（移动 + 双击选择器）
+@property (nonatomic, strong) NSArray<UIView *> *cornerViews;  // 【0.25.0】外沿 4 角热区（锚角缩放）
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIViewController *contentVC;
@@ -2752,97 +2752,119 @@ static char kMFRowBundleIDKey;
     self.view.layer.cornerRadius = 16.0;
     self.view.layer.masksToBounds = YES;
 
+    // 【0.25.0】Stheno 式外沿热区（一比一复刻 cardTrim/EdgeBarControlView 模型）：
+    //      窗口 = 内容区 + 四周 18pt 透明外沿（trim）。手势全部挂在外沿上：
+    //      四角 = 缩放（锚定对角）、四边 = 移动、外沿双击 = 唤出应用列表；
+    //      中间内容区完全不挡，App 自行接收触摸。
+    const CGFloat pad  = 18.0;                 // 外沿宽度（Stheno edgeWidth 同类参数）
     const CGFloat barH = 36.0, statusH = 22.0;
     CGRect bounds = self.view.bounds;
     CGFloat w = bounds.size.width, h = bounds.size.height;
 
-    // ---- 内容区：【0.23.0】占满整个窗口（全内容、无留边）——
-    //      顶/底边缘条与按钮盖在其上（z 序更高），保证可摸。----
-    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    // ---- 内容区：内缩外沿宽度（contentArea.bounds 仍是 scene.frame 尺寸真源）----
+    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(pad, pad, w - 2 * pad, h - 2 * pad)];
     content.backgroundColor = [UIColor clearColor];
     content.clipsToBounds = YES;
     content.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:content];
     self.contentArea = content;
 
-    // ---- 顶部边缘条（透明，保留拖动 + 顶右两个小按钮：✕ 关闭必须有退路）----
-    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, barH)];
+    // ---- ↻ / ✕ 按钮：浮在内容区右上角内侧（缩小 + 低透明度，不占外沿手势区）----
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(w - 2 * pad - 76, pad + 4, 70, 28)];
     bar.backgroundColor = [UIColor clearColor];
-    bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    bar.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    bar.userInteractionEnabled = NO;           // 容器透传，只有两个按钮可点
     [self.view addSubview:bar];
     self.titleBar = bar;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 96, barH)];
-    title.hidden = YES;    // 【0.23.0】不再显示标题文字（无框）
+    title.hidden = YES;
     [bar addSubview:title];
     self.titleLabel = title;
 
-    // 刷新键：拉取"当前正在运行"的 App 列表。
-    // 没有它就只能在 respring 后才能重试，而 respring 会杀掉目标 App 的 scene。
     UIButton *reload = [UIButton buttonWithType:UIButtonTypeCustom];
-    reload.frame = CGRectMake(w - 76, 4, 34, 28);
+    reload.frame = CGRectMake(0, 0, 32, 28);
     [reload setTitle:@"↻" forState:UIControlStateNormal];
-    [reload setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateNormal];
+    [reload setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.40] forState:UIControlStateNormal];
     reload.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     reload.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    reload.userInteractionEnabled = YES;
     [reload addTarget:self action:@selector(onReloadTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:reload];
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
-    close.frame = CGRectMake(w - 40, 4, 34, 28);
+    close.frame = CGRectMake(36, 0, 32, 28);
     [close setTitle:@"✕" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateNormal];
+    [close setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.40] forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    close.userInteractionEnabled = YES;
     [close addTarget:self action:@selector(onCloseTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:close];
 
-    // ---- 底部边缘条（透明）：移动手柄 + 双击/长按唤出应用选择器 ----
-    UIView *statusBar = [[UIView alloc] initWithFrame:CGRectMake(0, h - statusH, w, statusH)];
-    statusBar.backgroundColor = [UIColor clearColor];
-    statusBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    // ---- 底部状态条：保留对象（statusLabel 有日志/状态用途）但隐藏、不挡触摸 ----
+    UIView *statusBar = [[UIView alloc] initWithFrame:CGRectZero];
+    statusBar.hidden = YES;
+    statusBar.userInteractionEnabled = NO;
     [self.view addSubview:statusBar];
     self.statusBar = statusBar;
 
-    UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, w - 16, statusH)];
-    status.hidden = YES;   // 【0.23.0】状态文字只在日志里看（无框）
+    UILabel *status = [[UILabel alloc] initWithFrame:CGRectZero];
+    status.hidden = YES;
     [statusBar addSubview:status];
     self.statusLabel = status;
 
-    // ---- 右下角缩放命中区：【0.23.0】44x44（原 24x24 太小 + 半透明 ◢ 提示可拖）----
-    UILabel *grip = [[UILabel alloc] initWithFrame:CGRectMake(w - 46, h - statusH - 46, 44, 44)];
-    grip.text = @"◢";
-    grip.textColor = [UIColor colorWithWhite:1.0 alpha:0.30];
-    grip.font = [UIFont systemFontOfSize:15];
-    grip.textAlignment = NSTextAlignmentCenter;
-    grip.userInteractionEnabled = YES;
-    grip.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    [self.view addSubview:grip];
+    // ---- 外沿热区：4 边（移动 + 双击选择器）----
+    NSMutableArray *edges = [NSMutableArray array];
+    void (^mkEdge)(CGRect, UIViewAutoresizing, NSInteger) = ^(CGRect f, UIViewAutoresizing m, NSInteger tag) {
+        UIView *e = [[UIView alloc] initWithFrame:f];
+        e.backgroundColor = [UIColor clearColor];
+        e.autoresizingMask = m;
+        e.tag = tag;
+        [e addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
+        UITapGestureRecognizer *dbl = [[UITapGestureRecognizer alloc] initWithTarget:[MFFloatManager shared] action:@selector(toggleAppList)];
+        dbl.numberOfTapsRequired = 2;
+        [e addGestureRecognizer:dbl];
+        [self.view addSubview:e];
+        [edges addObject:e];
+    };
+    mkEdge(CGRectMake(pad, 0, w - 2 * pad, pad),
+           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin, 1);   // 上
+    mkEdge(CGRectMake(pad, h - pad, w - 2 * pad, pad),
+           UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin, 2);     // 下
+    mkEdge(CGRectMake(0, pad, pad, h - 2 * pad),
+           UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleRightMargin, 3);  // 左
+    mkEdge(CGRectMake(w - pad, pad, pad, h - 2 * pad),
+           UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleLeftMargin, 4);   // 右
 
-    [bar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
-    // 【0.22.0】底部条同样是移动手柄（用户需求：底部手势移动浮窗）
-    [statusBar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
-    // 【0.24.0】左/右透明边缘条：承载后 App 内容占满窗口，用户摸中间只会摸到 App；
-    // 抓"任意一条边"（上/下/左/右）都能移动。宽度 16pt，不挡 App 边缘交互主体。
-    {
-        UIView *lft = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 16, h)];
-        lft.backgroundColor = [UIColor clearColor];
-        lft.autoresizingMask = UIViewAutoresizingFlexibleHeight;
-        [lft addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
-        [self.view addSubview:lft];
-        self.leftStrip = lft;
+    // ---- 外沿热区：4 角（缩放，Stheno finalCardCorner 锚角式）----
+    NSMutableArray *corners = [NSMutableArray array];
+    void (^mkCorner)(CGRect, UIViewAutoresizing, NSInteger) = ^(CGRect f, UIViewAutoresizing m, NSInteger tag) {
+        UIView *c = [[UIView alloc] initWithFrame:f];
+        c.backgroundColor = [UIColor clearColor];
+        c.autoresizingMask = m;
+        c.tag = tag;                            // 11=左上 12=右上 13=左下 14=右下
+        [c addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onResize:)]];
+        UITapGestureRecognizer *dbl = [[UITapGestureRecognizer alloc] initWithTarget:[MFFloatManager shared] action:@selector(toggleAppList)];
+        dbl.numberOfTapsRequired = 2;
+        [c addGestureRecognizer:dbl];
+        [self.view addSubview:c];
+        [corners addObject:c];
+    };
+    mkCorner(CGRectMake(0, 0, pad, pad),
+             0, 11);                                                                        // 左上
+    mkCorner(CGRectMake(w - pad, 0, pad, pad),
+             UIViewAutoresizingFlexibleLeftMargin, 12);                                     // 右上
+    mkCorner(CGRectMake(0, h - pad, pad, pad),
+             UIViewAutoresizingFlexibleTopMargin, 13);                                      // 左下
+    mkCorner(CGRectMake(w - pad, h - pad, pad, pad),
+             UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin, 14); // 右下
 
-        UIView *rgt = [[UIView alloc] initWithFrame:CGRectMake(w - 16, 0, 16, h - 70)];
-        // 底部留出 70pt 避开 ◢ 缩放命中区（右下角必须归缩放手势，否则被移动抢走）
-        rgt.backgroundColor = [UIColor clearColor];
-        rgt.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleLeftMargin;
-        [rgt addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
-        [self.view addSubview:rgt];
-        self.rightStrip = rgt;
-    }
-    [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onResize:)]];
+    self.edgeViews   = edges;
+    self.cornerViews = corners;
 
-    MFLog(@"[ui] 面板就绪 %.0fx%.0f（0.23.0 无框壳）", w, h);
+    MFLog(@"[ui] 面板就绪 %.0fx%.0f（0.25.0 Stheno 外沿热区 pad=%.0f：4边移动/4角缩放/双击唤出）",
+         w, h, pad);
 }
 
 - (void)setStatusText:(NSString *)text {
@@ -2891,6 +2913,8 @@ static NSDate    *gMFResizeStartDate  = nil;
 static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
 static CGFloat    gMFResizeCurW        = 0.0;   // 【0.23.1】增量式当前宽
 static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日志计数
+static CGPoint    gMFResizeAnchor      = CGPointZero;  // 【0.25.0】锚角（拖动角的对角，固定不动）
+static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 12=右上 13=左下 14=右下
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -2904,13 +2928,23 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
+        // 【0.25.0】Stheno finalCardCorner：锚角 = 被拖角的对角，缩放期间固定不动
+        gMFResizeCorner = g.view.tag;
+        if (gMFResizeCorner < 11 || gMFResizeCorner > 14) gMFResizeCorner = 14;  // 兜底=右下
+        CGRect sf = gMFResizeStartFrame;
+        BOOL right = (gMFResizeCorner == 12 || gMFResizeCorner == 14);
+        BOOL down  = (gMFResizeCorner == 13 || gMFResizeCorner == 14);
+        gMFResizeAnchor = CGPointMake(right ? sf.origin.x : CGRectGetMaxX(sf),
+                                      down  ? sf.origin.y : CGRectGetMaxY(sf));
         // 【0.23.0】手势期间 + 结束后 1.5s：守护几何纠正全部让路（修复归档24"缩放失效"）
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 10.0;
-        MFLog(@"[ui] resize 开始 frame=%@ AR=%.3f", NSStringFromCGRect(win.frame), gMFResizeStartAR);
+        MFLog(@"[ui] resize 开始 corner=%ld anchor=(%.0f,%.0f) frame=%@ AR=%.3f",
+             (long)gMFResizeCorner, gMFResizeAnchor.x, gMFResizeAnchor.y,
+             NSStringFromCGRect(win.frame), gMFResizeStartAR);
     }
 
     // 【0.20.0】误触判定：手势开始后 0.8s 内累计变化"几乎纯竖直且幅度大"
-    //（|dy|>60pt 且 |dy|>3|dx|）—— 正经拖 ◢ 是斜向/横向的，快速上下滑才是这种形状。
+    //（|dy|>60pt 且 |dy|>3|dx|）—— 正经拖角是斜向/横向的，快速上下滑才是这种形状。
     // 命中 => 立即回滚 win.frame 并废掉手势；**不调 syncContentGeometry**，
     // scene.frame 从头到尾不被污染（Changed 期间本来也不写 scene.frame）。
     if (gMFResizeStartDate != nil && gMFResizeStartFrame.size.width > 0) {
@@ -2928,32 +2962,44 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
         }
     }
 
-    // 【0.23.1】等比例缩放（改回**增量式**）：onDrag 的增量模式在本项目实证可用，
-    // 0.22.0 的"起点锚定+绝对尺寸"实机失效（归档25：手势触发但 frame 一像素未动）。
-    // 做法：每拍平移沿"右下-左上"对角线投影出统一缩放量 dW（正=放大/负=缩小），
-    // 累加到当前宽上；高度 = 宽 / AR（锁比例，内容永不变形）。
+    // 【0.25.0】四角等比缩放（增量式 + 锚角推算 origin）：
+    // 尺寸仍走 0.23.1 实证可用的增量累加（勿回退"起点锚定绝对尺寸"）；
+    // origin 不再固定，而是从锚角反推 —— 拖哪个角，对角就钉在原地（Stheno 行为）。
     CGPoint t = [g translationInView:win];
     CGFloat sw = gMFResizeStartFrame.size.width, sh = gMFResizeStartFrame.size.height;
     CGFloat diag = sqrt(sw * sw + sh * sh);
-    CGFloat dW = (t.x * sw + t.y * sh) / diag;        // 对角线方向投影（增量）
+    // 方向符号：拖右/下侧的角向外 = 放大；拖左/上侧的角向外 = 平移为负
+    CGFloat sx = (gMFResizeCorner == 12 || gMFResizeCorner == 14) ? 1.0 : -1.0;
+    CGFloat sy = (gMFResizeCorner == 13 || gMFResizeCorner == 14) ? 1.0 : -1.0;
+    CGFloat dW = (t.x * sx * sw + t.y * sy * sh) / diag;   // 对角线方向投影（增量）
 
     CGRect screen = [UIScreen mainScreen].bounds;
     CGFloat newW = gMFResizeCurW + dW;
     newW = MAX(150.0, newW);
-    newW = MIN(newW, screen.size.width  - gMFResizeStartFrame.origin.x);
+    newW = MIN(newW, screen.size.width  - 2.0 * 18.0);
     CGFloat newH = newW / gMFResizeStartAR;           // ★ 锁比例：高度由宽度唯一决定
-    newH = MIN(newH, screen.size.height - gMFResizeStartFrame.origin.y);
+    newH = MIN(newH, screen.size.height - 2.0 * 18.0);
     if (newH < 150.0) { newH = 150.0; newW = newH * gMFResizeStartAR; }
     gMFResizeCurW = newW;
-    win.frame = CGRectMake(gMFResizeStartFrame.origin.x, gMFResizeStartFrame.origin.y, newW, newH);
+
+    // origin 由锚角反推（对角钉死）
+    CGRect nf = gMFResizeStartFrame;
+    switch (gMFResizeCorner) {
+        case 11: nf = CGRectMake(gMFResizeAnchor.x - newW, gMFResizeAnchor.y - newH, newW, newH); break; // 左上
+        case 12: nf = CGRectMake(gMFResizeStartFrame.origin.x, gMFResizeAnchor.y - newH, newW, newH); break; // 右上
+        case 13: nf = CGRectMake(gMFResizeAnchor.x - newW, gMFResizeStartFrame.origin.y, newW, newH); break; // 左下
+        default: nf = CGRectMake(gMFResizeStartFrame.origin.x, gMFResizeStartFrame.origin.y, newW, newH); break; // 右下
+    }
+    win.frame = nf;
     [g setTranslation:CGPointZero inView:win];
 
     // 【0.23.1】Changed 节流日志（每 4 拍 1 条）：下轮日志直接区分"没 Changed"还是
     // "Changed 但被写回"——归档25 的两种假设只有它能裁决。
     gMFResizeTick++;
     if (g.state == UIGestureRecognizerStateChanged && (gMFResizeTick % 4) == 1) {
-        MFLog(@"[ui] resize 变化 #%ld t=(%.1f,%.1f) dW=%.1f -> W=%.0f H=%.0f",
-             (long)gMFResizeTick, t.x, t.y, dW, newW, newH);
+        MFLog(@"[ui] resize 变化 #%ld corner=%ld t=(%.1f,%.1f) dW=%.1f -> W=%.0f H=%.0f origin=(%.0f,%.0f)",
+             (long)gMFResizeTick, (long)gMFResizeCorner, t.x, t.y, dW, newW, newH,
+             nf.origin.x, nf.origin.y);
     }
 
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
@@ -3103,8 +3149,11 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     MFLog(@"[ui] windowScene=%@", scene ? NSStringFromClass([scene class]) : @"nil");
 
     CGRect screen = [UIScreen mainScreen].bounds;
+    // 【0.25.0】w/h 是"内容区"目标尺寸；窗口额外外扩一圈 18pt 外沿热区（Stheno cardTrim）
+    const CGFloat kTrimPad = 18.0;
     CGFloat w = MAX(230.0, screen.size.width * 0.62);
     CGFloat h = MIN(screen.size.height * 0.65, w * 1.48);
+    w += 2 * kTrimPad;  h += 2 * kTrimPad;
     // 【0.22.0】按用户需求：浮窗默认打开在屏幕中心（原为右上角停靠）
     CGRect frame = CGRectMake((screen.size.width  - w) / 2.0,
                               (screen.size.height - h) / 2.0, w, h);
@@ -3145,33 +3194,20 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
 
     [self refreshAppList];
 
-    // ---- 【0.23.0】应用选择器唤出手势（Stheno 风：无常驻按钮，手势唤出）----
-    // 作用区 = 顶/底透明边缘条（不碰承载内容的触屏）。
-    // pickerGesture：0=关 / 1=双击（默认）/ 2=长按。
+    // ---- 【0.25.0】双击唤出手势已在 viewDidLoad 挂到外沿热区（4 边 + 4 角）。
+    //      pickerGesture=0 时这里移除它们（尊重关闭语义）；pg=2（长按）暂同 1。----
     {
         NSInteger pg = MFConfigInt(self.config, @"pickerGesture", 1);
-        NSArray *strips = @[ self.panel.titleBar, self.panel.statusBar,
-                             self.panel.leftStrip, self.panel.rightStrip ];
-        if (pg == 1 || pg == 2) {
-            for (UIView *strip in strips) {
-                UIGestureRecognizer *gr = nil;
-                if (pg == 1) {
-                    UITapGestureRecognizer *tap =
-                        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleAppList)];
-                    tap.numberOfTapsRequired = 2;
-                    gr = tap;
-                } else {
-                    UILongPressGestureRecognizer *lp =
-                        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(toggleAppList)];
-                    lp.minimumPressDuration = 0.5;
-                    gr = lp;
-                }
-                [strip addGestureRecognizer:gr];
-            }
-            MFLog(@"[ui] 选择器手势已挂（pickerGesture=%ld：%@ 边缘条）",
-                 (long)pg, pg == 1 ? @"双击" : @"长按");
-        } else {
+        if (pg == 0) {
+            for (UIView *v in self.panel.edgeViews)
+                for (UIGestureRecognizer *gr in v.gestureRecognizers)
+                    if ([gr isKindOfClass:[UITapGestureRecognizer class]]) [v removeGestureRecognizer:gr];
+            for (UIView *v in self.panel.cornerViews)
+                for (UIGestureRecognizer *gr in v.gestureRecognizers)
+                    if ([gr isKindOfClass:[UITapGestureRecognizer class]]) [v removeGestureRecognizer:gr];
             MFLogS(@"[ui] 选择器手势已关闭（pickerGesture=0）");
+        } else {
+            MFLog(@"[ui] 选择器手势已挂（外沿热区双击，pickerGesture=%ld）", (long)pg);
         }
     }
 
@@ -3643,7 +3679,10 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             Class svcCls = objc_getClass("FBSOpenApplicationService");
-            id svc = ((id (*)(id, SEL))objc_msgSend)((id)svcCls, NSSelectorFromString(@"sharedInstance"));
+            // 【0.25.0 归档27 修复】该类没有 +sharedInstance 类方法（实测
+            // unrecognized selector）—— FrontBoardServices 服务类走标准 alloc/init。
+            id svc = ((id (*)(id, SEL))objc_msgSend)((id)svcCls, @selector(alloc));
+            svc = ((id (*)(id, SEL))objc_msgSend)(svc, @selector(init));
             if (svc == nil || ![svc respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:")]) {
                 MFLogS(@"[host] !! FBSOpenApplicationService 通道不可用 -> 请先手动打开该 App");
                 [self.panel showMessage:@"无法自动启动该 App"
