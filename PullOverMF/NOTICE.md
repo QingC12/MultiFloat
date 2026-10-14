@@ -171,10 +171,53 @@
 38. **几何兜底**：所有进入几何计算的数值经 `MFRingSafe()` 过滤（NaN/Inf 一律回退），
     杜绝 NaN frame 这种会直接带走渲染服务器的输入；早期返回也全部留痕（不再静默早退）。
 
+## 0.1.8 改动（根治「右下边缘一滑就黑屏注销」—— 触摸路径与 SpringBoard 私有数据彻底解耦）
+39. **症状仍在 + 事实链复盘**：0.1.7 之后用户反馈仍是"右下边缘滑动就黑屏注销"。
+    把三份源码放在一起逐行比对后得到关键事实：
+    - **0.1.3 真机日志（17:53）证明**：同一份"取最近使用 App + 取图标"的代码当时**是跑得通的**
+      （`圆盘已展开：5 个 App`、`选中 com.tencent.xin -> 打开浮窗`）；
+    - 0.1.3 → 0.1.5 的 diff 只有几何/图标尺寸等**纯绘制**改动，不可能是元凶；
+    - 0.1.5 → 0.1.6 在触摸路径上新增的也全是纯数学与视图结构。
+    ⇒ 结论：崩溃点是**数据相关**的，而不是某一行代码写错。
+    嫌疑路径落在 `+[POApplicationHelper recentAppsWithCount:]`：它对
+    `SBMainSwitcherViewController / SBFluidSwitcherViewController / SBAppSwitcherModel …`
+    这些多任务切换器对象做 **KVC 递归遍历**（`displayItems`/`allItems`/`items`/`application`… 深度 4），
+    而"切换器里当前有哪些卡片"每时每刻都在变 —— 遍历到某个对象组合时会踩到
+    **不可捕获的 trap**（`@try` 无效），恰好表现为"一滑就注销、不进安全模式"。
+    **反证就摆在 Stheno 里**：Stheno 的圆盘内容来自 `AppSearcher`/`AppCellVew`（遍历**已安装应用**），
+    根本不去翻切换器模型 —— 这就是我们要的实证答案。
+40. **改造一：圆盘内容改用"扁平枚举已安装 App"**。
+    新增 `MFRingEnumerateInstalledBundleIds()`：只拿一个 App 对象数组，
+    逐个读 `bundleIdentifier` / `displayIdentifier` / `applicationIdentifier`（全部包 `@try`），
+    **绝不使用 `valueForKey:` 对切换器对象图做递归遍历**。
+    数据源优先 `SBApplicationController.sharedInstance.allApplications`，
+    退化到 `LSApplicationWorkspace.defaultWorkspace.allInstalledApplications`。
+41. **改造二：触摸路径零 SpringBoard 查询**。
+    新增 `MFRingBundleIds()`，只读「配置 `ringApps`」或「进程内缓存 `gMFRingAutoBundleIds`」，
+    **绝不查 SB**。缓存由 `scheduleAutoBundleIdEnumeration()` 在**安装后延后 0.6s** 执行一次，
+    成功后落盘到 `ringAppsAuto`（下次启动直接载入，连枚举都不用做）。
+    用户显式配置的 `ringApps` 优先级最高，配置过就完全跳过枚举。
+42. **改造三：图标也移出触摸路径**。
+    圆盘先用**首字母占位**铺好并显示出来，之后由 `scheduleIconFillWithGeneration:` 延后把真图标贴上去；
+    每个图标都有 `>>> 取图标 <id>` / `<<< 取图标 <id> ok=是/否` 日志，真出问题能点名到具体 App。
+    可用 `mfRingFetchIcons=false` 完全关掉图标抓取。
+43. **改造四：崩溃自解除闸门（关键安全网）**。
+    新增 `/var/mobile/PullOverMF.ringguard`：**危险动作（枚举 App / 抓图标）前立标记，
+    整趟走完并存活才撤**（沿用项目既有铁律：绝不按时间无条件清）。
+    `install` 时若发现标记还在 ⇒ 上回就是被这一步带走的 ⇒
+    **自动进入降级模式**：不再枚举、不再抓图标，只用配置/缓存 + 首字母图标，
+    并打印醒目告警。删掉该文件即可重新尝试。
+    **这样最坏情况是"圆盘朴素但可用"，绝不会陷入"一滑就注销"的死循环。**
+44. **改造五：触发条避开底部手势区**。
+    `mfTriggerLength` 默认 380 → **300**，并新增 `mfTriggerBottomInset`（默认 44）——
+    触发条任何情况下都离屏幕底边至少 44pt，不再与"主屏手势（Home Indicator）"区重叠。
+45. 其他：窗口 / 容器 / 触发条统一 `opaque = NO`；`mfRingMaxIcons` 上限 12；
+    降级模式下圆盘中央的提示文案会明确写出"当前为降级模式"。
+
 ## 待办（用户指定的下一版）
-39. **悬浮窗四周贴边手势区**（用户已说明"先不要推进"→ 暂缓）：在浮窗四周加贴边热区用于移动/缩放浮窗
+46. **悬浮窗四周贴边手势区**（用户已说明"先不要推进"→ 暂缓）：在浮窗四周加贴边热区用于移动/缩放浮窗
     （PullOver 已有 `applyCardScaleTarget:` 可做缩放；移动需接卡片的垂直锚点机制）。
     依据：0.1.5 日志已实证「全屏 App 之上，屏幕边缘区仍能收到本 tweak 窗口的触摸」；
     0.1.7 的 `hitTest` 点透模型进一步保证了"窗口全屏也不会挡住系统手势"。
 
-40. 后续改动（UI/交互/分屏能力）将逐条记录在此。
+47. 后续改动（UI/交互/分屏能力）将逐条记录在此。
