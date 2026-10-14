@@ -29,10 +29,15 @@
 //    mfTriggerLength   number 触发区长度（默认 380）
 //    mfTriggerThickness number 触发区厚度（默认 56）
 //    mfRingRadius      number 圆盘半径（默认 150）
-//    mfRingIconSize    number 图标尺寸（默认 56）
+//    mfRingIconSize    number 图标尺寸（默认 44；0.1.5 起从 56 缩小）
+//    mfRingEdgeMargin  number 圆盘外沿距屏幕边的间距（默认 12；圆心会内缩 radius+margin 保证整圆可见）
 //    mfRingRotation    number 图标整体旋转角，度（默认 0）
+//    mfRingStartAngle  number 第一个图标的角度，度（默认 -90 = 正上方）
 //    mfRingMaxIcons    number 未配置时最多显示几个（默认 8）
 //    ringApps          array  bundleID 数组（自定义圆盘内容）
+//
+//  版本备注：0.1.4 及以前圆心放在**屏幕边缘** → 圆有一半在屏幕外（用户反馈"只有半圆显示"）；
+//  0.1.5 起圆心内缩（screenWidth - radius - edgeMargin），**整圆完整显示在屏幕内**，图标绕整圈排布。
 //
 
 #import <UIKit/UIKit.h>
@@ -325,9 +330,9 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
             container.alpha = 1.0;
         }];
 
-        MFLog(@"[ring] 圆盘已展开：%@ 个 App（半径 %.0f，图标 %.0f，边=%@）",
+        MFLog(@"[ring] 圆盘已展开：%@ 个 App（完整圆，半径 %.0f，图标 %.0f，边=%@）",
               @([self.iconButtons count]), MFRingNumber(@"mfRingRadius", 150.0),
-              MFRingNumber(@"mfRingIconSize", 56.0), MFRingEdge());
+              MFRingNumber(@"mfRingIconSize", 44.0), MFRingEdge());
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 展开异常：%@", exception);
         [self hide];
@@ -375,24 +380,21 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     CGFloat screenWidth = CGRectGetWidth(bounds);
     CGFloat screenHeight = CGRectGetHeight(bounds);
     CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
-    CGFloat iconSize = MAX(28.0, MFRingNumber(@"mfRingIconSize", 56.0));
+    // 【0.1.5】图标默认缩小：56 -> 44（用户反馈图标偏大）
+    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
     CGFloat rotation = MFRingNumber(@"mfRingRotation", 0.0);
+    CGFloat edgeMargin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
     BOOL fromRight = ![MFRingEdge() isEqualToString:@"left"];
 
-    // 圆心贴屏幕边缘中点 -> 只显示朝内的一半 = Stheno 的"半圆盘"（RTSIH）
-    CGPoint center = CGPointMake(fromRight ? screenWidth : 0.0, screenHeight / 2.0);
+    // 【0.1.5 修复】圆心必须**移进屏幕内**，否则整圆有一半在屏幕外（0.1.4 就是这个问题）。
+    //   圆心 x = 屏幕内缩 (半径 + 边距) -> 圆的外沿距屏幕边 edgeMargin，整圆完整可见。
+    CGFloat centerX = fromRight ? (screenWidth - edgeMargin - radius) : (edgeMargin + radius);
+    CGPoint center = CGPointMake(centerX, screenHeight / 2.0);
     self.dialCenter = center;
 
-    // 半圆盘背景：圆心贴屏幕边缘中点，朝屏幕内张开 180°（Stheno 的"半圆盘" RTSIH）。
-    // 注意角度区间必须在**屏幕内**那一侧：贴右缘时是 90°(下) → 180°(朝左) → 270°(上)。
-    UIBezierPath *path = [UIBezierPath bezierPath];
-    [path moveToPoint:center];
-    if (fromRight) {
-        [path addArcWithCenter:center radius:radius startAngle:M_PI_2 endAngle:M_PI * 1.5 clockwise:YES];
-    } else {
-        [path addArcWithCenter:center radius:radius startAngle:-M_PI_2 endAngle:M_PI_2 clockwise:YES];
-    }
-    [path closePath];
+    // 完整圆形背景（不再是半圆）
+    UIBezierPath *path = [UIBezierPath bezierPathWithOvalInRect:
+                          CGRectMake(center.x - radius, center.y - radius, radius * 2.0, radius * 2.0)];
 
     CAShapeLayer *dial = [CAShapeLayer layer];
     dial.path = path.CGPath;
@@ -406,18 +408,20 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     NSArray<NSString *> *bundleIds = MFRingBundleIds();
     NSUInteger count = bundleIds.count;
     if (count == 0) {
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, screenWidth - 60.0, 60.0)];
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, radius * 1.4, 60.0)];
         hint.numberOfLines = 0;
         hint.textAlignment = NSTextAlignmentCenter;
         hint.text = @"圆盘里还没有 App\n编辑 com.mlgm.pulloverx.plist 的 ringApps（bundleID 数组）即可添加";
         hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
-        hint.font = [UIFont systemFontOfSize:13.0];
-        hint.center = CGPointMake(screenWidth / 2.0, center.y);
+        hint.font = [UIFont systemFontOfSize:12.0];
+        hint.center = center;
         [container addSubview:hint];
         return;
     }
 
-    CGFloat iconRadius = MAX(iconSize, radius - iconSize * 0.75);
+    // 图标放在圆内侧一圈（外沿贴近圆周，不越出圆盘）
+    CGFloat iconRadius = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
+    CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);   // 默认从正上方开始
     for (NSUInteger index = 0; index < count; index++) {
         NSString *bundleId = bundleIds[index];
         UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -449,13 +453,13 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         longPress.minimumPressDuration = 0.5;
         [button addGestureRecognizer:longPress];
 
-        // 角度：沿"屏幕内那半圆"均匀铺开（90°=下 → 180°=最内 → 270°=上）。
-        // ⚠️ 0.1.3 修正：不能用 -90°..90°（那一侧全在屏幕外）。
-        CGFloat fraction = (count <= 1) ? 0.5 : (CGFloat)index / (CGFloat)(count - 1);
-        CGFloat angleDegrees = 90.0 + 180.0 * fraction + rotation;
+        // 【0.1.5】沿**整圈**均匀铺开（圆已完整显示，图标绕整圈排布）。
+        // 0.1.3/0.1.4 是半圆排布（那个版本圆心在屏幕边缘）。
+        CGFloat angleDegrees = startAngle
+            + 360.0 * (CGFloat)index / (CGFloat)MAX((NSUInteger)1, count)
+            + rotation;
         CGFloat angle = angleDegrees * M_PI / 180.0;
-        CGFloat x = (fromRight ? center.x + iconRadius * cos(angle)
-                              : center.x - iconRadius * cos(angle));
+        CGFloat x = center.x + iconRadius * cos(angle);
         CGFloat y = center.y + iconRadius * sin(angle);
         button.center = CGPointMake(x, y);
 
