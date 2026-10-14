@@ -84,4 +84,21 @@
     `mfRingRadius`(150) / `mfRingIconSize`(56) / `mfRingRotation`(0) / `mfRingMaxIcons`(8) /
     `ringApps`(bundleID 数组，圆盘自定义内容)。
 
+## 0.1.4 改动（致命链接错误修复 —— 0.1.2/0.1.3 整个 tweak 不加载的真因）
+17. **真因不是"constructor 崩溃"，而是 C++ 名字修饰导致的 dylib 加载失败**：
+    `PullOverX.mm` 是 **ObjC++**，它调用没有 `extern "C"` 声明的跨文件 C 函数时，编译器生成的是
+    C++ 修饰名。实测 0.1.3 产物的未定义符号：
+    ```
+    __Z9MFLogRawCPKc            ← MFLogRawC(char const*)
+    __Z19MFRingPickerInstallv   ← MFRingPickerInstall()
+    ```
+    而 `MFDebugLog.m` / `MFRingPicker.m` 导出的是 C 名字 `_MFLogRawC` / `_MFRingPickerInstall`
+    → **dyld 解析不到 → 拒绝加载整个 dylib** → 桌面手柄消失、日志文件不生成、圆盘装不上。
+    （0.1.2 也是同一个原因：constructor 里调用了 `MFLog`。）
+18. **修复**：prefix header 里把所有共享 C 接口用 `extern "C"` 包裹
+    （`MFLogRawC` / `MFRingPickerInstall` / `MFLog`）。
+    ⚠️ 新增校验步骤：每次构建后**解析 dylib 符号表**，确认不含 `__Z` 形式的自有未定义符号
+    （已列入本项目的交付前检查）。
+19. 与 MultiFloat 时期"给 Swift 调的 C 头必须 extern C"是同一条铁律：**任何被 .mm 调用的 C 接口都要 extern "C"**。
+
 11. 后续改动（UI/交互/分屏能力）将逐条记录在此。

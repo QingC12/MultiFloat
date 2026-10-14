@@ -2,18 +2,34 @@
 
 #ifdef __OBJC__
     #import <Foundation/Foundation.h>
-
-    // ===== 【MF 0.1.3】文件日志 =====
-    // MFLog() 写 /var/mobile/PullOverMF.log（Filza 直接打开），启动时 >2MB 轮转为 .old。
-    // 实现见 PullOverX/MFDebugLog.m。
-    //   · MFLogRawC(const char *) —— 纯 C，零 Foundation 依赖，**constructor 阶段只能用这个**
-    //     （0.1.2 的教训：constructor 里用 Foundation 会把整个 tweak 拖崩，桌面连手柄都不显示）
-    //   · MFLog(NSString *, ...) —— 正常运行时使用
-    void MFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-
-    // 【MF 0.1.3】Stheno 风格圆盘选择器（边缘手势呼出）
-    void MFRingPickerInstall(void);
 #endif
 
-// 纯 C 日志：所有文件（含 .mm / 非 ObjC 单元）都能用
+// ===== 【MF】跨文件 C 接口 —— 必须 extern "C" 包裹 =====
+// ⚠️ 血的教训（PullOverMF 0.1.2 / 0.1.3 连续两版整个 tweak 不加载）：
+//   PullOverX.mm 是 **ObjC++**，调用没有 extern "C" 的 C 函数时，符号会被 C++ 名字修饰：
+//   实测 dylib 的未定义符号里出现
+//       __Z9MFLogRawCPKc          (MFLogRawC(char const*))
+//       __Z19MFRingPickerInstallv (MFRingPickerInstall())
+//   而 MFDebugLog.m / MFRingPicker.m 导出的是 C 名字 _MFLogRawC / _MFRingPickerInstall
+//   → dyld 解析不到 → **dylib 加载失败** → 手柄消失、日志文件不生成、圆盘装不上。
+//   （与 MultiFloat 时期"给 Swift 调的 C 头必须 extern C"是同一个坑。）
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// 纯 C 日志：constructor 阶段唯一安全入口（零 Foundation 依赖）
 void MFLogRawC(const char *message);
+
+// Stheno 风格圆盘选择器：由 constructor 延迟调用安装
+void MFRingPickerInstall(void);
+
+#ifdef __OBJC__
+
+// 常规日志（正常运行时使用）
+void MFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
+#endif
+
+#ifdef __cplusplus
+}
+#endif
