@@ -6,6 +6,15 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.32.0 变更（第 35 轮：归档34，实时缩放 + 挂载路线 phase 1）：
+#   - ① 实时跟手缩放：Changed 中本地把承载视图对齐到内容区（50ms 节流）——
+#     活的实时内容随手指等比缩放，零 scene 写入；定格预览只作无承载兜底。
+#   - ② 快速缩放卡屏根因：过小 scene.frame（129x271）触发系统拆 scene（12s 不复活）
+#     -> MFSetSceneFrame 写入前钳最小 340pt 高（等比），窗口仍可更小（本地对齐缩画面）。
+#   - ③ Stheno 挂载路线 phase 1（无 hook，用户安全要求）：面板视图直接挂进
+#     SBStatusBarWindow（枚举获取，触点在前台 App 之上仍有效）；fail-safe 回退
+#     独立 UIWindow；配置键 embedInStatusBar=false 可关。hostWindow 放宽为 UIView。
+#
 # 0.31.0 变更（第 34 轮：归档33 崩溃修正）：
 #   - ① P7-geom 崩溃回归 + 浮窗"自己缩到最小"根因 = 0.30 对 contentArea 直接
 #     transform/anchorPoint —— 它在 autoresizing/presenter 布局链上，带非恒等

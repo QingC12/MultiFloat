@@ -1277,6 +1277,16 @@ static void MFSetSceneFrame(id scene, CGRect frame) {
     SEL upd = NSSelectorFromString(@"updateSettingsWithBlock:");
     if (![scene respondsToSelector:upd]) return;
 
+    // 【0.32.0 归档34 铁证】写入过小的 scene.frame（129x271）会让系统直接拆 scene
+    //（isValid 连续 3+ 拍 NO、自愈观察等 12s 才复活 = "快速缩放后卡屏无法点击"）。
+    // 修法：写入前把尺寸钳到最小 340pt 高（等比放大），窗口可以更小 ——
+    // 多出来的部分由本地对齐把承载视图缩进内容区（画面等比缩小，scene 活着）。
+    if (frame.size.height > 0 && frame.size.height < 340.0) {
+        CGFloat k = 340.0 / frame.size.height;
+        frame = CGRectMake(frame.origin.x, frame.origin.y,
+                           frame.size.width * k, frame.size.height * k);
+    }
+
     // 【0.11.0】能不写就不写 —— 每一次写都是"一帧黑"的潜在来源。
     //   ① 刚写过同一个值（异步窗口内，读回来还是旧的）-> 跳过；
     //   ② settings.frame 本来就是我们要的尺寸 -> 跳过。
@@ -2804,13 +2814,14 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 - (void)hostBundleID:(NSString *)bundleID;
 /// 【0.8.0】浮窗被拖拽缩放后，把 scene 的渲染尺寸同步成新的内容区尺寸（保持画面比例）
 - (void)syncContentGeometry;
+- (void)syncContentGeometryLocal;   // 【0.32.0】拖动中本地对齐承载视图（零 scene 写入，实时跟手）
 - (void)refreshAppList;
 - (void)toggleAppList;      // 【0.23.0】手势唤出：选择器 ↔ 当前承载画面
 - (void)openOrHostBundleID:(NSString *)bundleID;   // 【0.24.0】未运行先启动再承载
 @end
 
 @interface MFFloatPanel : UIViewController
-@property (nonatomic, weak) UIWindow *hostWindow;
+@property (nonatomic, weak) UIView *hostWindow;   // 【0.32.0】可为独立 UIWindow 或状态栏窗口内的容器视图
 @property (nonatomic, strong) UIView *titleBar;
 @property (nonatomic, strong) UIView *contentArea;
 @property (nonatomic, strong) UIView *statusBar;      // 【0.25.0】已隐藏（保留对象兼容旧引用）
@@ -2986,7 +2997,7 @@ static char kMFRowBundleIDKey;
 }
 
 - (void)onDrag:(UIPanGestureRecognizer *)g {
-    UIWindow *win = self.hostWindow;
+    UIView *win = self.hostWindow;
     if (win == nil) return;
     CGPoint t = [g translationInView:win];
     CGRect f = win.frame;
@@ -3071,7 +3082,7 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
-    UIWindow *win = self.hostWindow;
+    UIView *win = self.hostWindow;
     if (win == nil) return;
 
     if (g.state == UIGestureRecognizerStateBegan) {
@@ -3080,8 +3091,10 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
         gMFResizeCurW       = win.frame.size.width;
         gMFResizeTick       = 0;
         MFPreviewEnd();   // 【0.31.0】上一手势若异常结束没清预览，这里兜底
-        // 【0.31.0】拖动开始抓一帧当前画面生成独立预览视图（零布局链，Stheno _dragScale 式）
-        MFPreviewBegin((UIView *)gMFCurrentContentArea);
+        // 【0.32.0】有承载内容时走本地实时对齐（活的实时内容），预览只兜底
+        if (gMFCurrentContentView == nil) {
+            MFPreviewBegin((UIView *)gMFCurrentContentArea);
+        }
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
@@ -3160,27 +3173,34 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
              nf.origin.x, nf.origin.y);
     }
 
-    // 【0.29.0 归档31 破案】拖动期间的 scene.frame 写入会把 presenter 打成
-    // isInvalidated=1（hosting 死 → 触摸死）。Changed 期间零 scene 写入是底线。
-    // 【0.31.0】实时缩放预览：transform/anchor 只打在独立预览视图上
-    //（0.30 打在 contentArea 上 = P7-geom 崩溃回归 + "自己缩到最小"，
-    //  因为 contentArea 在 autoresizing/presenter 布局链上，带 transform 设 frame
-    //  是未定义行为；Stheno 缩的是自己独立的容器所以没事）。
+    // 【0.29.0 归档31 破案】Changed 期间零 scene 写入是底线（写 -> presenter
+    // invalidated -> hosting 死）。
+    // 【0.32.0】实时跟手：本地把承载视图 frame 对齐到内容区 —— 拉伸的是**活的
+    // 实时内容**（App 内部布局不变，画面随手指等比缩放），零 scene 写入。
+    // 0.31 的定格预览只在没有承载内容时兜底使用。
     if (g.state == UIGestureRecognizerStateChanged) {
-        if (gMFPreviewImgView != nil && gMFResizeStartFrame.size.width > 0.5) {
-            CGFloat s = newW / gMFResizeStartFrame.size.width;
-            if (s > 0.05 && s < 20.0) {
-                if (!gMFPreviewAnchorSet) {
-                    CGPoint ap = CGPointZero;
-                    switch (gMFResizeCorner) {
-                        case 11: ap = CGPointMake(1, 1); break;  // 拖左上 -> 钉右下
-                        case 12: ap = CGPointMake(0, 1); break;  // 拖右上 -> 钉左下
-                        case 13: ap = CGPointMake(1, 0); break;  // 拖左下 -> 钉右上
-                        default: ap = CGPointMake(0, 0); break;  // 拖右下 -> 钉左上
+        static NSDate *sLastLocalSync = nil;
+        NSTimeInterval now2 = [NSDate timeIntervalSinceReferenceDate];
+        if (sLastLocalSync == nil ||
+            now2 - [sLastLocalSync timeIntervalSinceReferenceDate] > 0.05) {
+            sLastLocalSync = [NSDate date];
+            if (gMFCurrentContentView != nil) {
+                [[MFFloatManager shared] syncContentGeometryLocal];
+            } else if (gMFPreviewImgView != nil && gMFResizeStartFrame.size.width > 0.5) {
+                CGFloat s = newW / gMFResizeStartFrame.size.width;
+                if (s > 0.05 && s < 20.0) {
+                    if (!gMFPreviewAnchorSet) {
+                        CGPoint ap = CGPointZero;
+                        switch (gMFResizeCorner) {
+                            case 11: ap = CGPointMake(1, 1); break;
+                            case 12: ap = CGPointMake(0, 1); break;
+                            case 13: ap = CGPointMake(1, 0); break;
+                            default: ap = CGPointMake(0, 0); break;
+                        }
+                        MFPreviewAnchorTo(gMFPreviewImgView, ap);
                     }
-                    MFPreviewAnchorTo(gMFPreviewImgView, ap);
+                    gMFPreviewImgView.transform = CGAffineTransformMakeScale(s, s);
                 }
-                gMFPreviewImgView.transform = CGAffineTransformMakeScale(s, s);
             }
         }
     }
@@ -3439,16 +3459,59 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     win.windowLevel = level;
 
     MFFloatPanel *panel = [[MFFloatPanel alloc] init];
-    panel.hostWindow = win;
-    win.rootViewController = panel;
-    win.hidden = NO;
-
-    self.window = win;
     self.panel = panel;
 
-    MFLog(@"[ui] 浮窗已显示 level=%.0f frame=%@ hidden=%d key=%d",
-         level, NSStringFromCGRect(win.frame), (int)win.isHidden, (int)win.isKeyWindow);
+    // 【0.32.0 Stheno 挂载路线 phase 1（无 hook，fail-safe）】
+    // windowLevel 提到 1099 仍不够（归档33/34：App 前台手势依旧失效）。
+    // Stheno 实证：把视图直接挂进 UIStatusBarWindow（它的触点在前台 App 之上仍有效
+    // —— 灵动岛可点即证）。独立 UIWindow 换成"状态栏窗口内的容器视图"。
+    // fail-safe：找不到状态栏窗口 / 挂载异常 -> 回退独立 UIWindow（行为同 0.31）；
+    // 配置键 embedInStatusBar=false 可整体关闭。
+    UIView *hostView = win;
+    BOOL embedded = NO;
+    if (MFConfigBool(self.config, @"embedInStatusBar", YES)) {
+        @try {
+            NSArray *wins3 = ((NSArray *(*)(id, SEL))objc_msgSend)(
+                [UIApplication sharedApplication], NSSelectorFromString(@"windows"));
+            UIWindow *sbWin = nil;
+            for (UIWindow *w in wins3) {
+                if ([NSStringFromClass([w class]) containsString:@"StatusBar"]) { sbWin = w; break; }
+            }
+            if (sbWin != nil && sbWin.bounds.size.width > 100.0) {
+                UIView *container = [[UIView alloc] initWithFrame:win.frame];
+                container.backgroundColor = [UIColor clearColor];
+                container.clipsToBounds = NO;
+                container.userInteractionEnabled = YES;
+                [sbWin addSubview:container];
+                hostView = container;
+                embedded = YES;
+                MFLog(@"[ui] ★ 浮窗已挂进 %@（Stheno UIStatusBarWindow 路线，修 App 前台手势）",
+                      NSStringFromClass([sbWin class]));
+            } else {
+                MFLogS(@"[ui] 未找到可用的状态栏窗口 -> 浮窗走独立 UIWindow（回退）");
+            }
+        } @catch (NSException *e) {
+            hostView = win;
+            embedded = NO;
+            MFLog(@"[ui] !! 状态栏挂载异常：%@ -> 回退独立 UIWindow", e);
+        }
+    }
 
+    panel.hostWindow = hostView;
+    if (embedded) {
+        win.hidden = YES;                    // 独立 UIWindow 退场（仅保留引用）
+        panel.view.frame = hostView.bounds;
+        [hostView addSubview:panel.view];
+        MFLog(@"[ui] 浮窗已显示（挂载模式）frame=%@ super=%@",
+              NSStringFromCGRect(hostView.frame), NSStringFromClass([hostView.superview class]));
+    } else {
+        win.rootViewController = panel;
+        win.hidden = NO;
+        MFLog(@"[ui] 浮窗已显示 level=%.0f frame=%@ hidden=%d key=%d",
+             level, NSStringFromCGRect(win.frame), (int)win.isHidden, (int)win.isKeyWindow);
+    }
+
+    self.window = win;
     // ---- 0.4.0：绝不在启动时自动承载 ----
     // 0.3.0 的崩循环就是因为"启动即自动承载"。现在只出外壳 + 应用列表，
     // 承载必须由用户点某一行显式触发（点之前一定先过两道闸门）。
@@ -3882,6 +3945,20 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     if (panel == nil) return;
     MFLogS(@"[ui] 浮窗尺寸变化 -> 同步 scene.frame（保持画面比例）");
     MFSyncSceneGeometry(gMFCurrentScene, gMFCurrentContentView, panel.contentArea.bounds);
+}
+
+/// 【0.32.0】拖动中的"实时跟手"：只把承载视图 frame 对齐到内容区（纯本地 view
+/// 操作，绝不写 scene.settings —— 那会把 presenter 打成 invalidated）。
+/// 活的实时内容随手指等比缩放（App 内部布局不变，画面缩放跟随）。
+- (void)syncContentGeometryLocal {
+    MFFloatPanel *panel = self.panel;
+    if (panel == nil) return;
+    UIView *area = panel.contentArea;
+    if (area == nil || area.bounds.size.width < 1.0) return;
+    if (![gMFCurrentContentView isKindOfClass:[UIView class]]) return;
+    @try {
+        ((UIView *)gMFCurrentContentView).frame = area.bounds;
+    } @catch (NSException *e) { }
 }
 
 /// 【0.23.0】手势唤出：内容区在"应用选择器 ↔ 当前承载画面"之间切换。
