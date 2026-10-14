@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.26.0";
+    return @"0.27.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -302,7 +302,7 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @20,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @21,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
@@ -648,6 +648,15 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
             up[@"defaultBundleID"] = up[@"defaultBundleID"] ?: @"";
             up[@"pickerGesture"]   = up[@"pickerGesture"]   ?: @1;
             up[@"cfgVersion"] = @20;
+        }
+
+        // ---- 0.26 -> 0.27：默认浮窗比例（Stheno 风竖长卡片，归档29 用户要求可调）----
+        if (cur < 21) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=21：defaultWidthScale / defaultHeightScale"
+                  @"（浮窗默认宽/高占屏比例，Stheno 风竖长卡片 默认 0.55 / 0.72）");
+            up[@"defaultWidthScale"]  = up[@"defaultWidthScale"]  ?: @0.55;
+            up[@"defaultHeightScale"] = up[@"defaultHeightScale"] ?: @0.72;
+            up[@"cfgVersion"] = @21;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];

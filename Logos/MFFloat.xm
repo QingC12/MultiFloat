@@ -1837,6 +1837,12 @@ static NSInteger   gMFHealthyTicks  = 0;   // 【0.19.0】连续健康拍数（�
 static void MFSnapshotPadRaise(NSDictionary *cfg) {
     if (cfg != nil && !MFConfigBool(cfg, @"keepAliveSnapshotMask", YES)) return;
     if (gMFPadView == nil || gMFPadView.superview == nil) return;
+    // 【0.27.0 归档29】缩放/拖动中频繁掉层 → 快照反复置顶盖住真实内容 =
+    // 用户看到"静态图片"。手势活跃期间：不置顶 + 立即归位，让真实渲染层直接可见。
+    if (MFUserGestureActive()) {
+        if (gMFPadRaised) MFSnapshotPadLower();
+        return;
+    }
     @try {
         UIView *area = gMFPadView.superview;
         gMFPadView.frame = area.bounds;      // 对齐内容区（autoresizing 已兜底，双保险）
@@ -2749,7 +2755,7 @@ static char kMFRowBundleIDKey;
     // 【0.23.0】Stheno 风：窗口本体完全无框 —— 透明背景、无描边，看到的只有内容圆角。
     // 标题栏/状态条退化为"透明边缘条"：不可见但可触摸（移动手柄 + 选择器手势区）。
     self.view.backgroundColor = [UIColor clearColor];
-    self.view.layer.cornerRadius = 16.0;
+    self.view.layer.cornerRadius = 24.0;   // 【0.27.0】更圆（用户反馈）
     self.view.layer.masksToBounds = YES;
 
     // 【0.25.0】Stheno 式外沿热区（一比一复刻 cardTrim/EdgeBarControlView 模型）：
@@ -2770,7 +2776,7 @@ static char kMFRowBundleIDKey;
     self.contentArea = content;
     // 【0.26.0 归档28 修复】承载后窗口没有圆角 —— 外沿 pad 出来后内容区四角
     // 不在窗口圆角处，必须给内容区自己加圆角裁切。
-    content.layer.cornerRadius = 16.0;
+    content.layer.cornerRadius = 24.0;
     content.layer.masksToBounds = YES;
 
     // ---- ↻ / ✕ 按钮：浮在内容区右上角内侧（缩小 + 低透明度，不占外沿手势区）----
@@ -3171,11 +3177,37 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
     UIWindowScene *scene = MFMainWindowScene();
     MFLog(@"[ui] windowScene=%@", scene ? NSStringFromClass([scene class]) : @"nil");
 
+    // 【0.27.0 归档29】App 前台时浮窗手势失效 —— 根因假说：前台 App 激活期间
+    // SBWindowScene inactive，其 windows 不再参与 UIApplication 的触摸路由。
+    // 修法：优先把浮窗挂到**常驻 active** 的 UIStatusBarWindow 所在 scene
+    //（Stheno 有 UIStatusBarWindowHook，同为挂常驻窗口的思路）；
+    // 探测失败回退主窗口 scene（行为同 0.26）。
+    @try {
+        id sbw = MFClassSharedInstance(@"UIStatusBarWindow");
+        UIWindowScene *sbs = MFMsg(sbw, NSSelectorFromString(@"windowScene"));
+        if (sbs != nil && sbs != scene) {
+            MFLog(@"[ui] 浮窗改挂 statusBar scene=%@（常驻 active，修 App 前台手势失效）",
+                 NSStringFromClass([sbs class]));
+            scene = sbs;
+        } else {
+            MFLogS(@"[ui] statusBar scene 不可用或与主 scene 相同 -> 浮窗仍挂主窗口 scene");
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[ui] !! statusBar scene 探测异常：%@ -> 回退主 scene", e);
+    }
+
     CGRect screen = [UIScreen mainScreen].bounds;
     // 【0.25.0】w/h 是"内容区"目标尺寸；窗口额外外扩一圈 18pt 外沿热区（Stheno cardTrim）
+    // 【0.27.0】默认比例 Stheno 化（竖长卡片 0.55 x 0.72 屏），可用配置键调整
     const CGFloat kTrimPad = 18.0;
-    CGFloat w = MAX(230.0, screen.size.width * 0.62);
-    CGFloat h = MIN(screen.size.height * 0.65, w * 1.48);
+    double wScale = 0.55, hScale = 0.72;
+    id cfgWS = self.config[@"defaultWidthScale"], cfgHS = self.config[@"defaultHeightScale"];
+    if ([cfgWS respondsToSelector:@selector(doubleValue)]) wScale = [cfgWS doubleValue];
+    if ([cfgHS respondsToSelector:@selector(doubleValue)]) hScale = [cfgHS doubleValue];
+    if (wScale < 0.3 || wScale > 0.95) wScale = 0.55;    // fail-safe：陌生值走默认
+    if (hScale < 0.3 || hScale > 0.95) hScale = 0.72;
+    CGFloat w = MAX(230.0, screen.size.width * wScale);
+    CGFloat h = MIN(screen.size.height * hScale, w * 2.0);
     w += 2 * kTrimPad;  h += 2 * kTrimPad;
     // 【0.22.0】按用户需求：浮窗默认打开在屏幕中心（原为右上角停靠）
     CGRect frame = CGRectMake((screen.size.width  - w) / 2.0,
@@ -3714,8 +3746,11 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
                                  detail:@"请手动打开一次目标 App，再双击边缘条重新选择。"];
                 return;
             }
-            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, NO);
-            MFLog(@"[ui] 启动 %@ 已发起（suspended=NO）", bundleID);
+            // 【0.27.0 归档29】suspended:YES = Stheno 分屏同款：App 后台启动**不抢前台**，
+            // 浮窗打开期间背景保持当前界面（桌面）。suspended:NO 会先全屏打开 App
+            // 再切进浮窗，且 SB 桌面不恢复渲染（背景黑、必须手动回桌面）。
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(app, launchSel, bundleID, YES);
+            MFLog(@"[ui] 启动 %@ 已发起（suspended=YES，不抢前台）", bundleID);
         } @catch (NSException *e) {
             MFLog(@"[host] !! 启动异常：%@", e);
             [self.panel showMessage:@"自动启动失败" detail:[NSString stringWithFormat:@"%@", e]];
