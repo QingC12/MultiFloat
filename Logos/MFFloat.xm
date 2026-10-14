@@ -2831,6 +2831,10 @@ static void MFInstallSDTouchOverlay(void);  // 【0.36.0】前向声明（Manage
 - (void)toggleFloatVisible;   // 【0.33.0】呼出条手势：显示/隐藏浮窗（关闭后无需 respring）
 - (void)summonPan:(UIPanGestureRecognizer *)g;   // 【0.34.0】右缘热区左滑触发
 - (void)summonDrag:(UIPanGestureRecognizer *)g;  // 【0.34.0】悬浮按钮垂直拖动
+- (void)bandPinch:(UIPanGestureRecognizer *)g;   // 【0.39.0】拾取带两指缩放
+- (CGRect)floatFrame;                            // 【0.39.0】浮窗当前 frame
+- (void)moveFloatByTranslation:(CGPoint)t;       // 【0.39.0】移动浮窗（带钳制）
+- (void)resizeFloatToWidth:(CGFloat)w;           // 【0.39.0】等比缩放浮窗（中心锚）
 // 【0.37.0】半圆弧选择器（右缘左滑呼出；App 可自定义）
 - (void)toggleArcPicker;
 - (void)onPickerIconTapped:(UIButton *)b;
@@ -3411,6 +3415,10 @@ static CGFloat   gMFPickerCY = 0.0;           // 当前弧心高度
 static UIView   *gMFPickerRoot = nil;
 static const CGFloat kMFPickerIconSize = 44.0;   // 【0.38.0】图标缩小（原 58）
 static const CGFloat kMFPickerRadius   = 152.0;
+// 【0.39.0】右缘"拾取带"手势状态：0=未定 1=选择器 2=移动浮窗
+static NSInteger gMFBandMode = 0;
+static CGFloat   gMFBandStartY = 0.0;       // 手势起点（屏幕 y，备用）
+static CGFloat   gMFBandPinchBaseW = 0.0;   // 两指缩放基准宽度
 
 /// App 图标（SpringBoard 私有 API；取不到返回 nil -> 用首字母兜底）
 static UIImage *MFAppIconImage(NSString *bid) {
@@ -3489,23 +3497,110 @@ static void MFPickerHide(void) {
 }
 
 - (void)summonPan:(UIPanGestureRecognizer *)g {
-    // 【0.38.0】右缘局部热区：手势滑出圆弧选择器 —— 弧随手指滑动，
-    // 松手时手指停在哪就打开哪个 App；停在空白 = 关闭（用户指定交互）。
+    // 【0.39.0】右缘"拾取带"状态机（用户指定 + 归档38 实证：屏幕边缘区域在前台 App 上仍能收触摸）：
+    //   ① 带内竖向/斜向拖动  -> 直接移动浮窗（前台 App 也有效）
+    //   ② 带内明显向左滑 >30pt -> 呼出圆弧选择器（弧心固定在屏幕垂直中心，只让高亮跟手指）
+    // 手指按下时不立刻决定，等位移够了再分流（避免"想移动却弹出选择器"）。
     CGPoint p = [g.view.window convertPoint:[g locationInView:nil] toWindow:nil];   // -> 屏幕坐标
     CGPoint t = [g translationInView:g.view];
     if (g.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[arc] 手势呼出 来源=%@(tag=%ld) 起点=(%.0f,%.0f)",
+        gMFBandMode = 0;
+        gMFBandStartY = p.y;
+        MFLog(@"[band] 按下 来源=%@(tag=%ld) 起点=(%.0f,%.0f)",
               NSStringFromClass([g.view.window class]), (long)g.view.tag, p.x, p.y);
-        gMFPickerGestureMode = YES;
-        [self arcPickerShowAtY:p.y gesture:YES];
     } else if (g.state == UIGestureRecognizerStateChanged) {
-        [self arcPickerUpdateAtY:p.y finger:p];
-    } else if (g.state == UIGestureRecognizerStateEnded
-            || g.state == UIGestureRecognizerStateCancelled) {
-        if (gMFPickerGestureMode) {
-            [self arcPickerCommitWithTranslation:t];
+        if (gMFBandMode == 0) {
+            if (t.x < -30.0 && fabs(t.x) > fabs(t.y)) {
+                gMFBandMode = 1;   // 选择器
+                MFLogS(@"[band] 判定=呼出圆弧选择器（弧心固定屏幕中心）");
+                gMFPickerGestureMode = YES;
+                [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
+            } else if (fabs(t.y) > 6.0 || fabs(t.x) > 6.0) {
+                gMFBandMode = 2;   // 移动浮窗
+                MFLogS(@"[band] 判定=移动浮窗（前台 App 也走这条）");
+            } else {
+                return;
+            }
         }
+        if (gMFBandMode == 1) {
+            [self arcPickerUpdateAtY:gMFPickerCY finger:p];   // 弧固定，只更新高亮
+        } else if (gMFBandMode == 2) {
+            [self moveFloatByTranslation:t];
+            [g setTranslation:CGPointZero inView:g.view];
+        }
+        return;
     }
+    // Ended / Cancelled
+    if (gMFBandMode == 1) {
+        [self arcPickerCommitWithTranslation:t];
+    } else if (gMFBandMode == 2) {
+        [self syncContentGeometry];   // 移动结束：几何再对一次（尺寸未变，安全）
+        MFLogS(@"[band] 移动结束（几何同步）");
+    } else {
+        MFLogS(@"[band] 松手（未产生位移）");
+    }
+    gMFBandMode = 0;
+}
+
+/// 【0.39.0】两指竖向拖动 = 以中心为锚等比缩放浮窗（前台 App 也有效）
+- (void)bandPinch:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:g.view];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        gMFBandPinchBaseW = 0.0;
+        MFLog(@"[band] 两指按下 来源=%@(tag=%ld)", NSStringFromClass([g.view.window class]), (long)g.view.tag);
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGRect f = [self floatFrame];
+        if (f.size.width < 10.0) return;
+        if (gMFBandPinchBaseW <= 0.0) gMFBandPinchBaseW = f.size.width;
+        CGFloat scale = 1.0 + t.y / 320.0;         // 竖向拖动换算缩放（向下=放大）
+        scale = MIN(MAX(scale, 0.45), 3.0);
+        [self resizeFloatToWidth:gMFBandPinchBaseW * scale];
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        gMFBandPinchBaseW = 0.0;
+        [self syncContentGeometry];
+        MFLogS(@"[band] 两指缩放结束 -> 同步 scene.frame");
+    }
+}
+
+// ===== 【0.39.0】浮窗几何操作（供右缘拾取带调用；含边界钳制） =====
+- (CGRect)floatFrame {
+    UIView *host = self.panel.hostWindow ?: self.window;
+    return host != nil ? host.frame : CGRectZero;
+}
+
+- (void)moveFloatByTranslation:(CGPoint)t {
+    UIView *host = self.panel.hostWindow ?: self.window;
+    if (host == nil) return;
+    CGRect scr = [UIScreen mainScreen].bounds;
+    CGRect f = host.frame;
+    f.origin.x += t.x;
+    f.origin.y += t.y;
+    f.origin.x = MIN(MAX(f.origin.x, 0.0), MAX(scr.size.width  - f.size.width,  0.0));
+    f.origin.y = MIN(MAX(f.origin.y, 0.0), MAX(scr.size.height - f.size.height, 0.0));
+    host.frame = f;
+}
+
+/// 以当前中心为锚，把浮窗宽度改成 w（高度按原比例），并实时把承载内容对齐
+- (void)resizeFloatToWidth:(CGFloat)w {
+    UIView *host = self.panel.hostWindow ?: self.window;
+    if (host == nil) return;
+    CGRect scr = [UIScreen mainScreen].bounds;
+    CGRect f = host.frame;
+    if (f.size.width < 10.0) return;
+    CGFloat ar = f.size.height / f.size.width;
+    CGFloat nw = MIN(MAX(w, 200.0), scr.size.width - 40.0);
+    CGFloat nh = nw * ar;
+    if (nh > scr.size.height - 40.0) {
+        nh = scr.size.height - 40.0;
+        nw = nh / MAX(ar, 0.01);
+    }
+    CGPoint c = CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f));
+    host.frame = CGRectMake(c.x - nw / 2.0, c.y - nh / 2.0, nw, nh);
+    [[MFFloatManager shared] syncContentGeometryLocal];   // 本地实时对齐（零 scene 写入）
 }
 
 - (void)summonDrag:(UIPanGestureRecognizer *)g {
@@ -3626,13 +3721,11 @@ static void MFPickerHide(void) {
     }
 }
 
-/// 弧随手指（手势模式）：重排图标 + 高亮离手指最近的那个
+/// 【0.39.0】弧"固定位置"（用户要求）：不再随手指移动，只更新高亮
 - (void)arcPickerUpdateAtY:(CGFloat)cy finger:(CGPoint)p {
     if (!gMFPickerVisible || gMFPickerIcons == nil) {
         [self arcPickerShowAtY:cy gesture:YES];
         if (!gMFPickerVisible) return;
-    } else {
-        [self arcPickerLayoutAtY:cy];
     }
     UIButton *best = nil;
     CGFloat bestD = 88.0;   // 命中半径
@@ -4714,7 +4807,7 @@ static void MFInstallSummonGesture(void) {
         if (sw == nil) { MFScheduleSummonRetry(); return; }
         // 【0.38.0】窗口缩到"局部热区"：不再是整条右边缘（用户要求）；
         // 位置 = 右缘垂直中间，尺寸 88 x 200（按钮 + 滑选热区都在里面）
-        const CGFloat kZoneW = 88.0, kZoneH = 200.0;
+        const CGFloat kZoneW = 96.0, kZoneH = 320.0;
         CGFloat zoneX = W - kZoneW;
         CGFloat zoneY = (H - kZoneH) / 2.0;
         sw.frame = CGRectMake(zoneX, zoneY, kZoneW, kZoneH);
@@ -4726,14 +4819,22 @@ static void MFInstallSummonGesture(void) {
         sw.userInteractionEnabled = YES;
         sw.hidden = NO;
 
-        // 滑选热区：只在右边缘中段 40x140（局部），透明不挡视线 —— 手势滑出圆弧选择器
-        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 40.0, 30.0, 40.0, 140.0)];
+        // 滑选/拾取带：右边缘中段 56x300（局部），透明不挡视线
+        //   单指：竖向拖动=移动浮窗；明显向左滑=呼出圆弧选择器
+        //   两指：竖向拖动=等比缩放浮窗（前台 App 也走这条路）
+        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 56.0, 0.0, 56.0, 300.0)];
         strip.backgroundColor = [UIColor clearColor];
         strip.userInteractionEnabled = YES;
         strip.tag = 990040;
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
             initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
+        pan.maximumNumberOfTouches = 1;
         [strip addGestureRecognizer:pan];
+        UIPanGestureRecognizer *pinch = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(bandPinch:)];
+        pinch.minimumNumberOfTouches = 2;
+        pinch.maximumNumberOfTouches = 2;
+        [strip addGestureRecognizer:pinch];
         [sw addSubview:strip];
 
         // 悬浮按钮：半透明圆形 "▦"（点=显隐浮窗；长按=圆弧选择器；上下拖=整个热区窗口跟随移动）
@@ -4887,14 +4988,21 @@ static void MFInstallSDTouchOverlay(void) {
             [arr addObject:v];
         }
         // 右缘呼出热区（与独立窗口里那条互为备份；tag 990042 用于日志区分来源）
-        // 【0.38.0】与独立窗口一致：右缘中段"局部"热区（不再是整条右边缘）
+        // 【0.39.0】与独立窗口一致的右缘"拾取带"：56x300，屏幕右缘垂直中段
         CGFloat sbW = sb.bounds.size.width, sbH = sb.bounds.size.height;
-        CGRect zone = CGRectMake(sbW - 40.0, (sbH - 200.0) / 2.0 + 30.0, 40.0, 140.0);
+        CGRect zone = CGRectMake(sbW - 56.0, (sbH - 300.0) / 2.0, 56.0, 300.0);
         UIView *strip = [[UIView alloc] initWithFrame:zone];
         strip.backgroundColor = [UIColor clearColor];
         strip.tag = 990042;
-        [strip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
-                                                                        action:@selector(summonPan:)]];
+        UIPanGestureRecognizer *mPan = [[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                             action:@selector(summonPan:)];
+        mPan.maximumNumberOfTouches = 1;
+        [strip addGestureRecognizer:mPan];
+        UIPanGestureRecognizer *mPinch = [[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                               action:@selector(bandPinch:)];
+        mPinch.minimumNumberOfTouches = 2;
+        mPinch.maximumNumberOfTouches = 2;
+        [strip addGestureRecognizer:mPinch];
         [sb addSubview:strip];
         gMFOverlayStrip = strip;
 
