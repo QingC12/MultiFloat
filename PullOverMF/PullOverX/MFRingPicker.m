@@ -15,29 +15,36 @@
 //      并在 SBGrabberTongue 上处理 _handlePullGesture:（下拉）—— 所以它在**任何界面**（含全屏 App）都能触发。
 //      配置项：EBCI(触发边, 可调节) / AppearEdge / EdgeBarControlView / EgdeGestureView / EdgeGestureShape。
 //
-//  本实现（第一阶段，零 hook，确保不卡开机）：
-//    · 圆盘：贴边半圆盘（圆心在屏幕边缘中点），图标沿弧排布，点图标→浮窗打开该 App；
-//    · 呼出：屏幕边缘一条透明触发区，**向内滑动 / 向下滑动 / 单击**都能呼出；
-//    · 可自定义：配置键 ringApps（bundleID 数组），未配置时用最近使用的 App；
-//      圆盘内长按图标即可移出（写回配置，立即生效）。
-//    · 全程 MFLog 记录（含触摸来源窗口类名），用来验证「前台 App 上边缘区能否收到触摸」——
-//      若日志证实收不到，下一步再照 Stheno 加**单个**系统手势 hook（用户已授权：前期不要多个 hook）。
+//  本实现（零 hook，确保不卡开机）：
+//    · 圆盘：完整圆形，图标沿整圈排布；可自定义 App（配置键 ringApps）。
+//    · 呼出：**只保留手势**——屏幕边缘一条透明触发区，向内滑动 >阈值 即呼出。
+//    · 交互（0.1.6 重做，用户指定）：
+//        ① 手势呼出后圆盘**跟随手指**移动；
+//        ② 手指停住 / 靠近停靠点 → 圆盘**固定到屏幕下半屏中心**（不再是屏幕正中心）；
+//        ③ 手指自由滑动 → 高亮离手指最近的图标（悬停选择）；
+//        ④ **手指离开屏幕** → 自动收起圆盘；若已选中 App → 立即以浮窗打开。
+//    · 全程 MFLog 记录（含触摸来源窗口类名、悬停选中变化、固定时刻）。
 //
 //  配置项（suite com.mlgm.pulloverx，改完 respring 生效）：
-//    mfRingEnabled     BOOL   是否启用圆盘（默认 YES）
-//    mfTriggerEdge     string 触发边：right(默认) / left / top / bottom
-//    mfTriggerLength   number 触发区长度（默认 380）
+//    mfRingEnabled      BOOL   是否启用圆盘（默认 YES）
+//    mfTriggerEdge      string 触发边：right(默认) / left / top / bottom
+//    mfTriggerLength    number 触发区长度（默认 380）
 //    mfTriggerThickness number 触发区厚度（默认 56）
-//    mfRingRadius      number 圆盘半径（默认 150）
-//    mfRingIconSize    number 图标尺寸（默认 44；0.1.5 起从 56 缩小）
-//    mfRingEdgeMargin  number 圆盘外沿距屏幕边的间距（默认 12；圆心会内缩 radius+margin 保证整圆可见）
-//    mfRingRotation    number 图标整体旋转角，度（默认 0）
-//    mfRingStartAngle  number 第一个图标的角度，度（默认 -90 = 正上方）
-//    mfRingMaxIcons    number 未配置时最多显示几个（默认 8）
-//    ringApps          array  bundleID 数组（自定义圆盘内容）
+//    mfTriggerCenterRatio number 触发区中心位置 0~1（默认 0.78 = 屏幕偏下）
+//    mfRingSummonThreshold number 手势呼出阈值，pt（默认 18）
+//    mfRingRadius       number 圆盘半径（默认 150）
+//    mfRingIconSize     number 图标尺寸（默认 44；0.1.5 起从 56 缩小）
+//    mfRingEdgeMargin   number 圆盘外沿距屏幕边的间距（默认 12）
+//    mfRingRotation     number 图标整体旋转角，度（默认 0）
+//    mfRingStartAngle   number 第一个图标的角度，度（默认 -90 = 正上方）
+//    mfRingParkRatioY   number 停靠点纵向比例（默认 0.72 = 下半屏中心）
+//    mfRingLatchTolerance number 手指靠近停靠点多少 pt 即固定（默认 72）
+//    mfRingSettleDelay  number 手指停住多久自动固定，秒（默认 0.18）
+//    mfRingMaxIcons     number 未配置时最多显示几个（默认 8）
+//    ringApps           array  bundleID 数组（自定义圆盘内容）
 //
-//  版本备注：0.1.4 及以前圆心放在**屏幕边缘** → 圆有一半在屏幕外（用户反馈"只有半圆显示"）；
-//  0.1.5 起圆心内缩（screenWidth - radius - edgeMargin），**整圆完整显示在屏幕内**，图标绕整圈排布。
+//  版本备注：0.1.4 及以前圆心放在屏幕边缘 → 圆一半在屏幕外；0.1.5 圆心内缩让整圆可见；
+//  0.1.6 交互重做（本文件）：去掉「点击触发区呼出」，改为手势呼出 + 跟随手指 + 停靠下半屏中心 + 悬停选择 + 松手即开。
 //
 
 #import <UIKit/UIKit.h>
@@ -139,16 +146,30 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
 
 @interface MFRingPicker : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) MFRingWindow *window;
-@property (nonatomic, strong) UIView *container;        // 展开态的根视图（含遮罩 + 圆盘）
-@property (nonatomic, strong) CAShapeLayer *dialLayer;  // 半圆盘背景
+@property (nonatomic, strong) UIView *triggerView;          // 贴边透明触发区（收起态）
+@property (nonatomic, strong) UIPanGestureRecognizer *triggerPan;
+@property (nonatomic, strong) UIView *container;            // 展开态根视图（轻遮罩 + 圆盘）
+@property (nonatomic, strong) UIView *ringRoot;             // 圆盘整体（移动它 = 移动圆盘）
+@property (nonatomic, strong) CAShapeLayer *dialLayer;      // 圆形底盘
 @property (nonatomic, strong) NSMutableArray<UIButton *> *iconButtons;
 @property (nonatomic, assign) BOOL expanded;
-@property (nonatomic, assign) CGPoint dialCenter;
+@property (nonatomic, assign) BOOL ringLatched;             // 圆盘是否已固定在停靠点
+@property (nonatomic, assign) CGPoint parkCenter;           // 停靠点（屏幕下半屏中心）
+@property (nonatomic, weak) UIButton *selectedButton;       // 悬停选中的图标
+@property (nonatomic, assign) CGPoint lastFingerPoint;      // 最近一次手指屏幕坐标
+@property (nonatomic, assign) CGPoint latchFingerPoint;     // 固定那一刻的手指坐标
+@property (nonatomic, assign) BOOL hasLatchFinger;          // 是否已记录固定时的手指位置
+@property (nonatomic, assign) NSUInteger settleGeneration;  // 手指停住计时器代次
 + (instancetype)shared;
 - (void)install;
-- (void)show;
+- (void)showAtPoint:(CGPoint)point;
+- (void)showRingWithAnchor:(CGPoint)point latch:(BOOL)latch;
+- (void)moveRingToPoint:(CGPoint)point;
+- (void)latchToParkAnimated:(BOOL)animated;
+- (void)buildRingInContainer:(UIView *)container;
+- (void)updateSelectionForPoint:(CGPoint)point;
+- (void)openFloatWithBundleId:(NSString *)bundleId;
 - (void)hide;
-- (void)toggle;
 @end
 
 @implementation MFRingPicker
@@ -207,7 +228,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         self.window = window;
         self.iconButtons = [NSMutableArray array];
 
-        // ---- 收起态：屏幕边缘一条透明触发区 ----
+        // ---- 收起态：屏幕边缘一条透明触发区（**只挂 pan，不挂 tap** —— 0.1.6 起只保留手势呼出）----
         CGRect trigger = [self triggerFrameForScreen:screen];
         window.frame = trigger;
 
@@ -216,19 +237,15 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         triggerView.userInteractionEnabled = YES;
         triggerView.tag = 991001;
         [window addSubview:triggerView];
+        self.triggerView = triggerView;
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                             action:@selector(onTriggerPan:)];
+                                                                            action:@selector(onTriggerPan:)];
         pan.delegate = self;
         [triggerView addGestureRecognizer:pan];
+        self.triggerPan = pan;
 
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                             action:@selector(onTriggerTap:)];
-        tap.delegate = self;
-        [triggerView addGestureRecognizer:tap];
-        [tap requireGestureRecognizerToFail:pan];
-
-        MFLog(@"[ring] 圆盘选择器已安装：触发边=%@，触发区=%@，窗口 scene=%@",
+        MFLog(@"[ring] 圆盘选择器已安装（仅手势呼出）：触发边=%@，触发区=%@，窗口 scene=%@",
               MFRingEdge(), NSStringFromCGRect(trigger),
               scene != nil ? NSStringFromClass([scene class]) : @"nil(回退 frame)");
     } @catch (NSException *exception) {
@@ -257,50 +274,105 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     return CGRectMake(width - thickness, originY, thickness, length);   // right（默认）
 }
 
-#pragma mark 触发
+#pragma mark 坐标辅助
 
-- (void)onTriggerTap:(UITapGestureRecognizer *)gesture {
-    MFLog(@"[ring] 触发区单击 -> 呼出圆盘");
-    [self show];
+/// 手指在**屏幕**坐标系里的位置。
+/// 收起态窗口 frame = 触发区（原点非 0），展开态窗口 frame = 全屏（原点 0,0），
+/// 所以统一用 "窗口 frame 原点 + 窗口内坐标" 换算，两种状态都正确。
+- (CGPoint)screenPointForGesture:(UIGestureRecognizer *)gesture {
+    if (self.window == nil) {
+        return CGPointZero;
+    }
+    CGPoint inWindow = [gesture locationInView:self.window];
+    CGRect frame = self.window.frame;
+    return CGPointMake(frame.origin.x + inWindow.x, frame.origin.y + inWindow.y);
 }
 
+/// 把圆心夹到合法范围：整圆不出屏，且**只在下半屏**
+- (CGPoint)clampRingCenter:(CGPoint)point {
+    CGRect screen = [UIScreen mainScreen].bounds;
+    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
+    CGFloat margin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
+    CGFloat extent = radius + margin;
+    CGFloat minX = extent;
+    CGFloat maxX = MAX(CGRectGetMaxX(screen) - extent, minX);
+    CGFloat minY = CGRectGetMidY(screen);                       // 下半屏
+    CGFloat maxY = MAX(CGRectGetMaxY(screen) - extent, minY);
+    CGFloat x = MIN(MAX(point.x, minX), maxX);
+    CGFloat y = MIN(MAX(point.y, minY), maxY);
+    return CGPointMake(x, y);
+}
+
+#pragma mark 触发（仅手势）
+
 - (void)onTriggerPan:(UIPanGestureRecognizer *)gesture {
-    UIView *view = gesture.view;
-    if (view == nil) {
+    if (gesture.view == nil) {
         return;
     }
+    CGPoint finger = [self screenPointForGesture:gesture];
+    self.lastFingerPoint = finger;
+
     if (gesture.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[ring] 触发区按下 来源=%@(tag=%ld)",
-              NSStringFromClass([view.window class]), (long)view.tag);
+        MFLog(@"[ring] 贴边按下 来源=%@(tag=%ld) 屏幕(%.0f,%.0f)",
+              NSStringFromClass([gesture.view.window class]), (long)gesture.view.tag, finger.x, finger.y);
         return;
     }
+
     if (gesture.state == UIGestureRecognizerStateChanged) {
-        CGPoint translation = [gesture translationInView:view];
-        MFLog(@"[ring] 触发区滑动 dx=%.0f dy=%.0f", translation.x, translation.y);
-        // 任意方向滑出 18pt 即呼出（Stheno 是"边缘下拉"，这里放宽为"边缘滑动")
-        if (fabs(translation.x) > 18.0 || fabs(translation.y) > 18.0) {
-            [self show];
+        if (!self.expanded) {
+            CGPoint translation = [gesture translationInView:gesture.view];
+            CGFloat threshold = MAX(6.0, MFRingNumber(@"mfRingSummonThreshold", 18.0));
+            if (fabs(translation.x) > threshold || fabs(translation.y) > threshold) {
+                [self showAtPoint:finger];
+            }
+            return;
+        }
+
+        if (!self.ringLatched) {
+            [self moveRingToPoint:finger];
+            CGFloat tolerance = MAX(12.0, MFRingNumber(@"mfRingLatchTolerance", 72.0));
+            if (hypot(finger.x - self.parkCenter.x, finger.y - self.parkCenter.y) <= tolerance) {
+                [self latchToParkAnimated:YES];
+            } else {
+                [self scheduleSettle];
+            }
+        }
+        [self updateSelectionForPoint:finger];
+        return;
+    }
+
+    if (gesture.state == UIGestureRecognizerStateEnded ||
+        gesture.state == UIGestureRecognizerStateCancelled ||
+        gesture.state == UIGestureRecognizerStateFailed) {
+        if (!self.expanded) {
+            MFLog(@"[ring] 贴边松手（未达到呼出阈值，不呼出）");
+            return;
+        }
+        [self updateSelectionForPoint:finger];
+        UIButton *selected = self.selectedButton;
+        NSString *bundleId = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
+        if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
+            MFLog(@"[ring] 手指离开屏幕 -> 打开 %@ 浮窗", bundleId);
+            [self hide];
+            [self openFloatWithBundleId:bundleId];
+        } else {
+            MFLog(@"[ring] 手指离开屏幕 -> 未选中，收起圆盘");
+            [self hide];
         }
         return;
-    }
-    if (gesture.state == UIGestureRecognizerStateEnded) {
-        MFLog(@"[ring] 触发区松手（未达到阈值）");
     }
 }
 
 #pragma mark 展开 / 收起
 
-- (void)toggle {
-    if (self.expanded) {
-        [self hide];
-    } else {
-        [self show];
-    }
+- (void)showAtPoint:(CGPoint)point {
+    [self showRingWithAnchor:point latch:NO];
 }
 
-- (void)show {
+/// 展开圆盘。anchor = 圆盘初始圆心（= 手指位置）；latch = 是否立即固定到停靠点
+- (void)showRingWithAnchor:(CGPoint)point latch:(BOOL)latch {
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self show]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self showRingWithAnchor:point latch:latch]; });
         return;
     }
     if (self.window == nil) {
@@ -310,9 +382,16 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     if (self.expanded) {
         return;
     }
+    CGRect screen = [UIScreen mainScreen].bounds;
+    if (CGRectIsEmpty(screen)) {
+        return;
+    }
     @try {
-        CGRect screen = [UIScreen mainScreen].bounds;
         self.expanded = YES;
+        self.ringLatched = NO;
+        self.selectedButton = nil;
+        self.hasLatchFinger = NO;
+        self.settleGeneration += 1;
         self.window.frame = screen;
 
         UIView *container = [[UIView alloc] initWithFrame:self.window.bounds];
@@ -323,16 +402,29 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         [self.window addSubview:container];
         self.container = container;
 
-        [self layoutDialInContainer:container];
+        // 停靠点 = 屏幕下半屏中心（用户 0.1.6 指定，不再用屏幕正中心）
+        CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.72), 0.5), 0.92);
+        self.parkCenter = [self clampRingCenter:CGPointMake(CGRectGetMidX(screen),
+                                                            CGRectGetHeight(screen) * ratio)];
+
+        [self buildRingInContainer:container];
+
+        CGPoint anchor = [self clampRingCenter:point];
+        self.ringRoot.center = anchor;
 
         container.alpha = 0.0;
-        [UIView animateWithDuration:0.18 animations:^{
+        [UIView animateWithDuration:0.15 animations:^{
             container.alpha = 1.0;
         }];
 
-        MFLog(@"[ring] 圆盘已展开：%@ 个 App（完整圆，半径 %.0f，图标 %.0f，边=%@）",
-              @([self.iconButtons count]), MFRingNumber(@"mfRingRadius", 150.0),
-              MFRingNumber(@"mfRingIconSize", 44.0), MFRingEdge());
+        MFLog(@"[ring] 手势呼出圆盘：跟随手指起点(%.0f,%.0f) -> 停靠点(%.0f,%.0f) | %lu 个 App 半径 %.0f 图标 %.0f",
+              anchor.x, anchor.y, self.parkCenter.x, self.parkCenter.y,
+              (unsigned long)self.iconButtons.count,
+              MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0)),
+              MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0)));
+        if (latch) {
+            [self latchToParkAnimated:NO];
+        }
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 展开异常：%@", exception);
         [self hide];
@@ -346,14 +438,18 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     UIView *container = self.container;
     self.container = nil;
     self.dialLayer = nil;
+    self.ringRoot = nil;
+    self.selectedButton = nil;
+    self.ringLatched = NO;
+    self.hasLatchFinger = NO;
+    self.settleGeneration += 1;
     self.expanded = NO;
     [self.iconButtons removeAllObjects];
 
     void (^finish)(void) = ^{
         [container removeFromSuperview];
         if (self.window != nil) {
-            CGRect screen = [UIScreen mainScreen].bounds;
-            self.window.frame = [self triggerFrameForScreen:screen];
+            self.window.frame = [self triggerFrameForScreen:[UIScreen mainScreen].bounds];
         }
     };
     if (container == nil) {
@@ -365,7 +461,7 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     } completion:^(__unused BOOL finished) {
         finish();
     }];
-    MFLog(@"[ring] 圆盘已收起（触发区恢复）");
+    MFLog(@"[ring] 圆盘已收起（贴边手势恢复）");
 }
 
 - (void)onBackdropTap:(UITapGestureRecognizer *)gesture {
@@ -373,38 +469,85 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     [self hide];
 }
 
-#pragma mark 圆盘绘制
+#pragma mark 跟随 / 停靠
 
-- (void)layoutDialInContainer:(UIView *)container {
-    CGRect bounds = container.bounds;
-    CGFloat screenWidth = CGRectGetWidth(bounds);
-    CGFloat screenHeight = CGRectGetHeight(bounds);
+- (void)moveRingToPoint:(CGPoint)point {
+    if (self.ringRoot == nil) {
+        return;
+    }
+    CGPoint center = [self clampRingCenter:point];
+    self.ringRoot.center = center;
+}
+
+/// 手指停住一小会儿就把圆盘固定到停靠点（用户自然会在停靠点附近有个停顿）
+- (void)scheduleSettle {
+    self.settleGeneration += 1;
+    NSUInteger generation = self.settleGeneration;
+    NSTimeInterval delay = MAX(0.05, MFRingNumber(@"mfRingSettleDelay", 0.18));
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != self.settleGeneration) {
+            return;
+        }
+        if (!self.expanded || self.ringLatched) {
+            return;
+        }
+        [self latchToParkAnimated:YES];
+    });
+}
+
+/// 固定到下半屏中心 —— 之后手指滑动只改变"选中"，圆盘不再跟着动
+- (void)latchToParkAnimated:(BOOL)animated {
+    if (self.ringRoot == nil || self.ringLatched) {
+        return;
+    }
+    self.ringLatched = YES;
+    self.settleGeneration += 1;
+    // 记录"固定那一刻手指在哪"：手指还没动之前不产生选中，避免刚停靠就误开某个 App
+    self.latchFingerPoint = self.lastFingerPoint;
+    self.hasLatchFinger = YES;
+    CGPoint park = self.parkCenter;
+    if (animated) {
+        [UIView animateWithDuration:0.16
+                              delay:0.0
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState)
+                         animations:^{
+            self.ringRoot.center = park;
+        } completion:nil];
+    } else {
+        self.ringRoot.center = park;
+    }
+    MFLog(@"[ring] 圆盘已固定到下半屏中心 (%.0f, %.0f) —— 滑动到图标上选择，松手即打开", park.x, park.y);
+}
+
+#pragma mark 圆盘构建
+
+- (void)buildRingInContainer:(UIView *)container {
     CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
-    // 【0.1.5】图标默认缩小：56 -> 44（用户反馈图标偏大）
     CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
     CGFloat rotation = MFRingNumber(@"mfRingRotation", 0.0);
-    CGFloat edgeMargin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
-    BOOL fromRight = ![MFRingEdge() isEqualToString:@"left"];
+    CGFloat extent = radius + iconSize * 0.5 + 10.0;   // 圆盘视图半边长（含图标外沿余量）
 
-    // 【0.1.5 修复】圆心必须**移进屏幕内**，否则整圆有一半在屏幕外（0.1.4 就是这个问题）。
-    //   圆心 x = 屏幕内缩 (半径 + 边距) -> 圆的外沿距屏幕边 edgeMargin，整圆完整可见。
-    CGFloat centerX = fromRight ? (screenWidth - edgeMargin - radius) : (edgeMargin + radius);
-    CGPoint center = CGPointMake(centerX, screenHeight / 2.0);
-    self.dialCenter = center;
+    // 圆盘整体放在一个固定尺寸的容器里 —— 移动圆盘 = 改 ringRoot.center
+    UIView *ringRoot = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, extent * 2.0, extent * 2.0)];
+    ringRoot.backgroundColor = [UIColor clearColor];
+    ringRoot.userInteractionEnabled = YES;
+    ringRoot.tag = 991002;
+    [container addSubview:ringRoot];
+    self.ringRoot = ringRoot;
 
-    // 完整圆形背景（不再是半圆）
+    // 完整圆形底盘（0.1.4 及以前是半圆；0.1.5 起整圆）
     UIBezierPath *path = [UIBezierPath bezierPathWithOvalInRect:
-                          CGRectMake(center.x - radius, center.y - radius, radius * 2.0, radius * 2.0)];
-
+                          CGRectMake(extent - radius, extent - radius, radius * 2.0, radius * 2.0)];
     CAShapeLayer *dial = [CAShapeLayer layer];
     dial.path = path.CGPath;
     dial.fillColor = [UIColor colorWithWhite:0.12 alpha:0.55].CGColor;
     dial.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
     dial.lineWidth = 1.0;
-    [container.layer addSublayer:dial];
+    [ringRoot.layer addSublayer:dial];
     self.dialLayer = dial;
 
-    // 图标沿弧排布（半圆内圈，留出半径余量）
     NSArray<NSString *> *bundleIds = MFRingBundleIds();
     NSUInteger count = bundleIds.count;
     if (count == 0) {
@@ -414,14 +557,15 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         hint.text = @"圆盘里还没有 App\n编辑 com.mlgm.pulloverx.plist 的 ringApps（bundleID 数组）即可添加";
         hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
         hint.font = [UIFont systemFontOfSize:12.0];
-        hint.center = center;
-        [container addSubview:hint];
+        hint.center = CGPointMake(extent, extent);
+        [ringRoot addSubview:hint];
         return;
     }
 
-    // 图标放在圆内侧一圈（外沿贴近圆周，不越出圆盘）
+    // 图标放在圆周内侧一圈
     CGFloat iconRadius = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
     CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);   // 默认从正上方开始
+    CGPoint localCenter = CGPointMake(extent, extent);
     for (NSUInteger index = 0; index < count; index++) {
         NSString *bundleId = bundleIds[index];
         UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -440,7 +584,8 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
             [button setImage:icon forState:UIControlStateNormal];
             button.imageView.contentMode = UIViewContentModeScaleAspectFill;
         } else {
-            NSString *initial = (bundleId.length > 0) ? [[bundleId lastPathComponent] substringToIndex:1].uppercaseString : @"?";
+            NSString *initial = (bundleId.length > 0)
+                ? [[bundleId lastPathComponent] substringToIndex:1].uppercaseString : @"?";
             [button setTitle:initial forState:UIControlStateNormal];
             [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             button.titleLabel.font = [UIFont boldSystemFontOfSize:iconSize * 0.4];
@@ -453,26 +598,88 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
         longPress.minimumPressDuration = 0.5;
         [button addGestureRecognizer:longPress];
 
-        // 【0.1.5】沿**整圈**均匀铺开（圆已完整显示，图标绕整圈排布）。
-        // 0.1.3/0.1.4 是半圆排布（那个版本圆心在屏幕边缘）。
+        // 沿整圈均匀铺开
         CGFloat angleDegrees = startAngle
             + 360.0 * (CGFloat)index / (CGFloat)MAX((NSUInteger)1, count)
             + rotation;
         CGFloat angle = angleDegrees * M_PI / 180.0;
-        CGFloat x = center.x + iconRadius * cos(angle);
-        CGFloat y = center.y + iconRadius * sin(angle);
-        button.center = CGPointMake(x, y);
+        button.center = CGPointMake(localCenter.x + iconRadius * cos(angle),
+                                   localCenter.y + iconRadius * sin(angle));
 
-        [container addSubview:button];
+        [ringRoot addSubview:button];
         [self.iconButtons addObject:button];
     }
+}
+
+#pragma mark 悬停选择
+
+- (void)updateSelectionForPoint:(CGPoint)point {
+    UIView *container = self.container;
+    if (container == nil || self.iconButtons.count == 0) {
+        return;
+    }
+    // 刚固定时手指还停在原地 —— 必须真的滑动一下才算"选择"（防误开）
+    if (self.hasLatchFinger &&
+        hypot(point.x - self.latchFingerPoint.x, point.y - self.latchFingerPoint.y) < 22.0) {
+        [self setSelectedButton:nil];
+        return;
+    }
+    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
+    CGFloat hitRadius = MAX(30.0, iconSize * 0.85 + 10.0);
+
+    UIButton *best = nil;
+    CGFloat bestDistance = CGFLOAT_MAX;
+    for (UIButton *button in self.iconButtons) {
+        if (button.superview == nil) {
+            continue;
+        }
+        CGPoint center = [button.superview convertPoint:button.center toView:container];
+        CGFloat distance = hypot(center.x - point.x, center.y - point.y);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = button;
+        }
+    }
+    if (bestDistance > hitRadius) {
+        best = nil;
+    }
+    if (best == self.selectedButton) {
+        return;
+    }
+    [self setSelectedButton:best];
+}
+
+- (void)setSelectedButton:(UIButton *)button {
+    UIButton *previous = self.selectedButton;
+    self.selectedButton = button;
+    if (previous != nil && previous != button) {
+        [self applySelectionVisual:previous selected:NO];
+    }
+    if (button != nil) {
+        [self applySelectionVisual:button selected:YES];
+        NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
+        MFLog(@"[ring] 悬停选中 %@", bundleId ?: @"?");
+    } else if (previous != nil) {
+        MFLog(@"[ring] 悬停离开（当前无选中）");
+    }
+}
+
+- (void)applySelectionVisual:(UIButton *)button selected:(BOOL)selected {
+    if (button == nil) {
+        return;
+    }
+    [UIView animateWithDuration:0.12 animations:^{
+        button.transform = selected ? CGAffineTransformMakeScale(1.18, 1.18) : CGAffineTransformIdentity;
+        button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.42 : 0.14];
+        button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.95 : 0.35].CGColor;
+    }];
 }
 
 #pragma mark 图标交互
 
 - (void)onIconTapped:(UIButton *)button {
     NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
-    MFLog(@"[ring] 选中 %@ -> 打开浮窗", bundleId ?: @"(nil)");
+    MFLog(@"[ring] 直接点击 %@ -> 打开浮窗", bundleId ?: @"(nil)");
     if (bundleId.length == 0) {
         [self hide];
         return;
@@ -499,10 +706,13 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
     MFRingWriteBundleIds(ids);
     MFLog(@"[ring] 长按移出 %@ -> 剩 %lu 项", bundleId, (unsigned long)ids.count);
 
-    // 原地重建圆盘
+    // 原地重建，并直接停靠在下半屏中心
+    CGPoint park = self.parkCenter;
     [self hide];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self show]; });
+                   dispatch_get_main_queue(), ^{
+        [self showRingWithAnchor:park latch:YES];
+    });
 }
 
 #pragma mark 打开浮窗
