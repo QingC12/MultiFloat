@@ -1830,6 +1830,8 @@ static double       gMFPadLastTime = 0;     // 快照节流
 static BOOL        gMFPadRaised     = NO;  // 快照当前是否在最上层
 static NSInteger   gMFHealthyTicks  = 0;   // 【0.19.0】连续健康拍数（≥2 才归位；真黑拍清零）
 
+static void MFSnapshotPadLower(void);   // 【0.27.0】前向声明（Raise 内手势让路分支要调）
+
 /// 把快照提到内容区最上层。**每个真黑拍都调用、每次都重新置前** ——
 /// 归档(20) 钉死：系统恢复 hosting 时会把 presentationView 重新插回快照之上，
 /// 只置顶一次守不住；置顶后掉层、恢复、再掉层，快照每拍都要重新爬回最上层。
