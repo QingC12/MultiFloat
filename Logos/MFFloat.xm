@@ -2837,7 +2837,13 @@ static void MFInstallSDTouchOverlay(void);  // 【0.36.0】前向声明（Manage
 - (void)onPickerIconLongPress:(UILongPressGestureRecognizer *)g;
 - (void)onPickerBackdropTap:(UITapGestureRecognizer *)g;
 - (void)toggleDockApp:(NSString *)bundleID;   // 应用列表长按 -> 加入/移出圆弧
-- (NSArray<NSArray<NSString *> *> *)dockItems; // 圆弧成员（dockApps 或默认 6 项）
+- (NSArray<NSArray<NSString *> *> *)dockItems; // 圆弧成员（dockApps 数组；无该键才用默认 6 项）
+- (void)setFloatVisible:(BOOL)visible;        // 【0.38.0】显式设置浮窗可见性（圆弧选定后强制显示）
+- (void)arcPickerShowAtY:(CGFloat)cy gesture:(BOOL)gesture;   // 【0.38.0】在指定高度呼出圆弧
+- (void)arcPickerUpdateAtY:(CGFloat)cy finger:(CGPoint)p;     // 【0.38.0】弧随手指滑动 + 高亮最近图标
+- (void)arcPickerCommitWithTranslation:(CGPoint)t;            // 【0.38.0】松手：高亮处 App 直接打开
+- (void)addDockApp:(NSString *)bid;
+- (void)removeDockApp:(NSString *)bid;
 - (void)onSummonButtonLongPress:(UILongPressGestureRecognizer *)g;  // ▦ 长按 -> 呼出选择器
 @end
 
@@ -3397,6 +3403,14 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 static UIWindow *gMFPickerWin = nil;
 static BOOL      gMFPickerVisible = NO;
 static char      kMFDockBIDKey;   // 圆弧图标 -> bundleID 关联对象 key
+// 【0.38.0】手势滑选
+static NSMutableArray *gMFPickerIcons = nil;  // 图标按钮（顺序 = dockItems 顺序）
+static UIButton *gMFPickerHighlighted = nil;  // 当前高亮（手指最近）
+static BOOL      gMFPickerGestureMode = NO;   // YES=手势滑选模式
+static CGFloat   gMFPickerCY = 0.0;           // 当前弧心高度
+static UIView   *gMFPickerRoot = nil;
+static const CGFloat kMFPickerIconSize = 44.0;   // 【0.38.0】图标缩小（原 58）
+static const CGFloat kMFPickerRadius   = 152.0;
 
 /// App 图标（SpringBoard 私有 API；取不到返回 nil -> 用首字母兜底）
 static UIImage *MFAppIconImage(NSString *bid) {
@@ -3434,6 +3448,10 @@ static NSString *MFAppDisplayName(NSString *bid) {
 /// 关闭并清空圆弧选择器
 static void MFPickerHide(void) {
     gMFPickerVisible = NO;
+    gMFPickerGestureMode = NO;
+    gMFPickerHighlighted = nil;
+    gMFPickerRoot = nil;
+    [gMFPickerIcons removeAllObjects];
     if (gMFPickerWin != nil) {
         for (UIView *v in [gMFPickerWin.subviews copy]) [v removeFromSuperview];
         gMFPickerWin.hidden = YES;
@@ -3454,69 +3472,58 @@ static void MFPickerHide(void) {
         return;
     }
     sLastToggle = nowT;
-    @try {
-        MFFloatPanel *p = self.panel;
-        if (p == nil || p.view == nil || p.view.superview == nil) {
-            if (gMFBootConfig == nil) {
-                MFLogS(@"[summon] 无浮窗且无 bootstrap 配置快照 -> 无法呼出");
-                return;
-            }
-            MFLogS(@"[summon] 首次呼出 -> 用 bootstrap 配置启动浮窗");
-            [[MFFloatManager shared] startWithConfig:gMFBootConfig];
+    MFFloatPanel *p = self.panel;
+    if (p == nil || p.view == nil || p.view.superview == nil) {
+        if (gMFBootConfig == nil) {
+            MFLogS(@"[summon] 无浮窗且无 bootstrap 配置快照 -> 无法呼出");
             return;
         }
-        BOOL embedded = (p.view.superview != self.window);   // 挂载模式：superview 是容器视图
-        if (embedded) {
-            UIView *host = p.hostWindow;
-            if (host == nil) { MFLogS(@"[summon] !! 挂载模式但 hostWindow 已释放 -> 忽略"); return; }
-            BOOL willShow = host.isHidden;
-            host.hidden = !willShow;
-            if (willShow && host.superview != nil) [host.superview bringSubviewToFront:host];
-            MFLog(@"[summon] 挂载模式切换 hidden=%d", (int)!willShow);
-            if (!willShow) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
-        } else {
-            BOOL willShow = self.window.isHidden;
-            self.window.hidden = !willShow;
-            if (willShow) {
-                [self.window makeKeyAndVisible];
-                if (self.window.frame.size.width < 50.0)
-                    self.window.frame = [UIScreen mainScreen].bounds;
-            } else {
-                MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
-            }
-            MFLog(@"[summon] 独立窗口模式切换 hidden=%d", (int)!willShow);
-        }
-    } @catch (NSException *e) {
-        MFLog(@"[summon] !! toggle 异常：%@", e);
+        MFLogS(@"[summon] 首次呼出 -> 用 bootstrap 配置启动浮窗");
+        [[MFFloatManager shared] startWithConfig:gMFBootConfig];
+        return;
     }
+    BOOL embedded = (p.view.superview != self.window);
+    BOOL willShow = embedded ? p.hostWindow.isHidden : self.window.isHidden;
+    MFLog(@"[summon] ▦ 点击 -> 浮窗 %@", willShow ? @"显示" : @"隐藏");
+    [self setFloatVisible:willShow];
 }
 
 - (void)summonPan:(UIPanGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateEnded) return;
+    // 【0.38.0】右缘局部热区：手势滑出圆弧选择器 —— 弧随手指滑动，
+    // 松手时手指停在哪就打开哪个 App；停在空白 = 关闭（用户指定交互）。
+    CGPoint p = [g.view.window convertPoint:[g locationInView:nil] toWindow:nil];   // -> 屏幕坐标
     CGPoint t = [g translationInView:g.view];
-    // 【0.37.0】右缘左滑 = 呼出"半圆弧选择器"（用户指定交互；原 toggle 语义取消，
-    // 浮窗显隐改由 ▦ 按钮负责）
-    if (t.x < -25.0) {
-        MFLog(@"[summon] 右缘左滑 -> 呼出圆弧选择器 t=(%.0f, %.0f) 来源=%@(tag=%ld)",
-              t.x, t.y, NSStringFromClass([g.view.window class]), (long)g.view.tag);
-        [self toggleArcPicker];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        MFLog(@"[arc] 手势呼出 来源=%@(tag=%ld) 起点=(%.0f,%.0f)",
+              NSStringFromClass([g.view.window class]), (long)g.view.tag, p.x, p.y);
+        gMFPickerGestureMode = YES;
+        [self arcPickerShowAtY:p.y gesture:YES];
+    } else if (g.state == UIGestureRecognizerStateChanged) {
+        [self arcPickerUpdateAtY:p.y finger:p];
+    } else if (g.state == UIGestureRecognizerStateEnded
+            || g.state == UIGestureRecognizerStateCancelled) {
+        if (gMFPickerGestureMode) {
+            [self arcPickerCommitWithTranslation:t];
+        }
     }
 }
 
-// 【0.34.0】悬浮按钮垂直拖动（水平锁定，只上下移）
 - (void)summonDrag:(UIPanGestureRecognizer *)g {
+    // 【0.38.0】▦ 拖动 = 整个"局部热区窗口"上下移动（窗口很小，移动它比移动按钮更直观）
     UIView *v = g.view;
-    if (v == nil || v.superview == nil) return;
-    CGPoint t = [g translationInView:v.superview];
-    CGRect f = v.frame;
-    CGFloat maxY = [UIScreen mainScreen].bounds.size.height - f.size.height - 40.0;
-    f.origin.y = MIN(MAX(f.origin.y + t.y, 40.0), MAX(maxY, 40.0));
-    v.frame = f;
-    [g setTranslation:CGPointZero inView:v.superview];
+    UIWindow *w = v.window;
+    if (w == nil) return;
+    CGPoint t = [g translationInView:v];
+    CGRect f = w.frame;
+    CGFloat H = [UIScreen mainScreen].bounds.size.height;
+    f.origin.y = MIN(MAX(f.origin.y + t.y, 60.0), MAX(H - f.size.height - 60.0, 60.0));
+    w.frame = f;
+    [g setTranslation:CGPointZero inView:v];
 }
 
-// ===== 【0.37.0】右缘半圆弧选择器 =====
-/// 呼出 / 关闭：图标沿右缘半圆排布（180° 指向正左），点图标 = 浮窗打开该 App
+// ===== 【0.37.0/0.38.0】右缘半圆弧选择器 =====
+// ===== 【0.37.0/0.38.0】右缘半圆弧选择器（手势滑选）=====
+/// 点击/长按按钮呼出（切换语义，弧心在屏幕垂直中心）
 - (void)toggleArcPicker {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self toggleArcPicker]; });
@@ -3524,9 +3531,14 @@ static void MFPickerHide(void) {
     }
     if (gMFPickerVisible) {
         MFPickerHide();
-        MFLogS(@"[arc] 选择器关闭（再次左滑）");
+        MFLogS(@"[arc] 选择器关闭（再次触发）");
         return;
     }
+    [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:NO];
+}
+
+/// 呼出/重建：弧心高度 cy 由调用方给出（手势模式 = 手指当前位置）
+- (void)arcPickerShowAtY:(CGFloat)cy gesture:(BOOL)gesture {
     @try {
         CGRect scr = [UIScreen mainScreen].bounds;
         if (gMFPickerWin == nil) {
@@ -3541,31 +3553,27 @@ static void MFPickerHide(void) {
         for (UIView *v in [gMFPickerWin.subviews copy]) [v removeFromSuperview];
 
         UIView *root = [[UIView alloc] initWithFrame:gMFPickerWin.bounds];
-        root.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.30];   // 轻遮罩（点空白关闭）
+        root.backgroundColor = [UIColor colorWithWhite:0.0 alpha:(gesture ? 0.16 : 0.30)];
         root.userInteractionEnabled = YES;
         [root addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
                                                                          action:@selector(onPickerBackdropTap:)]];
         [gMFPickerWin addSubview:root];
+        gMFPickerRoot = root;
+        gMFPickerIcons = [NSMutableArray array];
+        gMFPickerHighlighted = nil;
+        gMFPickerGestureMode = gesture;
 
         NSArray *items = [self dockItems];
-        CGFloat W = scr.size.width, H = scr.size.height;
-        CGFloat cx = W, cy = H / 2.0;
-        CGFloat R = MIN(178.0, W - 56.0);
-        CGFloat iconSize = 58.0;
         NSInteger n = (NSInteger)items.count;
-        CGFloat half = (n <= 1) ? 0.0 : MIN(74.0, 11.0 * (CGFloat)(n - 1));   // 半张角（度）
+        CGFloat s = kMFPickerIconSize;
         for (NSInteger i = 0; i < n; i++) {
             NSArray *pair = items[(NSUInteger)i];
             NSString *name = pair.firstObject;
             NSString *bid = pair.lastObject;
-            CGFloat frac = (n <= 1) ? 0.0 : ((CGFloat)i / (CGFloat)(n - 1) - 0.5) * 2.0;  // -1..1
-            CGFloat rad = (180.0 + frac * half) * M_PI / 180.0;
-            CGFloat px = cx + R * cos(rad);
-            CGFloat py = cy - R * sin(rad);
             UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-            b.frame = CGRectMake(px - iconSize / 2.0, py - iconSize / 2.0, iconSize, iconSize);
+            b.bounds = CGRectMake(0.0, 0.0, s, s);
             b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-            b.layer.cornerRadius = iconSize / 2.0;
+            b.layer.cornerRadius = s / 2.0;
             b.layer.masksToBounds = YES;
             b.layer.borderWidth = 1.0;
             b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
@@ -3577,7 +3585,7 @@ static void MFPickerHide(void) {
                 NSString *initial = (name.length > 0) ? [name substringToIndex:1] : @"?";
                 [b setTitle:initial forState:UIControlStateNormal];
                 [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-                b.titleLabel.font = [UIFont boldSystemFontOfSize:22.0];
+                b.titleLabel.font = [UIFont boldSystemFontOfSize:17.0];
             }
             objc_setAssociatedObject(b, &kMFDockBIDKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [b addTarget:self action:@selector(onPickerIconTapped:) forControlEvents:UIControlEventTouchUpInside];
@@ -3586,44 +3594,113 @@ static void MFPickerHide(void) {
             lp.minimumPressDuration = 0.5;
             [b addGestureRecognizer:lp];
             [root addSubview:b];
+            [gMFPickerIcons addObject:b];
         }
+        [self arcPickerLayoutAtY:cy];   // 布点（含弧心钳制）
 
         if (n == 0) {
-            UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(W - 300.0, cy - 40.0, 270.0, 80.0)];
+            UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(scr.size.width - 300.0,
+                                                                     gMFPickerCY - 40.0, 270.0, 80.0)];
             hint.numberOfLines = 0;
             hint.textAlignment = NSTextAlignmentCenter;
-            hint.text = @"圆弧选择器还没有 App\n双击浮窗外沿打开列表，长按任意 App 即可加入";
+            hint.text = @"圆弧里还没有 App\n双击浮窗外沿打开列表，长按任意 App 即可加入";
             hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.88];
             hint.font = [UIFont systemFontOfSize:13.0];
             [root addSubview:hint];
+        } else {
+            UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(scr.size.width - 320.0, 44.0, 300.0, 22.0)];
+            tip.text = gesture ? @"滑到目标 App 松手即打开" : @"点图标=打开   长按=移出   点空白=关闭";
+            tip.textAlignment = NSTextAlignmentRight;
+            tip.textColor = [UIColor colorWithWhite:1.0 alpha:0.60];
+            tip.font = [UIFont systemFontOfSize:11.0];
+            [root addSubview:tip];
         }
-        UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(W - 320.0, 44.0, 300.0, 22.0)];
-        tip.text = @"点图标=浮窗打开   长按图标=移出   点空白=关闭";
-        tip.textAlignment = NSTextAlignmentRight;
-        tip.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-        tip.font = [UIFont systemFontOfSize:11.0];
-        [root addSubview:tip];
 
         gMFPickerWin.hidden = NO;
         gMFPickerVisible = YES;
-        MFLog(@"[arc] 选择器已呼出：%ld 个 App（R=%.0f，半张角 %.0f°）", (long)n, R, half);
+        MFLog(@"[arc] 选择器%@：%ld 个 App（弧心 y=%.0f，图标 %.0f）",
+              gesture ? @"手势呼出" : @"已呼出", (long)n, gMFPickerCY, s);
     } @catch (NSException *e) {
         MFLog(@"[arc] !! 选择器构建异常：%@", e);
         MFPickerHide();
     }
 }
 
-/// 选择器内容 = 配置键 dockApps（bundleID 数组）；为空时给默认 6 项
+/// 弧随手指（手势模式）：重排图标 + 高亮离手指最近的那个
+- (void)arcPickerUpdateAtY:(CGFloat)cy finger:(CGPoint)p {
+    if (!gMFPickerVisible || gMFPickerIcons == nil) {
+        [self arcPickerShowAtY:cy gesture:YES];
+        if (!gMFPickerVisible) return;
+    } else {
+        [self arcPickerLayoutAtY:cy];
+    }
+    UIButton *best = nil;
+    CGFloat bestD = 88.0;   // 命中半径
+    for (UIButton *b in gMFPickerIcons) {
+        CGFloat d = hypot(CGRectGetMidX(b.frame) - p.x, CGRectGetMidY(b.frame) - p.y);
+        if (d < bestD) { bestD = d; best = b; }
+    }
+    if (best == gMFPickerHighlighted) return;
+    if (gMFPickerHighlighted != nil) {
+        gMFPickerHighlighted.transform = CGAffineTransformIdentity;
+        gMFPickerHighlighted.layer.borderWidth = 1.0;
+    }
+    gMFPickerHighlighted = best;
+    if (best != nil) {
+        best.transform = CGAffineTransformMakeScale(1.30, 1.30);
+        best.layer.borderWidth = 2.5;
+    }
+}
+
+/// 松手：高亮处 App 直接打开（空白 = 关闭）
+- (void)arcPickerCommitWithTranslation:(CGPoint)t {
+    UIButton *sel = gMFPickerHighlighted;
+    NSString *bid = (sel != nil) ? objc_getAssociatedObject(sel, &kMFDockBIDKey) : nil;
+    MFPickerHide();
+    if (bid.length == 0) {
+        MFLog(@"[arc] 松手在空白（t=%.0f,%.0f）-> 关闭选择器", t.x, t.y);
+        return;
+    }
+    MFLog(@"[arc] 松手选定 %@ -> 先显示浮窗再承载", bid);
+    [self setFloatVisible:YES];   // 【0.38.0 修复】避免"选了 App 却因浮窗被隐藏而看不见"
+    [[MFFloatManager shared] openOrHostBundleID:bid];
+}
+
+/// 布点：弧心在右边缘，cx=W，180° 指向正左；图标用 bounds/center（不碰 frame，防 transform 冲突）
+- (void)arcPickerLayoutAtY:(CGFloat)cy {
+    if (gMFPickerIcons == nil || gMFPickerIcons.count == 0) return;
+    @try {
+        CGRect scr = [UIScreen mainScreen].bounds;
+        CGFloat W = scr.size.width, H = scr.size.height;
+        cy = MIN(MAX(cy, 120.0), H - 120.0);
+        gMFPickerCY = cy;
+        NSInteger n = (NSInteger)gMFPickerIcons.count;
+        CGFloat half = (n <= 1) ? 0.0 : MIN(72.0, 10.0 * (CGFloat)(n - 1));
+        CGFloat R = MIN(kMFPickerRadius, W - 40.0);
+        CGFloat s = kMFPickerIconSize;
+        for (NSInteger i = 0; i < n; i++) {
+            CGFloat frac = (n <= 1) ? 0.0 : ((CGFloat)i / (CGFloat)(n - 1) - 0.5) * 2.0;   // -1..1
+            CGFloat rad = (180.0 + frac * half) * M_PI / 180.0;
+            UIButton *b = gMFPickerIcons[(NSUInteger)i];
+            b.bounds = CGRectMake(0.0, 0.0, s, s);
+            b.center = CGPointMake(W + R * cos(rad), cy - R * sin(rad));
+        }
+    } @catch (NSException *e) { }
+}
+
+/// 选择器内容 = 配置键 dockApps（bundleID 数组）；**没有该键**时才给默认 6 项
+/// 【0.38.0】空数组 = 空圆弧（尊重"全部移出"，不再回落到默认项）
 - (NSArray<NSArray<NSString *> *> *)dockItems {
     NSMutableArray *out = [NSMutableArray array];
     NSDictionary *cfg = MFLoadConfig() ?: self.config;
     id cur = cfg[@"dockApps"];
-    if ([cur isKindOfClass:[NSArray class]] && [cur count] > 0) {
+    if ([cur isKindOfClass:[NSArray class]]) {
         for (id x in cur) {
             if (![x isKindOfClass:[NSString class]]) continue;
             NSString *bid = (NSString *)x;
             [out addObject:@[ MFAppDisplayName(bid), bid ]];
         }
+        MFLog(@"[arc] dockApps 已配置 -> %lu 项", (unsigned long)out.count);
         return out;
     }
     @try {
@@ -3649,14 +3726,14 @@ static void MFPickerHide(void) {
             [cand sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
                 return [a.firstObject localizedCaseInsensitiveCompare:b.firstObject];
             }];
-            for (NSArray *p in cand) {
+            for (NSArray *pp in cand) {
                 if (out.count >= 6) break;
                 BOOL dup = NO;
-                for (NSArray *q in out) if ([q.lastObject isEqualToString:p.lastObject]) { dup = YES; break; }
-                if (!dup) [out addObject:p];
+                for (NSArray *q in out) if ([q.lastObject isEqualToString:pp.lastObject]) { dup = YES; break; }
+                if (!dup) [out addObject:pp];
             }
         }
-        MFLogS(@"[arc] dockApps 未配置 -> 默认 6 项（在应用列表长按任意 App，或在 plist 加 dockApps 数组可自定义）");
+        MFLogS(@"[arc] dockApps 未配置 -> 默认 6 项（长按任意 App 加入/移出即可自定义）");
     } @catch (NSException *e) {
         MFLog(@"[arc] !! 默认列表构建异常：%@", e);
     }
@@ -3665,9 +3742,10 @@ static void MFPickerHide(void) {
 
 - (void)onPickerIconTapped:(UIButton *)b {
     NSString *bid = objc_getAssociatedObject(b, &kMFDockBIDKey);
-    MFLog(@"[arc] 图标被点 bid=%@ -> 浮窗打开", bid ?: @"nil");
+    MFLog(@"[arc] 图标被点 bid=%@ -> 先显示浮窗再承载", bid ?: @"nil");
     MFPickerHide();
     if (bid.length == 0) return;
+    [self setFloatVisible:YES];   // 【0.38.0 修复】浮窗被 ▦ 隐藏时，选 App 也要能看见
     [[MFFloatManager shared] openOrHostBundleID:bid];
 }
 
@@ -3676,9 +3754,8 @@ static void MFPickerHide(void) {
     NSString *bid = objc_getAssociatedObject(g.view, &kMFDockBIDKey);
     MFLog(@"[arc] 图标被长按 bid=%@ -> 移出圆弧", bid ?: @"nil");
     if (bid.length > 0) {
-        [self toggleDockApp:bid];
-        MFPickerHide();          // 重建，立刻反映变化
-        [self toggleArcPicker];
+        [self removeDockApp:bid];   // 【0.38.0】一律按"当前显示集"移除（默认项也能移出）
+        [self arcPickerShowAtY:gMFPickerCY gesture:NO];   // 原地重建，立刻反映
     }
 }
 
@@ -3687,36 +3764,83 @@ static void MFPickerHide(void) {
     MFPickerHide();
 }
 
-/// ▦ 按钮长按 = 呼出圆弧选择器（与右缘左滑等价）
+/// ▦ 按钮长按 = 呼出圆弧选择器（与右缘滑选等价）
 - (void)onSummonButtonLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
     MFLogS(@"[arc] ▦ 长按 -> 呼出圆弧选择器");
     [self toggleArcPicker];
 }
 
-/// 应用列表长按 / 圆弧图标长按 -> 加入或移出 dockApps（写盘持久化）
-- (void)toggleDockApp:(NSString *)bundleID {
-    if (bundleID.length == 0) return;
+/// 写盘：把 dockApps 设为给定数组
+static BOOL MFWriteDockApps(NSArray *ids) {
+    BOOL ok = NO;
     @try {
         NSString *path = @"/var/mobile/MultiFloat.plist";
         NSMutableDictionary *cfg = [NSMutableDictionary dictionaryWithContentsOfFile:path];
         if (cfg == nil) cfg = [NSMutableDictionary dictionary];
-        NSMutableArray *ids = [NSMutableArray array];
-        id cur = cfg[@"dockApps"];
-        if ([cur isKindOfClass:[NSArray class]]) [ids addObjectsFromArray:cur];
-        BOOL removed = NO;
-        if ([ids containsObject:bundleID]) {
-            [ids removeObject:bundleID];
-            removed = YES;
+        cfg[@"dockApps"] = ids ?: @[];
+        ok = [cfg writeToFile:path atomically:YES];
+    } @catch (NSException *e) { ok = NO; }
+    return ok;
+}
+
+/// 加入：先把"当前显示集"物化（可能是默认 6 项）再加进去 -> 不会变成只剩一个
+- (void)addDockApp:(NSString *)bid {
+    if (bid.length == 0) return;
+    NSMutableArray *ids = [NSMutableArray array];
+    for (NSArray *pp in [self dockItems]) {
+        if (![ids containsObject:pp.lastObject]) [ids addObject:pp.lastObject];
+    }
+    if (![ids containsObject:bid]) [ids addObject:bid];
+    BOOL ok = MFWriteDockApps(ids);
+    MFLog(@"[arc] 加入 %@ -> dockApps 共 %lu 项 ok=%d", bid, (unsigned long)ids.count, (int)ok);
+}
+
+/// 移出：按当前显示集移除（默认 6 项也能移出；移空 = 空圆弧，不回落默认）
+- (void)removeDockApp:(NSString *)bid {
+    if (bid.length == 0) return;
+    NSMutableArray *ids = [NSMutableArray array];
+    BOOL found = NO;
+    for (NSArray *pp in [self dockItems]) {
+        if ([pp.lastObject isEqualToString:bid]) { found = YES; continue; }
+        if (![ids containsObject:pp.lastObject]) [ids addObject:pp.lastObject];
+    }
+    BOOL ok = MFWriteDockApps(ids);
+    MFLog(@"[arc] 移出 %@（%s）-> dockApps 共 %lu 项 ok=%d",
+          bid, found ? "原在圆弧内" : "原本不在", (unsigned long)ids.count, (int)ok);
+}
+
+/// 应用列表长按 -> 切换成员
+- (void)toggleDockApp:(NSString *)bundleID {
+    if (bundleID.length == 0) return;
+    BOOL present = NO;
+    for (NSArray *pp in [self dockItems]) {
+        if ([pp.lastObject isEqualToString:bundleID]) { present = YES; break; }
+    }
+    if (present) [self removeDockApp:bundleID];
+    else         [self addDockApp:bundleID];
+}
+
+/// 【0.38.0】显式设置浮窗可见性（toggleFloatVisible 与"圆弧选定"共用）
+- (void)setFloatVisible:(BOOL)visible {
+    @try {
+        MFFloatPanel *p = self.panel;
+        if (p == nil || p.view.superview == nil) return;   // 还没有浮窗 -> 不做事
+        BOOL embedded = (p.view.superview != self.window);
+        if (embedded) {
+            UIView *host = p.hostWindow;
+            if (host == nil) return;
+            host.hidden = !visible;
+            if (visible && host.superview != nil) [host.superview bringSubviewToFront:host];
         } else {
-            [ids addObject:bundleID];
+            self.window.hidden = !visible;
+            if (visible && self.window.frame.size.width < 50.0)
+                self.window.frame = [UIScreen mainScreen].bounds;
         }
-        cfg[@"dockApps"] = ids;
-        BOOL ok = [cfg writeToFile:path atomically:YES];
-        MFLog(@"[arc] %@ %@ -> dockApps 共 %lu 项 ok=%d",
-              removed ? @"移出" : @"加入", bundleID, (unsigned long)ids.count, (int)ok);
+        if (!visible) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
+        MFLog(@"[summon] 浮窗可见性 -> %d（%@）", (int)visible, embedded ? @"挂载" : @"独立窗口");
     } @catch (NSException *e) {
-        MFLog(@"[arc] !! 保存 dockApps 异常：%@", e);
+        MFLog(@"[summon] !! setFloatVisible 异常：%@", e);
     }
 }
 
@@ -4588,15 +4712,22 @@ static void MFInstallSummonGesture(void) {
             sw = [[UIWindow alloc] initWithFrame:CGRectMake(W - 64.0, 0.0, 64.0, H)];
         }
         if (sw == nil) { MFScheduleSummonRetry(); return; }
-        sw.frame = CGRectMake(W - 64.0, 0.0, 64.0, H);
-        MFLog(@"[summon] 呼出窗口 scene=%@", sScene ? NSStringFromClass([sScene class]) : @"nil(回退 frame)");
+        // 【0.38.0】窗口缩到"局部热区"：不再是整条右边缘（用户要求）；
+        // 位置 = 右缘垂直中间，尺寸 88 x 200（按钮 + 滑选热区都在里面）
+        const CGFloat kZoneW = 88.0, kZoneH = 200.0;
+        CGFloat zoneX = W - kZoneW;
+        CGFloat zoneY = (H - kZoneH) / 2.0;
+        sw.frame = CGRectMake(zoneX, zoneY, kZoneW, kZoneH);
+        MFLog(@"[summon] 呼出窗口 scene=%@ frame=%@（局部热区）",
+              sScene ? NSStringFromClass([sScene class]) : @"nil(回退 frame)",
+              NSStringFromCGRect(sw.frame));
         sw.windowLevel = 1100.0;
         sw.backgroundColor = [UIColor clearColor];
         sw.userInteractionEnabled = YES;
         sw.hidden = NO;
 
-        // 右缘滑动热区：贴右边缘 20pt 全高，透明不挡视线
-        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(44.0, 0.0, 20.0, H)];
+        // 滑选热区：只在右边缘中段 40x140（局部），透明不挡视线 —— 手势滑出圆弧选择器
+        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 40.0, 30.0, 40.0, 140.0)];
         strip.backgroundColor = [UIColor clearColor];
         strip.userInteractionEnabled = YES;
         strip.tag = 990040;
@@ -4605,22 +4736,22 @@ static void MFInstallSummonGesture(void) {
         [strip addGestureRecognizer:pan];
         [sw addSubview:strip];
 
-        // 悬浮按钮：半透明圆形 "▦"，可点可垂直拖
+        // 悬浮按钮：半透明圆形 "▦"（点=显隐浮窗；长按=圆弧选择器；上下拖=整个热区窗口跟随移动）
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(8.0, 160.0, 48.0, 48.0);
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
-        btn.layer.cornerRadius = 24.0;
+        btn.frame = CGRectMake(10.0, 24.0, 44.0, 44.0);
+        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.42];
+        btn.layer.cornerRadius = 22.0;
         btn.layer.masksToBounds = YES;
         [btn setTitle:@"▦" forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:20.0];
+        btn.titleLabel.font = [UIFont systemFontOfSize:18.0];
         btn.tag = 990041;
         [btn addTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)
                       forControlEvents:UIControlEventTouchUpInside];
         UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc]
             initWithTarget:[MFFloatManager shared] action:@selector(summonDrag:)];
         [btn addGestureRecognizer:drag];
-        // 【0.37.0】长按 ▦ = 呼出圆弧选择器（与右缘左滑等价）
+        // 【0.37.0】长按 ▦ = 呼出圆弧选择器（与右缘滑选等价）
         UILongPressGestureRecognizer *btnLP = [[UILongPressGestureRecognizer alloc]
             initWithTarget:[MFFloatManager shared] action:@selector(onSummonButtonLongPress:)];
         btnLP.minimumPressDuration = 0.6;
@@ -4629,7 +4760,7 @@ static void MFInstallSummonGesture(void) {
 
         gMFStripView = btn;
         gMFStripWin = sw;   // 【0.35.0】成功后才落库（此前异常不会污染幂等守卫 -> 可重试）
-        MFLog(@"[summon] 右缘呼出 UI 已安装（悬浮按钮 + 右缘左滑热区）win=%@ frame=%@",
+        MFLog(@"[summon] 右缘呼出 UI 已安装（▦ 按钮 + 局部滑选热区）win=%@ frame=%@",
               NSStringFromClass([sw class]), NSStringFromCGRect(sw.frame));
     } @catch (NSException *e) {
         MFLog(@"[summon] !! 安装异常（1s 后重试）：%@", e);
@@ -4756,8 +4887,10 @@ static void MFInstallSDTouchOverlay(void) {
             [arr addObject:v];
         }
         // 右缘呼出热区（与独立窗口里那条互为备份；tag 990042 用于日志区分来源）
-        UIView *strip = [[UIView alloc] initWithFrame:
-                         CGRectMake(sb.bounds.size.width - 20.0, 0.0, 20.0, sb.bounds.size.height)];
+        // 【0.38.0】与独立窗口一致：右缘中段"局部"热区（不再是整条右边缘）
+        CGFloat sbW = sb.bounds.size.width, sbH = sb.bounds.size.height;
+        CGRect zone = CGRectMake(sbW - 40.0, (sbH - 200.0) / 2.0 + 30.0, 40.0, 140.0);
+        UIView *strip = [[UIView alloc] initWithFrame:zone];
         strip.backgroundColor = [UIColor clearColor];
         strip.tag = 990042;
         [strip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
