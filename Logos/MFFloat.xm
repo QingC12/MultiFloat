@@ -3643,7 +3643,7 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
             Class svcCls = objc_getClass("FBSOpenApplicationService");
-            id svc = [svcCls performSelector:NSSelectorFromString(@"sharedInstance")];
+            id svc = ((id (*)(id, SEL))objc_msgSend)((id)svcCls, NSSelectorFromString(@"sharedInstance"));
             if (svc == nil || ![svc respondsToSelector:NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:")]) {
                 MFLogS(@"[host] !! FBSOpenApplicationService 通道不可用 -> 请先手动打开该 App");
                 [self.panel showMessage:@"无法自动启动该 App"
@@ -3653,17 +3653,16 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
             id opts = nil;
             Class optCls = objc_getClass("FBSOpenApplicationOptions");
             if (optCls && [optCls respondsToSelector:NSSelectorFromString(@"options")]) {
-                opts = [optCls performSelector:NSSelectorFromString(@"options")];
+                opts = ((id (*)(id, SEL))objc_msgSend)((id)optCls, NSSelectorFromString(@"options"));
             }
-            [svc openApplicationWithBundleID:bundleID
-                                     options:opts
-                           withResultHandler:^(NSError *err) {
+            SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:options:withResultHandler:");
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(svc, openSel, bundleID, opts, ^(NSError *err) {
                 if (err != nil) {
                     MFLog(@"[host] 启动 %@ 返回错误：%@", bundleID, err);
                 } else {
                     MFLog(@"[ui] 启动 %@ 已受理", bundleID);
                 }
-            }];
+            });
         } @catch (NSException *e) {
             MFLog(@"[host] !! 启动异常：%@", e);
             [self.panel showMessage:@"自动启动失败" detail:[NSString stringWithFormat:@"%@", e]];
@@ -3716,7 +3715,7 @@ static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日
 
     NSMutableArray *installedItems = [NSMutableArray array];
     @try {
-        id ws = [objc_getClass("LSApplicationWorkspace") performSelector:NSSelectorFromString(@"defaultWorkspace")];
+        id ws = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("LSApplicationWorkspace"), NSSelectorFromString(@"defaultWorkspace"));
         NSArray *all = MFIterate(MFMsg(ws, NSSelectorFromString(@"allInstalledApplications")));
         MFLog(@"[ui] allInstalledApplications=%lu", (unsigned long)all.count);
         for (id proxy in all) {
