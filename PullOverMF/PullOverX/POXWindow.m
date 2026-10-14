@@ -410,6 +410,17 @@ static CGAffineTransform POOrientationTransform(UIInterfaceOrientation orientati
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 【MF 0.1.9】先问圆盘选择器：
+    //   · 圆盘展开态 → 整窗接管（模态交互）
+    //   · 收起态、点落在贴边触发条内、且不在 PullOver 手柄上 → 触发条视图
+    //   · 其余 → nil，原样交回控制器 —— 既有手柄/面板行为零改变
+    // 为什么挂在这里而不再自建窗口：日志实证"自建窗口抢屏幕边缘触摸"会让
+    // SpringBoard 在按下后立刻硬重启（0.1.6/0.1.7/0.1.8 连续三版），
+    // 而本窗口这套 hitTest 模型在真机上被反复验证可用（手柄就靠它）。
+    UIView *ringView = MFRingHitTestViewForWindowPoint(self, point);
+    if (ringView != nil) {
+        return ringView;
+    }
     return [controller interactiveViewForWindowPoint:point event:event];
 }
 

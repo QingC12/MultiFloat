@@ -2,6 +2,7 @@
 
 #ifdef __OBJC__
     #import <Foundation/Foundation.h>
+    #import <UIKit/UIKit.h>
 #endif
 
 // ===== 【MF】跨文件 C 接口 —— 必须 extern "C" 包裹 =====
@@ -27,6 +28,10 @@ void MFRingPickerInstall(void);
 
 // 常规日志（正常运行时使用）
 void MFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
+// 【0.1.9】圆盘命中判定：POXWindow.hitTest 优先询问圆盘（展开态整窗、收起态贴边触发条）
+// 返回 nil = 原样交回 PullOver 控制器（既有手柄/面板行为零改变）
+UIView *MFRingHitTestViewForWindowPoint(UIWindow *window, CGPoint point);
 
 #endif
 
