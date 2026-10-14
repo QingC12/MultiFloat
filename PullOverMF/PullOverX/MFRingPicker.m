@@ -2,6 +2,31 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.2 核心改动 ============================
+//  ① **圆盘容量 16 → 24**（`mfRingMaxIcons` 默认 24）。做法不是"把图标挤小"，而是
+//     `MFRingComputeGeometry()` 反向求解：先用配置半径算容量，装不下 24 就按 4% 步进
+//     放大**有效外圈半径**（上限 = 底盘不出屏），底盘/视图尺寸跟着一起长。
+//  ② **两圈排布重做（用户反馈"无论外圈还是内圈间隔都很大"）**：
+//     · 分配：**外圈先铺满**，剩余才开内圈（0.2.1 按周长比例分 ⇒ 16 个时 外10/内6，
+//       两圈都只填一半、弧上间隔 30pt+，正是"间隔很大"的来源）；内圈只剩 1~2 个时
+//       从外圈匀到 3 个，免得单图标孤零零贴着圆心。
+//     · 半径：内圈半径**按个数自适应** `r_in = R_out × (n_in / n_out)`（下限 0.42×外圈，
+//       上限 = 规划半径），让两圈"弧上间距"一致 ⇒ 视觉上密度均匀。
+//     · 图标间距 `mfRingIconGap` 默认 8 → 6（同半径下容量 +1~2，24 个刚好排满）。
+//  ③ **停靠点下移**：`mfRingParkRatioY` 默认 0.72 → **0.78**（用户："固定后还是有点靠上"）。
+//  ④ **呼出阈值 18 → 12pt**：贴着屏幕边缘时手指横向余量小，阈值太高容易在呼出前松手。
+//  ⑤ **触摸到达诊断**（`[ring][diag]`，0.25s 最多一行）：记录"带内/临带"的触摸是否到达
+//    我们窗口 + 当时的窗口状态。用于一次定性"全屏 App 内贴边滑动到底有没有触摸到我们"。
+//  ⑥ 触发条几何说明（**重要背景**）：归档 38 / 第 42 轮定论 —— 全屏 App 活跃时，
+//     SpringBoard 自己 scene 的普通视图拿不到"屏幕中间区域"的触摸，只有**屏幕边缘 /
+//     状态栏这些系统保留区**仍会路由到 SB 的视图。所以：
+//       · 右/左边缘条 x 紧贴屏幕边（已是如此）；
+//       · **下边缘条改成贴死屏幕底边**（bottomInset 默认 0）——底部主屏手势带同为系统保留区，
+//         是"零 hook 也盼着能在全屏 App 上收到触摸"的最后一块可用地（`mfTriggerEdge=bottom`）。
+//     若 diag 证明"连贴边都没有触摸到达"，下一步只能走系统手势路线
+//     （hook SBReachabilityGestureRecognizer / SBGrabberTongue，见
+//      analysis/stheno-ring-gesture-study.md 第四节）。
+//
 //  ============================ 0.2.1 核心改动 ============================
 //  ① **圆盘变双圈**（`mfRingRings` 默认 2）：图标沿「外圈 + 内圈」两层同心圆排布，
 //     容量 `mfRingMaxIcons` 默认 8 → **16**（上限 24），外/内圈按各自周长按比例分图标，
@@ -76,20 +101,20 @@
 //    mfTriggerLength    number 触发区长度（默认 300）
 //    mfTriggerThickness number 触发区厚度（默认 56）
 //    mfTriggerCenterRatio number 触发区中心位置 0~1（默认 0.78）
-//    mfTriggerBottomInset number 触发区距屏幕底边最少留白（默认 44）
-//    mfRingSummonThreshold number 手势呼出阈值，pt（默认 18）
-//    mfRingRadius       number 圆盘半径（默认 150）
+//    mfTriggerBottomInset number 触发区距屏幕底边最少留白（默认 44；bottom 边默认 0 = 贴死底边）
+//    mfRingSummonThreshold number 手势呼出阈值，pt（默认 12）
+//    mfRingRadius       number 圆盘半径（默认 150；容量不足 24 时会被自动放大）
 //    mfRingIconSize     number 图标尺寸（默认 44）
 //    mfRingEdgeMargin   number 圆盘外沿距屏幕边的间距（默认 12）
 //    mfRingRotation     number 图标整体旋转角，度（默认 0）
 //    mfRingStartAngle   number 第一个图标的角度，度（默认 -90 = 正上方）
-//    mfRingParkRatioY   number 停靠点纵向比例（默认 0.72 = 下半屏中心）
+//    mfRingParkRatioY   number 停靠点纵向比例（默认 0.78 = 下半屏偏下）
 //    mfRingLatchTolerance number 手指靠近停靠点多少 pt 即固定（默认 72）
 //    mfRingSettleDelay  number 手指停住多久自动固定，秒（默认 0.18）
 //    mfRingRings        number 圆盘圈数 1~3（默认 2；装得下时自动收敛为 1 圈）
-//    mfRingInnerRatio   number 内圈半径比例 0.35~0.95（默认 0.62，仅多圈时生效）
-//    mfRingIconGap      number 图标间距估算值，pt（默认 8；越大每圈能放越少）
-//    mfRingMaxIcons     number 圆盘最多显示几个（默认 16，上限 24）
+//    mfRingInnerRatio   number 内圈半径比例上限 0.35~0.95（默认 0.62，仅多圈时生效）
+//    mfRingIconGap      number 图标间距估算值，pt（默认 6；越大每圈能放越少）
+//    mfRingMaxIcons     number 圆盘最多显示几个（默认 24，上限 24）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -99,7 +124,8 @@
 //  0.1.7 全屏窗口 + hitTest 点透；0.1.8 触摸路径零 SB 查询 + 图标延后 + 崩溃降级；
 //  0.1.9 删掉自建窗口，改挂 PullOver 既有窗口（POXWindow，保留）；
 //  0.2.0 修掉四版崩溃的真凶 —— setter 死递归（见文件头 0.2.0 段）；
-//  **0.2.1 双圈布局 + 圆盘应用编辑器（长按边缘触发条打开，自己挑 App）。**
+//  0.2.1 双圈布局 + 圆盘应用编辑器（长按边缘触发条打开，自己挑 App）；
+//  **0.2.2 容量 24 + 两圈"外圈铺满 / 内圈自适应半径" + 停靠点下移 + 触摸到达诊断（diag）。**
 //
 
 #import <UIKit/UIKit.h>
@@ -356,9 +382,9 @@ static NSArray<NSString *> *MFRingEnumerateInstalledBundleIds(NSUInteger limit) 
 
 #pragma mark - 圆盘内容（触摸路径上只读缓存，绝不查 SB）
 
-/// 圆盘最多显示几个（0.2.1：默认 8 → 16，上限 12 → 24）
+/// 圆盘最多显示几个（0.2.2：默认 16 → 24 —— 用户要求"圆盘总量 24"）
 static NSUInteger MFRingMaxIcons(void) {
-    return (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 16.0), 1.0), 24.0);
+    return (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 24.0), 1.0), 24.0);
 }
 
 /// 用户是否**亲手设置过**圆盘内容。写过（哪怕写的是空数组）就必须尊重用户的选择，
@@ -480,6 +506,123 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         MFRingIconCache()[bundleId] = icon;
     }
     return icon;
+}
+
+#pragma mark - 圆盘几何（0.2.2）
+
+/// 【0.2.2】圆盘几何：由配置统一算出"有效外圈半径 / 底盘半径 / 视图半边长 / 圈数"。
+///
+/// 为什么需要"有效半径"：**容量**（能放几个图标）只由外圈半径与图标间距决定，
+/// 而用户要"圆盘总量 24 个"——配置半径(150)+图标(44)+间距(8) 时 两圈只有 23 个位置。
+/// 于是这里反过来算：先用配置半径求容量，不够 24 就按 4% 步进放大半径，
+/// 上限是屏幕内安全值（底盘 + 图标外沿不出屏）。这样 `mfRingMaxIcons=24` 一定装得下。
+/// 几何是"触摸路径无关"的纯计算，只读配置。
+typedef struct {
+    CGFloat outerRadius;   // 最外圈图标圆心所在半径
+    CGFloat dialRadius;    // 底盘（深色圆）半径
+    CGFloat extent;        // ringRoot 半边长（含图标外沿余量）
+    CGFloat iconSize;      // 图标直径
+    CGFloat step;          // 同圈相邻图标的最小圆心距（= 图标宽 + 间距）
+    CGFloat innerRatio;    // 内圈 / 外圈 的固定比例（上限）
+    NSUInteger rings;      // 实际可用圈数（>= 1）
+} MFRingGeometry;
+
+static MFRingGeometry MFRingComputeGeometry(CGRect bounds) {
+    MFRingGeometry geo = (MFRingGeometry){ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1 };
+
+    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
+    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
+    CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 6.0));
+    CGFloat innerRatio = MIN(MAX(MFRingNumber(@"mfRingInnerRatio", 0.62), 0.35), 0.95);
+    NSUInteger desiredRings = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingRings", 2.0), 1.0), 3.0);
+    NSUInteger targetCap = MFRingMaxIcons();
+
+    CGFloat step = MAX(iconSize + gap, 1.0);
+    CGFloat outer = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
+
+    CGFloat half = MIN(CGRectGetWidth(bounds), CGRectGetHeight(bounds)) * 0.5;
+    if (half <= 0.0) {
+        half = 215.0;
+    }
+    CGFloat maxDial = MAX(60.0, half - 8.0);                 // 底盘不出屏
+    CGFloat maxOuter = MAX(outer, maxDial - iconSize * 0.5 - 6.0);
+
+    for (NSUInteger guard = 0; guard < 60; guard++) {
+        CGFloat sum = 0.0;
+        CGFloat r = outer;
+        for (NSUInteger ring = 0; ring < desiredRings; ring++) {
+            if (ring > 0) {
+                r *= innerRatio;
+                if (r < iconSize * 1.15) {
+                    break;
+                }
+            }
+            sum += floor((2.0 * M_PI * r) / step);
+        }
+        if ((NSUInteger)sum >= targetCap || outer >= maxOuter) {
+            break;
+        }
+        outer = MIN(outer * 1.04 + 0.5, maxOuter);
+    }
+
+    geo.outerRadius = outer;
+    geo.dialRadius = outer + iconSize * 0.5 + 6.0;
+    geo.extent = geo.dialRadius + iconSize * 0.5 + 10.0;
+    geo.iconSize = iconSize;
+    geo.step = step;
+    geo.innerRatio = innerRatio;
+
+    NSUInteger rings = 0;
+    CGFloat r = outer;
+    for (NSUInteger ring = 0; ring < desiredRings; ring++) {
+        if (ring > 0) {
+            r *= innerRatio;
+            if (r < iconSize * 1.15) {
+                break;
+            }
+        }
+        if ((NSUInteger)floor((2.0 * M_PI * r) / step) < 1) {
+            break;
+        }
+        rings++;
+    }
+    geo.rings = MAX(rings, (NSUInteger)1);
+    return geo;
+}
+
+#pragma mark - 触摸到达诊断（0.2.2）
+
+/// 【0.2.2 诊断】"触摸到底有没有到达我们窗口"—— 一次测试就能定性的关键日志。
+///
+/// 归档 38 的定论是：**全屏 App 活跃时，SB 自己 scene 的普通视图在"屏幕中间区域"收不到触摸**。
+/// 如果下一次日志里，在 App 内贴边滑动时**一条 `[ring][diag]` 都没有**，
+/// 就证明"连贴边也拿不到触摸" ⇒ 只能走系统手势路线（hook SBReachability/GrabberTongue，
+/// 见 analysis/stheno-ring-gesture-study.md）。
+/// 反之如果有 diag 行却没呼出，就说明是阈值/几何判定问题，改配置即可。
+///
+/// 只在"触发带内、或距带 40pt 内"记，且 0.25s 最多一条 —— 不刷屏、不影响触摸路径性能。
+static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
+    static CFTimeInterval lastDiag = 0.0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastDiag < 0.25) {
+        return;
+    }
+    lastDiag = now;
+    if (window == nil) {
+        return;
+    }
+    CGRect full = window.bounds;
+    CGFloat nearestEdge = MIN(MIN(point.x, point.y),
+                              MIN(MAX(CGRectGetWidth(full) - point.x, 0.0),
+                                  MAX(CGRectGetHeight(full) - point.y, 0.0)));
+    MFLog(@"[ring][diag] 触摸到达宿主窗口 屏幕(%.0f,%.0f) 距最近屏边 %.0fpt 带内=%@ 带=%@ | "
+          @"hidden=%d 交互=%d hiddenRC=%d 键窗口=%d level=%.0f",
+          point.x, point.y, nearestEdge,
+          CGRectContainsPoint(band, point) ? @"是" : @"否",
+          NSStringFromCGRect(band),
+          (int)window.hidden, (int)window.userInteractionEnabled,
+          (int)window.rootViewController.view.hidden,
+          (int)window.isKeyWindow, window.windowLevel);
 }
 
 #pragma mark - 圆盘选择器
@@ -679,18 +822,27 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.1 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
-              @"交互=%d 控制器=%@ | 触发边=%@ 触发条=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
+        MFLog(@"[ring] 0.2.2 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
+              @"交互=%d 键窗口=%d 控制器=%@ | 触发边=%@ 触发条=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               NSStringFromCGRect(bounds), host.windowLevel, (int)host.hidden,
-              (int)host.userInteractionEnabled,
+              (int)host.userInteractionEnabled, (int)host.isKeyWindow,
               self.hostController != nil ? @"已就绪" : @"nil",
               MFRingEdge(), NSStringFromCGRect(self.triggerFrame),
               (unsigned long)MFRingConfiguredBundleIds().count,
               (unsigned long)gMFRingAutoBundleIds.count,
               gMFRingDegraded ? @"是" : @"否");
-        MFLog(@"[ring] 圆盘编辑器入口：长按贴边触发条 0.7 秒（mfRingRings=%.0f 圈，"
-              @"最多 %.0f 个图标）",
-              MFRingNumber(@"mfRingRings", 2.0), MFRingNumber(@"mfRingMaxIcons", 16.0));
+        {
+            MFRingGeometry geo = MFRingComputeGeometry(bounds);
+            MFLog(@"[ring] 圆盘几何：圈数=%lu 有效外圈半径=%.0f 底盘=%.0f 图标=%.0f 步距=%.0f "
+                  @"停靠比例Y=%.2f | 编辑器入口：长按贴边触发条 0.7 秒（最多 %lu 个图标）",
+                  (unsigned long)geo.rings, geo.outerRadius, geo.dialRadius,
+                  geo.iconSize, geo.step,
+                  MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.78), 0.5), 0.92),
+                  (unsigned long)MFRingMaxIcons());
+            MFLog(@"[ring] 呼出阈值=%.0fpt | 归档38 提醒：全屏 App 上只有'屏幕边缘/状态栏'这些系统保留区"
+                  @"的触摸会路由到我们窗口；`[ring][diag]` 行就是用来判定触摸到底有没有到的",
+                  MAX(6.0, MFRingNumber(@"mfRingSummonThreshold", 12.0)));
+        }
 
         // 触摸路径零 SB 查询 ⇒ 列表在安装后延后算一次
         [self scheduleAutoBundleIdEnumeration];
@@ -721,16 +873,29 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
           NSStringFromCGRect(bounds), NSStringFromCGRect(self.triggerFrame));
 }
 
-/// 收起态的触发区（贴边一条）。默认长度 300，且离屏幕底边 ≥ mfTriggerBottomInset，
-/// 避开底部"主屏手势（Home Indicator）"区。
+/// 收起态的触发区（贴边一条）。
+///
+/// 【0.2.2 重要背景】归档 38 / 第 42 轮定论：**全屏 App 活跃时，SpringBoard 自己 scene
+/// 的普通视图拿不到"屏幕中间区域"的触摸**（触点归属前台 App 的 scene），
+/// 只有**屏幕边缘 / 状态栏这些系统保留区**仍会路由到 SB 的视图。
+/// 所以触发条必须**贴死在屏幕边缘**（inner 侧越靠外越好）：
+///   · 右/左边缘条：x 紧贴屏幕右/左边（宽度 = mfTriggerThickness）；
+///   · 下边缘条：**贴屏幕底边**（bottomInset 默认 0）——底部主屏手势带同样是系统保留区，
+///     是"零 hook 也能在全屏 App 上收到触摸"的最后一块可用地。
+/// 顶部条无所谓 inset。左右条的纵向范围仍避开底部 44pt，免得跟主屏手势打架。
 - (CGRect)triggerFrameForBounds:(CGRect)bounds {
     CGFloat width = CGRectGetWidth(bounds);
     CGFloat height = CGRectGetHeight(bounds);
     CGFloat thickness = MAX(16.0, MFRingNumber(@"mfTriggerThickness", 56.0));
     CGFloat length = MAX(80.0, MFRingNumber(@"mfTriggerLength", 300.0));
     CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
-    CGFloat bottomInset = MAX(0.0, MFRingNumber(@"mfTriggerBottomInset", 44.0));
     NSString *edge = MFRingEdge();
+    // 下边缘条默认**不留底边距**（贴死屏幕底边）；其余方向沿用 44pt 避让主屏手势区
+    CGFloat insetFallback = [edge isEqualToString:@"bottom"] ? 0.0 : 44.0;
+    CGFloat bottomInset = MAX(0.0, MFRingNumber(@"mfTriggerBottomInset", insetFallback));
+    if ([edge isEqualToString:@"bottom"]) {
+        bottomInset = MIN(bottomInset, MAX(height - thickness, 0.0));
+    }
 
     if ([edge isEqualToString:@"top"] || [edge isEqualToString:@"bottom"]) {
         CGFloat originX = MIN(MAX(width * centerRatio - length / 2.0, 0.0), MAX(width - length, 0.0));
@@ -812,6 +977,10 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (strip == nil || strip.hidden || CGRectIsEmpty(self.triggerFrame)) {
         return nil;
     }
+    // 【0.2.2 诊断】带内 / 临带 40pt 的触摸都记一行 —— 见 MFRingDiagTouch 注释
+    if (CGRectContainsPoint(CGRectInset(self.triggerFrame, -40.0, -40.0), point)) {
+        MFRingDiagTouch(point, self.triggerFrame, window);
+    }
     if (!CGRectContainsPoint(self.triggerFrame, point)) {
         return nil;
     }
@@ -832,15 +1001,21 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     self.lastFingerPoint = finger;
 
     if (gesture.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[ring] 贴边按下(POXWindow 子视图 tag=%ld) 屏幕(%.0f,%.0f)",
-              (long)gesture.view.tag, finger.x, finger.y);
+        CGRect full = window.bounds;
+        CGFloat edgeGap = MIN(MIN(finger.x, finger.y),
+                              MIN(MAX(CGRectGetWidth(full) - finger.x, 0.0),
+                                  MAX(CGRectGetHeight(full) - finger.y, 0.0)));
+        MFLog(@"[ring] 贴边按下(POXWindow 子视图 tag=%ld) 屏幕(%.0f,%.0f) 距最近屏边 %.0fpt",
+              (long)gesture.view.tag, finger.x, finger.y, edgeGap);
         return;
     }
 
     if (gesture.state == UIGestureRecognizerStateChanged) {
         if (!self.expanded) {
             CGPoint translation = [gesture translationInView:gesture.view];
-            CGFloat threshold = MAX(6.0, MFRingNumber(@"mfRingSummonThreshold", 18.0));
+            // 【0.2.2】阈值 18 → 12：贴着边缘时手指能走的横向余量很小，
+            // 阈值太高会让"贴边轻扫"被系统手势吃掉之前就松手
+            CGFloat threshold = MAX(6.0, MFRingNumber(@"mfRingSummonThreshold", 12.0));
             if (fabs(translation.x) > threshold || fabs(translation.y) > threshold) {
                 [self showAtPoint:finger];
             }
@@ -905,9 +1080,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (CGRectIsEmpty(bounds)) {
         return CGPointZero;
     }
-    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
+    // 【0.2.2】用"有效几何"而不是配置半径做夹取 —— 半径可能被容量 24 自动放大过
     CGFloat margin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
-    CGFloat extent = radius + margin;
+    CGFloat extent = MFRingComputeGeometry(bounds).extent + margin;
     CGFloat minX = extent;
     CGFloat maxX = MAX(CGRectGetMaxX(bounds) - extent, minX);
     CGFloat minY = CGRectGetMidY(bounds);                       // 下半屏
@@ -951,7 +1126,8 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         self.hasLatchFinger = NO;
         self.settleGeneration += 1;
 
-        CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.72), 0.5), 0.92);
+        // 【0.2.2】停靠点下移：0.72 → 0.78（用户反馈"固定后还是有点靠上"）
+        CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.78), 0.5), 0.92);
         self.parkCenter = [self clampRingCenter:CGPointMake(CGRectGetMidX(bounds),
                                                             CGRectGetHeight(bounds) * ratio)];
         MFLog(@"[ring] 呼出前置 ok（0.2.0：setter 死递归已修）");
@@ -1077,10 +1253,17 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 #pragma mark 圆盘构建
 
 - (void)buildRingInContainer:(UIView *)container {
-    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
-    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
+    // 【0.2.2】几何统一由 MFRingComputeGeometry 算：
+    //   · 配置半径装不下 `mfRingMaxIcons`(默认 24) 时自动放大半径；
+    //   · 底盘半径 / 视图半边长都以"有效外圈半径"为准，图标永不顶出屏幕。
+    MFRingGeometry geo = MFRingComputeGeometry(container.bounds);
+    CGFloat iconSize = geo.iconSize;
+    CGFloat step = geo.step;
+    CGFloat extent = geo.extent;
+    CGFloat dialRadius = geo.dialRadius;
+    CGFloat outerRadius = geo.outerRadius;
+    CGFloat innerRatio = geo.innerRatio;
     CGFloat rotation = MFRingNumber(@"mfRingRotation", 0.0);
-    CGFloat extent = radius + iconSize * 0.5 + 10.0;   // 圆盘视图半边长（含图标外沿余量）
 
     // 圆盘整体放在一个固定尺寸的容器里 —— 移动圆盘 = 改 ringRoot.center
     UIView *ringRoot = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, extent * 2.0, extent * 2.0)];
@@ -1093,7 +1276,8 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
     // 完整圆形底盘
     UIBezierPath *path = [UIBezierPath bezierPathWithOvalInRect:
-                          CGRectMake(extent - radius, extent - radius, radius * 2.0, radius * 2.0)];
+                          CGRectMake(extent - dialRadius, extent - dialRadius,
+                                     dialRadius * 2.0, dialRadius * 2.0)];
     CAShapeLayer *dial = [CAShapeLayer layer];
     dial.path = path.CGPath;
     dial.fillColor = [UIColor colorWithWhite:0.12 alpha:0.55].CGColor;
@@ -1111,7 +1295,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         NSString *text = gMFRingDegraded
             ? @"圆盘里还没有 App\n（降级模式：自动枚举已停用）\n长按屏幕边缘可自己挑选 App"
             : @"圆盘里还没有 App\n长按屏幕边缘（触发条）约 1 秒\n即可自己挑选要放在圆盘上的 App";
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, radius * 1.9, 110.0)];
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, outerRadius * 1.9, 110.0)];
         hint.numberOfLines = 0;
         hint.textAlignment = NSTextAlignmentCenter;
         hint.text = text;
@@ -1122,44 +1306,38 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         return;
     }
 
-    // 【0.2.1】多圈（同心圆）布局：**先铺"首字母"占位**，真图标延后贴
+    // 【0.2.2】多圈（同心圆）布局：**先铺"首字母"占位**，真图标延后贴
     CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);   // 默认从正上方开始
-    CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 8.0));
     CGPoint localCenter = CGPointMake(extent, extent);
 
-    // ① 算出每一圈的半径（由外到内）与该圈最多能放几个
-    NSUInteger desiredRings = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingRings", 2.0), 1.0), 3.0);
-    CGFloat innerRatio = MIN(MAX(MFRingNumber(@"mfRingInnerRatio", 0.62), 0.35), 0.95);
+    // ① 算出每一圈的规划半径（由外到内）与该圈最多能放几个
     NSMutableArray<NSNumber *> *ringRadii = [NSMutableArray array];
     NSMutableArray<NSNumber *> *ringCaps = [NSMutableArray array];
-    for (NSUInteger ring = 0; ring < desiredRings; ring++) {
-        CGFloat ringRadius;
-        if (ring == 0) {
-            ringRadius = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
-        } else {
-            ringRadius = [ringRadii[ring - 1] doubleValue] * innerRatio;
-            if (ringRadius < iconSize * 1.15) {
-                break;   // 内圈塞不下图标就不再加圈
-            }
+    for (NSUInteger ring = 0; ring < geo.rings; ring++) {
+        CGFloat ringRadius = (ring == 0) ? outerRadius
+                                        : [ringRadii[ring - 1] doubleValue] * innerRatio;
+        if (ring > 0 && ringRadius < iconSize * 1.15) {
+            break;   // 内圈塞不下图标就不再加圈
         }
         [ringRadii addObject:@(ringRadius)];
-        double cap = floor((2.0 * M_PI * ringRadius) / MAX(iconSize + gap, 1.0));
-        [ringCaps addObject:@(MAX(cap, 1.0))];
-    }
-
-    // ② 装得下就收敛为一圈（少量 App 时单圈更好看）；否则丢掉容量太小的内圈
-    if (count <= [ringCaps[0] unsignedIntegerValue]) {
-        if (ringRadii.count > 1) {
-            [ringRadii removeObjectsInRange:NSMakeRange(1, ringRadii.count - 1)];
-            [ringCaps removeObjectsInRange:NSMakeRange(1, ringCaps.count - 1)];
-        }
-    } else {
-        while (ringCaps.count > 1 && [ringCaps.lastObject unsignedIntegerValue] < 3) {
-            [ringRadii removeLastObject];
-            [ringCaps removeLastObject];
-        }
+        [ringCaps addObject:@(MAX(floor((2.0 * M_PI * ringRadius) / step), 1.0))];
     }
     NSUInteger rings = ringRadii.count;
+
+    // ② 外圈装得下就收敛为一圈（少量 App 时单圈更好看，保持 0.2.1 的观感）
+    if (count <= [ringCaps[0] unsignedIntegerValue]) {
+        if (rings > 1) {
+            [ringRadii removeObjectsInRange:NSMakeRange(1, rings - 1)];
+            [ringCaps removeObjectsInRange:NSMakeRange(1, rings - 1)];
+            rings = 1;
+        }
+    } else {
+        while (rings > 1 && [ringCaps[rings - 1] unsignedIntegerValue] < 3) {
+            [ringRadii removeLastObject];
+            [ringCaps removeLastObject];
+            rings--;
+        }
+    }
     NSUInteger totalCap = 0;
     for (NSNumber *cap in ringCaps) {
         totalCap += [cap unsignedIntegerValue];
@@ -1168,7 +1346,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         count = totalCap;   // 兜底：超出所有圈的总容量时截断
     }
 
-    // ③ 按各圈容量比例把 count 分到各圈，余数从外圈往里补
+    // ③ 分配：**外圈先铺满**，剩余按容量往里圈填。
+    //    0.2.1 是"按容量比例"分（16 个 ⇒ 外 10 内 6），结果两圈都只填一半、间隔很大；
+    //    用户要的正是"外圈铺满、内圈再开一圈"。
     NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
     for (NSUInteger ring = 0; ring < rings; ring++) {
         [perRing addObject:@(0)];
@@ -1176,24 +1356,50 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     NSUInteger left = count;
     for (NSUInteger ring = 0; ring < rings && left > 0; ring++) {
         NSUInteger cap = [ringCaps[ring] unsignedIntegerValue];
-        NSUInteger share = (NSUInteger)floor((double)count * (double)cap / (double)MAX(totalCap, (NSUInteger)1));
-        share = MIN(share, MIN(cap, left));
-        perRing[ring] = @(share);
-        left -= share;
+        NSUInteger take = MIN(cap, left);
+        perRing[ring] = @(take);
+        left -= take;
     }
-    for (NSUInteger ring = 0; ring < rings && left > 0; ring++) {
-        NSUInteger cap = [ringCaps[ring] unsignedIntegerValue];
-        NSUInteger current = [perRing[ring] unsignedIntegerValue];
-        NSUInteger add = MIN(left, cap - current);
-        perRing[ring] = @(current + add);
-        left -= add;
+    // 内圈只分到 1~2 个时，从外圈匀几个下来凑到 3 个 —— 否则那一个图标孤零零贴在圆心附近
+    if (rings > 1) {
+        NSUInteger last = rings - 1;
+        NSUInteger innerCount = [perRing[last] unsignedIntegerValue];
+        if (innerCount > 0 && innerCount < 3) {
+            NSUInteger need = 3 - innerCount;
+            for (NSInteger ring = (NSInteger)last - 1; ring >= 0 && need > 0; ring--) {
+                NSUInteger have = [perRing[(NSUInteger)ring] unsignedIntegerValue];
+                if (have <= 4) {
+                    continue;   // 外圈自己也得留够
+                }
+                NSUInteger move = MIN(need, have - 3);
+                perRing[(NSUInteger)ring] = @(have - move);
+                need -= move;
+            }
+            perRing[last] = @(innerCount + ((3 - innerCount) - need));
+        }
     }
 
-    // ④ 逐圈铺图标 —— 先铺"首字母"占位，真图标延后贴
+    // ④ 内圈半径**按个数自适应**：r_in = R_out × (n_in / n_out)，让两圈"弧上间距"一致。
+    //    固定 0.62 比例时，6 个图标被摊在整圈上 ⇒ 间隔 35pt+，这就是"内圈间隔很大"的原因。
+    //    上限仍取规划半径（不至于贴到外圈），下限 0.42×外圈（不至于挤成一团）。
+    NSMutableArray<NSNumber *> *drawnRadii = [NSMutableArray arrayWithCapacity:rings];
+    CGFloat outerCount = MAX((CGFloat)[perRing[0] doubleValue], 1.0);
+    for (NSUInteger ring = 0; ring < rings; ring++) {
+        CGFloat drawn = [ringRadii[ring] doubleValue];
+        if (ring > 0) {
+            CGFloat innerCount = (CGFloat)[perRing[ring] doubleValue];
+            if (innerCount > 0.5) {
+                drawn = MIN(MAX(outerRadius * (innerCount / outerCount), outerRadius * 0.42), drawn);
+            }
+        }
+        [drawnRadii addObject:@(drawn)];
+    }
+
+    // ⑤ 逐圈铺图标 —— 先铺"首字母"占位，真图标延后贴
     NSUInteger placed = 0;
     NSMutableArray<NSString *> *layoutLog = [NSMutableArray array];
     for (NSUInteger ring = 0; ring < rings && placed < count; ring++) {
-        CGFloat iconRadius = [ringRadii[ring] doubleValue];
+        CGFloat iconRadius = [drawnRadii[ring] doubleValue];
         NSUInteger ringCount = [perRing[ring] unsignedIntegerValue];
         for (NSUInteger slot = 0; slot < ringCount && placed < count; slot++, placed++) {
             NSString *bundleId = bundleIds[placed];
@@ -1233,9 +1439,11 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         [layoutLog addObject:[NSString stringWithFormat:@"第%lu圈(r=%.0f/%lu个)",
                               (unsigned long)(ring + 1), iconRadius, (unsigned long)ringCount]];
     }
-    MFLog(@"[ring] <<< 图标铺好：%.0f 个图标 / %lu 圈 [%@] 图标 %.0f 起始角 %.0f",
+    MFLog(@"[ring] <<< 图标铺好：%.0f 个图标 / %lu 圈 [%@] 图标 %.0f 步距 %.0f "
+          @"(有效外圈半径 %.0f 底盘 %.0f 上限 %lu)",
           (double)placed, (unsigned long)rings,
-          [layoutLog componentsJoinedByString:@" "], iconSize, startAngle);
+          [layoutLog componentsJoinedByString:@" "], iconSize, step,
+          outerRadius, dialRadius, (unsigned long)MFRingMaxIcons());
 }
 
 /// 延后抓取真图标。危险动作 ⇒ 立闸门，走完并存活才撤。
