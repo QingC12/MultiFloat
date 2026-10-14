@@ -69,10 +69,11 @@
 
 static char kMFRingBundleIdKey;
 
-/// 前向声明：MFRingWindow 的 hitTest 要问 MFRingPicker（定义在下方）
-@interface MFRingPicker (MFRingHitTest)
-+ (BOOL)ringWindowHitTestDecision:(UIWindow *)window point:(CGPoint)point;
-@end
+@class MFRingPicker;
+
+/// 窗口命中判定（实现见文件后半段，MFRingPicker 定义之后）——
+/// 不能写成 MFRingPicker 的分类：分类必须先有类声明（clang: cannot find interface declaration）。
+static BOOL MFRingWindowHitTestDecision(UIWindow *window, CGPoint point);
 
 #pragma mark - 配置读取
 
@@ -235,7 +236,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 @implementation MFRingWindow
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (![MFRingPicker ringWindowHitTestDecision:self point:point]) {
+    if (!MFRingWindowHitTestDecision(self, point)) {
         return nil;   // 点透：本窗口不参与这次触摸
     }
     return [super hitTest:point withEvent:event];
@@ -286,21 +287,6 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         instance = [[MFRingPicker alloc] init];
     });
     return instance;
-}
-
-/// 窗口命中判定：收起态只认触发条，展开态整窗接管
-+ (BOOL)ringWindowHitTestDecision:(UIWindow *)window point:(CGPoint)point {
-    MFRingPicker *picker = [MFRingPicker shared];
-    if (window == nil || window != picker.window) {
-        return NO;
-    }
-    if (picker.expanded) {
-        return YES;
-    }
-    if (CGRectIsEmpty(picker.triggerFrame)) {
-        return NO;
-    }
-    return CGRectContainsPoint(picker.triggerFrame, point);
 }
 
 #pragma mark 安装
@@ -912,6 +898,24 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 }
 
 @end
+
+#pragma mark - 窗口命中判定
+
+/// 收起态只认「贴边触发条」，条外一律返回 NO（窗口 hitTest 会返回 nil → 触摸点透给下层 App）；
+/// 展开态整窗接管（圆盘 + 轻遮罩需要吃掉全部触摸）。
+static BOOL MFRingWindowHitTestDecision(UIWindow *window, CGPoint point) {
+    MFRingPicker *picker = [MFRingPicker shared];
+    if (window == nil || window != picker.window) {
+        return NO;
+    }
+    if (picker.expanded) {
+        return YES;
+    }
+    if (CGRectIsEmpty(picker.triggerFrame)) {
+        return NO;
+    }
+    return CGRectContainsPoint(picker.triggerFrame, point);
+}
 
 #pragma mark - 安装入口
 
