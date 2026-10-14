@@ -6,6 +6,22 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.42.0 变更（第 47 轮：按 PullOver-X 模型改写窗口/触摸 —— 用户要求先给测试版）：
+#   参考 github.com/mlgm66/PullOver-X（GPL-3.0，仅借鉴设计，代码自写）：
+#   - ① windowLevel 1099/1170 -> **100**（源码注释：SBStatusBarWindow=999、
+#     SBControlCenterWindow=1080，"100 盖过 App 且明确低于状态栏/控制中心"）；
+#     自动提升改为可选（windowLevelAutoRaise，默认 NO）；1010/1099 视为历史占位值。
+#   - ② 新增 MFFloatWindow 子类：**接管 hitTest**，命中面板根视图等"无意义命中"返回 nil
+#     → 触摸点透给下面的 App（PullOver 的 interactiveViewForWindowPoint 同思路）。
+#   - ③ 显示浮窗改走 **makeKeyAndVisible**（makeKeyOnShow 默认 YES），
+#     并随显隐切换窗口 userInteractionEnabled（PullOver 做法）。
+#   - ④ 隐形透明热区 -> **可见把手 nub**（MFNubView，48pt 圆角块 + 放大到 ≥52pt 的
+#     pointInside、向屏幕边缘多给 12pt）；手势仲裁照 PullOver：
+#     单击=显隐 / 长按 0.3s=圆弧 / 横向左拖=圆弧 / 竖向拖=把手沿边移动 / 双指=等比缩放。
+#   - ⑤ 层级重排：浮窗 100 < 把手窗 150 < 圆弧选择器 200 < 状态栏 999；
+#     状态栏镜像触摸层默认关闭（mirrorTouchZones=true 可开，仅诊断用）。
+#   - ⑥ cfgVersion 23 -> 24 迁移（自动把旧层级/开关修正到新模型）。
+#
 # 0.41.0 变更（第 45 轮：归档40 —— 贴边区按下即呼出 + 左缘探针）：
 #   - 归档40 实证：13 次手势全部来自 tag=990050（贴边 20pt），且 dx 仅 -10~-14 就结束
 #     （疑似被系统右缘返回手势抢走）-> 永远达不到 -20pt 阈值，圆弧呼不出来；

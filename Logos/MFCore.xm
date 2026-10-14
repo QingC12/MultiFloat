@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.41.0";
+    return @"0.42.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -302,11 +302,15 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @23,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @24,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @6,
         @"embedInStatusBar": @NO,                      // 【0.34.0】挂载实测不可见，默认回退独立 UIWindow
-        @"windowLevel"     : @1010,
+        @"windowLevelAutoRaise": @NO,                  // 【0.42.0】PullOver-X 模型：默认不自动提升层级
+        @"makeKeyOnShow": @YES,                        // 【0.42.0】显示浮窗时 makeKeyAndVisible
+        @"passThrough": @YES,                          // 【0.42.0】窗口 hitTest 未命中返回 nil（点透）
+        @"visibleNub": @YES,                           // 【0.42.0】可见把手（替代隐形热区）
+        @"windowLevel"     : @100,   // 【0.42.0】PullOver-X 模型：盖过 App、低于状态栏
         // 【0.23.0】Stheno 风交互：
         @"defaultBundleID" : @"",                      // 非空 => 浮窗出现即自动承载该 App（"默认打开"）
         @"pickerGesture"   : @1,                       // 应用选择器唤出手势：0=关 1=双击窗口边缘条（默认） 2=长按边缘条
@@ -675,6 +679,22 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                   @"（0.32/0.33 挂载视图不渲染；想重新实验可在 plist 显式改 true）");
             up[@"embedInStatusBar"] = @NO;
             up[@"cfgVersion"] = @23;
+        }
+
+        // ---- 0.41 -> 0.42：PullOver-X 窗口模型（层级 100 等）----
+        if (cur < 24) {
+            id lv = up[@"windowLevel"];
+            double lvNum = [lv respondsToSelector:@selector(doubleValue)] ? [lv doubleValue] : 0.0;
+            if (lv == nil || lvNum == 1010.0 || lvNum == 1099.0 || lvNum > 1050.0) {
+                up[@"windowLevel"] = @100;
+            }
+            up[@"windowLevelAutoRaise"] = up[@"windowLevelAutoRaise"] ?: @NO;
+            up[@"makeKeyOnShow"]        = up[@"makeKeyOnShow"]        ?: @YES;
+            up[@"passThrough"]          = up[@"passThrough"]          ?: @YES;
+            up[@"visibleNub"]           = up[@"visibleNub"]           ?: @YES;
+            up[@"cfgVersion"] = @24;
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=24：PullOver-X 窗口模型 —— windowLevel=100"
+                  @"（盖过 App、低于状态栏 999）/ 关闭自动提升 / 显示 makeKeyAndVisible / hitTest 点透 / 可见把手");
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];

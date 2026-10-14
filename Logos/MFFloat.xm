@@ -2832,6 +2832,7 @@ static void MFInstallSDTouchOverlay(void);  // 【0.36.0】前向声明（Manage
 - (void)summonPan:(UIPanGestureRecognizer *)g;   // 【0.34.0】右缘热区左滑触发
 - (void)summonDrag:(UIPanGestureRecognizer *)g;  // 【0.34.0】悬浮按钮垂直拖动
 - (void)bandPinch:(UIPanGestureRecognizer *)g;   // 【0.39.0】拾取带两指缩放
+- (void)summonNubPan:(UIPanGestureRecognizer *)g;  // 【0.42.0】可见把手：横=选择器 / 竖=沿边移动
 - (CGRect)floatFrame;                            // 【0.39.0】浮窗当前 frame
 - (void)moveFloatByTranslation:(CGPoint)t;       // 【0.39.0】移动浮窗（带钳制）
 - (void)resizeFloatToWidth:(CGFloat)w;           // 【0.39.0】等比缩放浮窗（中心锚）
@@ -3415,6 +3416,51 @@ static CGFloat   gMFPickerCY = 0.0;           // 当前弧心高度
 static UIView   *gMFPickerRoot = nil;
 static const CGFloat kMFPickerIconSize = 44.0;   // 【0.38.0】图标缩小（原 58）
 static const CGFloat kMFPickerRadius   = 152.0;
+
+// ===== 【0.42.0】PullOver-X 式窗口与把手 =====
+// 参考 github.com/mlgm66/PullOver-X（GPL-3.0，仅借鉴设计，代码自写）：
+//   ① 层级 100（"盖过 App，明确低于状态栏 999 / 控制中心 1080"）
+//   ② 显示用 makeKeyAndVisible（不只是 hidden=NO）
+//   ③ 窗口 hitTest: 接管 —— 未命中交互视图就返回 nil（点透给下面的 App）
+//   ④ 可见把手 nub（pointInside 放大到最小 52pt），而不是看不见的透明热区
+@interface MFFloatWindow : UIWindow
+@end
+
+@implementation MFFloatWindow
+
+/// 命中测试接管：命中浮窗内的交互视图才返回；否则返回 nil -> 触摸点透给下面的 App
+/// （PullOver-X 的 POXWindow.hitTest: → interactiveViewForWindowPoint: 同思路）
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == nil) return nil;
+    // passThrough=false 时退回系统默认行为（配置键逃生阀）
+    if (!MFConfigBool([[MFFloatManager shared] config], @"passThrough", YES)) return hit;
+    // 命中"面板根视图自身"（透明边角/背景）= 没有意义的命中 -> 点透给下面的 App
+    UIView *panelRoot = self.rootViewController.view;
+    if (panelRoot != nil && hit == panelRoot) return nil;
+    return hit;
+}
+
+@end
+
+/// 可见把手（nub）：命中区放大到最小 52pt，并向外（屏幕边缘方向）多给 12pt
+@interface MFNubView : UIView
+@end
+
+@implementation MFNubView
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGRect b = self.bounds;
+    CGFloat minSide = 52.0;
+    CGFloat hInset = MAX(0.0, (minSide - b.size.width) / 2.0);
+    CGFloat vInset = MAX(0.0, (minSide - b.size.height) / 2.0);
+    CGRect hit = CGRectInset(b, -hInset, -vInset);
+    hit.size.width += 12.0;          // 屏幕边缘一侧再多 12pt（贴边也好抓）
+    return CGRectContainsPoint(hit, point);
+}
+
+@end
+
 // 【0.39.0】右缘"拾取带"手势状态：0=未定 1=选择器 2=移动浮窗
 static NSInteger gMFBandMode = 0;
 static CGFloat   gMFBandPinchBaseW = 0.0;   // 两指缩放基准宽度
@@ -3597,6 +3643,48 @@ static void MFPickerHide(void) {
     }
 }
 
+/// 【0.42.0】可见把手的单指手势（PullOver-X 式仲裁）：
+/// 横向分量更大且向左 -> 呼出圆弧选择器；否则竖向拖动 = 把手沿屏幕边缘上下移动
+- (void)summonNubPan:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    if (v == nil) return;
+    CGPoint t = [g translationInView:v];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        gMFBandMode = 0;
+        MFLog(@"[nub] 按下 来源=%@(tag=%ld) v.frame=%@",
+              NSStringFromClass([v.window class]), (long)v.tag, NSStringFromCGRect(v.frame));
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateChanged) {
+        if (gMFBandMode == 0) {
+            if (fabs(t.x) > fabs(t.y) && t.x < -8.0) {
+                gMFBandMode = 1;
+                MFLog(@"[nub] 判定=呼出圆弧选择器（dx=%.0f dy=%.0f）", t.x, t.y);
+                gMFPickerGestureMode = YES;
+                [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
+            } else if (fabs(t.y) > 8.0) {
+                gMFBandMode = 2;
+                MFLog(@"[nub] 判定=把手沿边缘移动（dy=%.0f）", t.y);
+            } else {
+                return;
+            }
+        }
+        if (gMFBandMode == 1) {
+            CGPoint p = [v.window convertPoint:[g locationInView:nil] toWindow:nil];
+            [self arcPickerUpdateAtY:gMFPickerCY finger:p];
+        } else {
+            [self summonDrag:g];   // 复用：移动整个把手窗口（带垂直钳制）
+        }
+        return;
+    }
+    if (gMFBandMode == 1) {
+        [self arcPickerCommitWithTranslation:t];
+    } else if (gMFBandMode == 2) {
+        MFLogS(@"[nub] 把手移动结束");
+    }
+    gMFBandMode = 0;
+}
+
 // ===== 【0.39.0】浮窗几何操作（供右缘拾取带调用；含边界钳制） =====
 - (CGRect)floatFrame {
     UIView *host = self.panel.hostWindow ?: self.window;
@@ -3672,7 +3760,7 @@ static void MFPickerHide(void) {
             gMFPickerWin = (sc != nil) ? [[UIWindow alloc] initWithWindowScene:sc]
                                        : [[UIWindow alloc] initWithFrame:scr];
             if (gMFPickerWin == nil) { MFLogS(@"[arc] !! 选择器窗口创建失败"); return; }
-            gMFPickerWin.windowLevel = 1101.0;
+            gMFPickerWin.windowLevel = 200.0;   // 【0.42.0】浮窗(100)/把手(150)之上、状态栏之下
             gMFPickerWin.backgroundColor = [UIColor clearColor];
         }
         gMFPickerWin.frame = scr;
@@ -3957,9 +4045,16 @@ static BOOL MFWriteDockApps(NSArray *ids) {
             host.hidden = !visible;
             if (visible && host.superview != nil) [host.superview bringSubviewToFront:host];
         } else {
+            // 【0.42.0】PullOver-X 模型：显隐时切换窗口可交互性；显示时 makeKeyAndVisible
+            self.window.userInteractionEnabled = visible;
             self.window.hidden = !visible;
-            if (visible && self.window.frame.size.width < 50.0)
-                self.window.frame = [UIScreen mainScreen].bounds;
+            if (visible) {
+                if (self.window.frame.size.width < 50.0)
+                    self.window.frame = [UIScreen mainScreen].bounds;
+                if (MFConfigBool(self.config, @"makeKeyOnShow", YES)) {
+                    [self.window makeKeyAndVisible];
+                }
+            }
         }
         if (!visible) MFStopSceneKeepAlive(@"呼出条隐藏浮窗");
         MFLog(@"[summon] 浮窗可见性 -> %d（%@）", (int)visible, embedded ? @"挂载" : @"独立窗口");
@@ -4022,11 +4117,12 @@ static BOOL MFWriteDockApps(NSArray *ids) {
     CGRect frame = CGRectMake((screen.size.width  - w) / 2.0,
                               (screen.size.height - h) / 2.0, w, h);
 
-    UIWindow *win = nil;
+    // 【0.42.0】PullOver-X 式窗口（hitTest 接管 = 点透）
+    MFFloatWindow *win = nil;
     if (scene != nil) {
-        win = [[UIWindow alloc] initWithWindowScene:scene];
+        win = [[MFFloatWindow alloc] initWithWindowScene:scene];
     } else {
-        win = [[UIWindow alloc] initWithFrame:frame];
+        win = [[MFFloatWindow alloc] initWithFrame:frame];
     }
     if (win == nil) {
         MFLogS(@"[ui] !! UIWindow 创建失败");
@@ -4034,9 +4130,16 @@ static BOOL MFWriteDockApps(NSArray *ids) {
     }
     win.frame = frame;
 
-    double level = 1010.0;
+    // 【0.42.0 PullOver-X 模型】默认 level = 100：
+    // 源码注释原话 —— "SBStatusBarWindow=999、SBControlCenterWindow=1080；
+    // 100 盖过 App，且明确低于状态栏 / 控制中心"。我们此前一路加到 1099/1170 是反方向。
+    double level = 100.0;
     id cfgLevel = self.config[@"windowLevel"];
-    if ([cfgLevel respondsToSelector:@selector(doubleValue)]) level = [cfgLevel doubleValue];
+    if ([cfgLevel respondsToSelector:@selector(doubleValue)]) {
+        double v = [cfgLevel doubleValue];
+        if (v > 0.0 && v != 1010.0 && v != 1099.0) level = v;   // 1010/1099 = 历史占位值，按默认处理
+    }
+    BOOL autoRaise = MFConfigBool(self.config, @"windowLevelAutoRaise", NO);   // 默认关闭
     // 【0.28.0 归档30】App 前台时浮窗手势失效（能看见、点不到）：
     // 0.27 证实 statusBar 与主窗口同一 scene，换 scene 方案作废。
     // 新假说：触摸仲裁按 windowLevel 分层，前台 App 内容路由压过了 level=1010 的浮窗。
@@ -4044,7 +4147,7 @@ static BOOL MFWriteDockApps(NSArray *ids) {
     // 【0.29.0 归档31 修复】默认配置里 windowLevel=@1010 是"未配置"（归档31 日志
     // 证明 0.28 的自动提升因 cfgLevel!=nil 从未执行）——1010 视为未配置，照常自动提。
     @try {
-        if (cfgLevel == nil || level == 1010.0) {
+        if (autoRaise) {
             // 【0.30.0 归档32 修复】0.29 用 MFClassSharedInstance(@"UIStatusBarWindow")
             // 找不到实例（日志 `statusBar windowLevel=-1`）—— Stheno 是 hook 到
             // UIStatusBarWindow 实例再 setWindowLevel: 的。改枚举进程内所有窗口：
@@ -4080,6 +4183,9 @@ static BOOL MFWriteDockApps(NSArray *ids) {
         }
     } @catch (NSException *e) {
         MFLog(@"[ui] !! statusBar windowLevel 探测异常：%@ -> 维持 level=%.0f", e, level);
+    }
+    if (!autoRaise) {
+        MFLog(@"[ui] windowLevel = %.0f（PullOver-X 模型：盖过 App、低于状态栏 999；自动提升已关闭）", level);
     }
     win.windowLevel = level;
 
@@ -4172,7 +4278,13 @@ static BOOL MFWriteDockApps(NSArray *ids) {
         });
     } else {
         win.rootViewController = panel;
+        win.userInteractionEnabled = YES;
         win.hidden = NO;
+        // 【0.42.0】PullOver-X 模型：显示用 makeKeyAndVisible（不只是 hidden=NO）
+        if (MFConfigBool(self.config, @"makeKeyOnShow", YES)) {
+            [win makeKeyAndVisible];
+            MFLogS(@"[ui] 已 makeKeyAndVisible（PullOver-X 式）");
+        }
         MFLog(@"[ui] 浮窗已显示 level=%.0f frame=%@ hidden=%d key=%d",
              level, NSStringFromCGRect(win.frame), (int)win.isHidden, (int)win.isKeyWindow);
     }
@@ -4845,71 +4957,66 @@ static void MFInstallSummonGesture(void) {
         MFLog(@"[summon] 呼出窗口 scene=%@ frame=%@（局部热区）",
               sScene ? NSStringFromClass([sScene class]) : @"nil(回退 frame)",
               NSStringFromCGRect(sw.frame));
-        sw.windowLevel = 1100.0;
+        sw.windowLevel = 150.0;   // 【0.42.0】PullOver-X 模型：浮窗之上、状态栏 999 之下
         sw.backgroundColor = [UIColor clearColor];
         sw.userInteractionEnabled = YES;
         sw.hidden = NO;
 
-        // 滑选/拾取带：右边缘中段 56x300（局部），透明不挡视线
-        //   单指：竖向拖动=移动浮窗；明显向左滑=呼出圆弧选择器
-        //   两指：竖向拖动=等比缩放浮窗（前台 App 也走这条路）
-        UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 56.0, 0.0, 56.0, 300.0)];
-        strip.backgroundColor = [UIColor clearColor];
-        strip.userInteractionEnabled = YES;
-        strip.tag = 990040;
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
-        pan.maximumNumberOfTouches = 1;
-        [strip addGestureRecognizer:pan];
-        UIPanGestureRecognizer *pinch = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(bandPinch:)];
-        pinch.minimumNumberOfTouches = 2;
-        pinch.maximumNumberOfTouches = 2;
-        [strip addGestureRecognizer:pinch];
-        [sw addSubview:strip];
+        // ===== 【0.42.0 PullOver-X 模型】可见把手 nub（替代原来的隐形透明热区）=====
+        // PullOver-X 的实证：抓取点是**看得见的把手**（34pt 圆角块），并靠 pointInside
+        // 把命中区放大到最小 52pt；并且只占屏幕边缘一小块，其余触摸全部点透给下面的 App。
+        //   · 单击 = 浮窗显隐
+        //   · 长按 0.3s = 圆弧选择器
+        //   · 单指横向左拖 = 圆弧选择器（PullOver 的 |vx|>|vy| 才吞横向）
+        //   · 单指竖向拖 = 把手沿屏幕边缘上下移动（PullOver 的"导轨"）
+        //   · 双指竖向拖 = 等比缩放浮窗
+        MFNubView *nub = [[MFNubView alloc] initWithFrame:CGRectMake(kZoneW - 54.0, 136.0, 48.0, 48.0)];
+        nub.backgroundColor = [[UIColor colorWithWhite:0.08 alpha:0.55] copy];
+        nub.layer.cornerRadius = 16.0;
+        nub.layer.cornerCurve = kCACornerCurveContinuous;
+        nub.layer.borderWidth = 1.0;
+        nub.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+        nub.layer.shadowColor = [UIColor blackColor].CGColor;
+        nub.layer.shadowOpacity = 0.35;
+        nub.layer.shadowRadius = 4.0;
+        nub.layer.shadowOffset = CGSizeZero;
+        nub.tag = 990041;
+        nub.userInteractionEnabled = YES;
 
-        // 【0.40.0】极边缘 20pt 全能区：与内带同行为，单独 tag 便于日志区分
-        //（用途：验证"全屏 App 时最贴边的那 20pt 是否仍能收到触摸"）
-        UIView *edge = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 20.0, 0.0, 20.0, 300.0)];
-        edge.backgroundColor = [UIColor clearColor];
-        edge.userInteractionEnabled = YES;
-        edge.tag = 990050;
-        UIPanGestureRecognizer *ePan = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
-        ePan.maximumNumberOfTouches = 1;
-        [edge addGestureRecognizer:ePan];
-        UIPanGestureRecognizer *ePinch = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(bandPinch:)];
-        ePinch.minimumNumberOfTouches = 2;
-        ePinch.maximumNumberOfTouches = 2;
-        [edge addGestureRecognizer:ePinch];
-        [sw addSubview:edge];
+        UILabel *nubGlyph = [[UILabel alloc] initWithFrame:nub.bounds];
+        nubGlyph.text = @"▤";
+        nubGlyph.textAlignment = NSTextAlignmentCenter;
+        nubGlyph.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+        nubGlyph.font = [UIFont systemFontOfSize:20.0];
+        nubGlyph.userInteractionEnabled = NO;
+        [nub addSubview:nubGlyph];
 
-        // 悬浮按钮：半透明圆形 "▦"（点=显隐浮窗；长按=圆弧选择器；上下拖=整个热区窗口跟随移动）
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(10.0, 24.0, 44.0, 44.0);
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.42];
-        btn.layer.cornerRadius = 22.0;
-        btn.layer.masksToBounds = YES;
-        [btn setTitle:@"▦" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:18.0];
-        btn.tag = 990041;
-        [btn addTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)
-                      forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[MFFloatManager shared] action:@selector(summonDrag:)];
-        [btn addGestureRecognizer:drag];
-        // 【0.37.0】长按 ▦ = 呼出圆弧选择器（与右缘滑选等价）
-        UILongPressGestureRecognizer *btnLP = [[UILongPressGestureRecognizer alloc]
+        UITapGestureRecognizer *nubTap = [[UITapGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(toggleFloatVisible)];
+        [nub addGestureRecognizer:nubTap];
+        UILongPressGestureRecognizer *nubLP = [[UILongPressGestureRecognizer alloc]
             initWithTarget:[MFFloatManager shared] action:@selector(onSummonButtonLongPress:)];
-        btnLP.minimumPressDuration = 0.6;
-        [btn addGestureRecognizer:btnLP];
-        [sw addSubview:btn];
+        nubLP.minimumPressDuration = 0.30;      // PullOver 用 0.3s
+        nubLP.cancelsTouchesInView = NO;
+        [nub addGestureRecognizer:nubLP];
+        UIPanGestureRecognizer *nubPan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(summonNubPan:)];
+        nubPan.maximumNumberOfTouches = 1;
+        [nub addGestureRecognizer:nubPan];
+        UIPanGestureRecognizer *nubPinch = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(bandPinch:)];
+        nubPinch.minimumNumberOfTouches = 2;
+        nubPinch.maximumNumberOfTouches = 2;
+        [nub addGestureRecognizer:nubPinch];
+        [nubTap requireGestureRecognizerToFail:nubLP];
+        [nubTap requireGestureRecognizerToFail:nubPan];
+        [sw addSubview:nub];
+
+        MFNubView *btn = nub;   // 兼容后面的 gMFStripView 赋值
 
         gMFStripView = btn;
         gMFStripWin = sw;   // 【0.35.0】成功后才落库（此前异常不会污染幂等守卫 -> 可重试）
-        MFLog(@"[summon] 右缘呼出 UI 已安装（▦ 按钮 + 局部滑选热区）win=%@ frame=%@",
+        MFLog(@"[summon] PullOver-X 式把手已安装（可见 nub + 放大命中区）win=%@ frame=%@",
               NSStringFromClass([sw class]), NSStringFromCGRect(sw.frame));
     } @catch (NSException *e) {
         MFLog(@"[summon] !! 安装异常（1s 后重试）：%@", e);
@@ -5004,6 +5111,12 @@ static void MFUpdateTouchOverlay(void) {
 
 static void MFInstallSDTouchOverlay(void) {
     if (gMFOverlayViews != nil) return;   // 幂等
+    // 【0.42.0】PullOver-X 模型下，抓取交给"可见把手"；状态栏窗口镜像层改为可选
+    //（默认关闭，配置 mirrorTouchZones=true 可打开做诊断）。
+    if (!MFConfigBool([[MFFloatManager shared] config], @"mirrorTouchZones", NO)) {
+        MFLogS(@"[summon] 状态栏镜像触摸层已按 0.42.0 默认关闭（mirrorTouchZones=true 可开启）");
+        return;
+    }
     MFFloatPanel *panel = [[MFFloatManager shared] panel];
     if (panel == nil) return;             // 浮窗还没建：等 startWithConfig 之后再来
     UIWindow *sb = MFStatusBarWindowStrict();
