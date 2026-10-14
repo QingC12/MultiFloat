@@ -2,6 +2,25 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.3 核心改动 ============================
+//  ① **宿主窗口改为「状态栏窗口」**（`mfRingHostWindow`，默认 2=自动优先，1=强制，0=只用 POXWindow）。
+//     为什么（**实证，不是猜**）：归档 38 的证据表里，**挂在 `SBStatusBarWindow` 里的热区（tag 990042）
+//     在全屏 App 活跃时收到过 3 次触摸**，而同一时刻 SB 自己普通窗口里的 8 个抓手一次都没收到 ——
+//     两者唯一的差别就是"挂在哪个窗口"。Stheno 的字符串里同样是 `UIStatusBarWindowHook` +
+//     `_statusBarGroup`（把视图挂进状态栏窗口，而不是自建普通窗口）。
+//     ⇒ 所以本轮不再往 POXWindow 里挂，而是**优先把触发条+圆盘挂进状态栏窗口**（零 hook：
+//       运行时扫窗口找它；找不到/不是全屏就自动退回 POXWindow，行为与 0.2.2 相同，不会更难用）。
+//     ⚠️ 状态栏窗口的 hitTest 由我们的 `MFRingHostOverlayView` 接管：只认触发带/圆盘，**其余返回 nil 点透**，
+//        所以状态栏、手柄、面板一切照旧（nil 会让 UIKit 继续问下一扇窗口）。
+//  ② **圆盘大小随 App 数量自适应**（用户要求）：数量少 → 小、数量多 → 大。
+//     `mfRingScaleMin`(0.50) / `mfRingScaleBase`(0.85) / `mfRingScaleMax`(1.00) 三个锚点，
+//     由 `mfRingScaleCountLow`(4) / `CountBase`(14) / `CountHigh`(22) 做分段线性插值；
+//     缩放同时作用于**半径 / 图标尺寸 / 间距**，即"整个圆盘等比大小"。
+//     关键实现点：几何的容量目标从"固定 24"改成**实际数量** —— 否则半径会被自动放大到能装 24 个，
+//     缩放就白做了（`MFRingComputeGeometry(bounds, count)`）。
+//  ③ `[ring][diag]` 增加**宿主窗口类名**、并新增安装时**全窗口清单日志**（类名/level/尺寸/可见），
+//     下次日志一眼就能看到"到底有没有找到状态栏窗口、它多大"。
+//
 //  ============================ 0.2.2 核心改动 ============================
 //  ① **圆盘容量 16 → 24**（`mfRingMaxIcons` 默认 24）。做法不是"把图标挤小"，而是
 //     `MFRingComputeGeometry()` 反向求解：先用配置半径算容量，装不下 24 就按 4% 步进
@@ -103,8 +122,8 @@
 //    mfTriggerCenterRatio number 触发区中心位置 0~1（默认 0.78）
 //    mfTriggerBottomInset number 触发区距屏幕底边最少留白（默认 44；bottom 边默认 0 = 贴死底边）
 //    mfRingSummonThreshold number 手势呼出阈值，pt（默认 12）
-//    mfRingRadius       number 圆盘半径（默认 150；容量不足 24 时会被自动放大）
-//    mfRingIconSize     number 图标尺寸（默认 44）
+//    mfRingRadius       number 圆盘半径基准（默认 150；会随数量缩放、装不下时再自动放大）
+//    mfRingIconSize     number 图标尺寸基准（默认 44；同样随数量缩放）
 //    mfRingEdgeMargin   number 圆盘外沿距屏幕边的间距（默认 12）
 //    mfRingRotation     number 图标整体旋转角，度（默认 0）
 //    mfRingStartAngle   number 第一个图标的角度，度（默认 -90 = 正上方）
@@ -115,6 +134,14 @@
 //    mfRingInnerRatio   number 内圈半径比例上限 0.35~0.95（默认 0.62，仅多圈时生效）
 //    mfRingIconGap      number 图标间距估算值，pt（默认 6；越大每圈能放越少）
 //    mfRingMaxIcons     number 圆盘最多显示几个（默认 24，上限 24）
+//    mfRingHostWindow   number 圆盘/触发条的宿主窗口：2=自动(默认，优先状态栏窗口) / 1=强制状态栏窗口 /
+//                              0=只用 PullOver 窗口（0.2.2 行为）
+//    mfRingScaleMin     number 图标少时圆盘缩放下限（默认 0.50 = 50%）
+//    mfRingScaleBase    number 常规数量的缩放基数（默认 0.85 = 85%）
+//    mfRingScaleMax     number 图标多时的缩放上限（默认 1.00 = 100%）
+//    mfRingScaleCountLow  number 数量 ≤ 此值 → 用 mfRingScaleMin（默认 4）
+//    mfRingScaleCountBase number 数量 = 此值 → 用 mfRingScaleBase（默认 14）
+//    mfRingScaleCountHigh number 数量 ≥ 此值 → 用 mfRingScaleMax（默认 22）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -125,7 +152,9 @@
 //  0.1.9 删掉自建窗口，改挂 PullOver 既有窗口（POXWindow，保留）；
 //  0.2.0 修掉四版崩溃的真凶 —— setter 死递归（见文件头 0.2.0 段）；
 //  0.2.1 双圈布局 + 圆盘应用编辑器（长按边缘触发条打开，自己挑 App）；
-//  **0.2.2 容量 24 + 两圈"外圈铺满 / 内圈自适应半径" + 停靠点下移 + 触摸到达诊断（diag）。**
+//  0.2.2 容量 24 + 两圈"外圈铺满 / 内圈自适应半径" + 停靠点下移 + 触摸到达诊断（diag）；
+//  **0.2.3 宿主优先挂「状态栏窗口」（全屏 App 里也能收到触摸，见文件头 0.2.3 段）
+//        + 圆盘大小随 App 数量自适应（50% / 85% / 100%）+ 全窗口清单诊断日志。**
 //
 
 #import <UIKit/UIKit.h>
@@ -398,24 +427,25 @@ static NSArray<NSString *> *MFRingConfiguredBundleIds(void) {
     return MFRingFilterBundleIds([MFRingDefaults() arrayForKey:@"ringApps"], 0);
 }
 
+/// 最近一次算出的圆盘内容数量（0.2.3：几何缩放要用它；触摸路径上零开销）
+static NSUInteger gMFRingCount = 0;
+
 /// 圆盘最终内容：**用户配置 > 自动枚举缓存 > 空**。只读内存 / NSUserDefaults。
 static NSArray<NSString *> *MFRingBundleIds(void) {
     NSUInteger limit = MFRingMaxIcons();
+    NSArray<NSString *> *result = @[];
     if (MFRingUserListSet()) {
         // 写过就以用户为准（空数组 ⇒ 圆盘空，显示"长按边缘添加"提示）
         NSArray<NSString *> *configured = MFRingConfiguredBundleIds();
-        if (configured.count > limit) {
-            return [configured subarrayWithRange:NSMakeRange(0, limit)];
-        }
-        return configured;
+        result = (configured.count > limit) ? [configured subarrayWithRange:NSMakeRange(0, limit)]
+                                            : configured;
+    } else if (gMFRingAutoBundleIds.count > 0) {
+        result = (gMFRingAutoBundleIds.count > limit)
+            ? [gMFRingAutoBundleIds subarrayWithRange:NSMakeRange(0, limit)]
+            : gMFRingAutoBundleIds;
     }
-    if (gMFRingAutoBundleIds.count > 0) {
-        if (gMFRingAutoBundleIds.count > limit) {
-            return [gMFRingAutoBundleIds subarrayWithRange:NSMakeRange(0, limit)];
-        }
-        return gMFRingAutoBundleIds;
-    }
-    return @[];
+    gMFRingCount = result.count;   // 【0.2.3】记录数量 —— 几何缩放与夹取都用它
+    return result;
 }
 
 /// App 的中文/本地化名称（取不到就退化成 bundleID 末段）。全部包 @try。
@@ -508,14 +538,19 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     return icon;
 }
 
-#pragma mark - 圆盘几何（0.2.2）
+#pragma mark - 圆盘几何（0.2.3）
 
 /// 【0.2.2】圆盘几何：由配置统一算出"有效外圈半径 / 底盘半径 / 视图半边长 / 圈数"。
 ///
 /// 为什么需要"有效半径"：**容量**（能放几个图标）只由外圈半径与图标间距决定，
 /// 而用户要"圆盘总量 24 个"——配置半径(150)+图标(44)+间距(8) 时 两圈只有 23 个位置。
-/// 于是这里反过来算：先用配置半径求容量，不够 24 就按 4% 步进放大半径，
+/// 于是这里反过来算：先用配置半径求容量，不够就按 4% 步进放大半径，
 /// 上限是屏幕内安全值（底盘 + 图标外沿不出屏）。这样 `mfRingMaxIcons=24` 一定装得下。
+///
+/// 【0.2.3 重要】容量目标从"固定 24"改成**实际数量 `count`**，并乘以 `scale`：
+///   数量少时圆盘整体变小（半径/图标/间距一起缩），数量多时才长大 —— 即用户要的
+///   "圆盘大小随着添加应用数量而变大变小"。若仍按 24 求容量，半径会被自动放大到能装 24 个，
+///   缩放就完全失效（这是本轮最容易踩的坑）。
 /// 几何是"触摸路径无关"的纯计算，只读配置。
 typedef struct {
     CGFloat outerRadius;   // 最外圈图标圆心所在半径
@@ -525,17 +560,61 @@ typedef struct {
     CGFloat step;          // 同圈相邻图标的最小圆心距（= 图标宽 + 间距）
     CGFloat innerRatio;    // 内圈 / 外圈 的固定比例（上限）
     NSUInteger rings;      // 实际可用圈数（>= 1）
+    CGFloat scale;         // 【0.2.3】整体缩放（由数量决定，1.0 = 配置原尺寸）
+    NSUInteger count;      // 【0.2.3】本次几何是按几个图标算的
 } MFRingGeometry;
 
-static MFRingGeometry MFRingComputeGeometry(CGRect bounds) {
-    MFRingGeometry geo = (MFRingGeometry){ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1 };
+/// 【0.2.3】"几个 App ⇒ 圆盘多大"。三锚点分段线性：
+///   count ≤ Low            → mfRingScaleMin  (0.50)
+///   count = CountBase      → mfRingScaleBase (0.85)
+///   count ≥ CountHigh      → mfRingScaleMax  (1.00)
+/// 端点值都做了合法性夹取（min ≤ base ≤ max，锚点递增），配置写错也不会算出 NaN/负半径。
+static CGFloat MFRingScaleForCount(NSUInteger count) {
+    CGFloat lo = MIN(MAX(MFRingNumber(@"mfRingScaleMin", 0.50), 0.20), 1.00);
+    CGFloat base = MIN(MAX(MFRingNumber(@"mfRingScaleBase", 0.85), lo), 1.00);
+    CGFloat hi = MIN(MAX(MFRingNumber(@"mfRingScaleMax", 1.00), base), 1.00);
+    NSUInteger nLow = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountLow", 4.0), 1.0), 24.0);
+    NSUInteger nBase = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountBase", 14.0), (CGFloat)nLow), 24.0);
+    NSUInteger nHigh = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingScaleCountHigh", 22.0), (CGFloat)nBase), 24.0);
+    CGFloat n = (CGFloat)count;
+    if (n <= (CGFloat)nLow) {
+        return lo;
+    }
+    if (n >= (CGFloat)nHigh) {
+        return hi;
+    }
+    if (n <= (CGFloat)nBase) {
+        CGFloat t = (n - (CGFloat)nLow) / MAX((CGFloat)(nBase - nLow), 1.0);
+        return lo + (base - lo) * t;
+    }
+    CGFloat t = (n - (CGFloat)nBase) / MAX((CGFloat)(nHigh - nBase), 1.0);
+    return base + (hi - base) * t;
+}
 
-    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0));
-    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
-    CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 6.0));
+/// 缩放纯文本（日志用）：`19个 -> 94%`
+static NSString *MFRingScaleDescription(NSUInteger count) {
+    return [NSString stringWithFormat:@"%lu个 -> %.0f%%（下限%.0f%% 基数%.0f%% 上限%.0f%%）",
+            (unsigned long)count, MFRingScaleForCount(count) * 100.0,
+            MIN(MAX(MFRingNumber(@"mfRingScaleMin", 0.50), 0.20), 1.00) * 100.0,
+            MIN(MAX(MFRingNumber(@"mfRingScaleBase", 0.85), 0.20), 1.00) * 100.0,
+            MIN(MAX(MFRingNumber(@"mfRingScaleMax", 1.00), 0.20), 1.00) * 100.0];
+}
+
+static MFRingGeometry MFRingComputeGeometry(CGRect bounds, NSUInteger count) {
+    MFRingGeometry geo = (MFRingGeometry){ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1, 1.0, 0 };
+
+    // 【0.2.3】容量目标 = 本次真实数量（夹到 [1, mfRingMaxIcons]）
+    NSUInteger want = MIN(MAX(count, (NSUInteger)1), MFRingMaxIcons());
+    CGFloat scale = MFRingScaleForCount(want);
+    geo.count = want;
+    geo.scale = scale;
+
+    CGFloat radius = MAX(60.0, MFRingNumber(@"mfRingRadius", 150.0)) * scale;
+    CGFloat iconSize = MAX(20.0, MFRingNumber(@"mfRingIconSize", 44.0) * scale);
+    CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 6.0) * scale);
     CGFloat innerRatio = MIN(MAX(MFRingNumber(@"mfRingInnerRatio", 0.62), 0.35), 0.95);
     NSUInteger desiredRings = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingRings", 2.0), 1.0), 3.0);
-    NSUInteger targetCap = MFRingMaxIcons();
+    NSUInteger targetCap = want;
 
     CGFloat step = MAX(iconSize + gap, 1.0);
     CGFloat outer = MAX(iconSize, radius - iconSize * 0.5 - 6.0);
@@ -590,6 +669,11 @@ static MFRingGeometry MFRingComputeGeometry(CGRect bounds) {
     return geo;
 }
 
+/// 拿"当前内容数量"算几何（触摸路径上的夹取用；数量由 MFRingBundleIds 记录）
+static MFRingGeometry MFRingCurrentGeometry(CGRect bounds) {
+    return MFRingComputeGeometry(bounds, gMFRingCount);
+}
+
 #pragma mark - 触摸到达诊断（0.2.2）
 
 /// 【0.2.2 诊断】"触摸到底有没有到达我们窗口"—— 一次测试就能定性的关键日志。
@@ -616,21 +700,123 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
                               MIN(MAX(CGRectGetWidth(full) - point.x, 0.0),
                                   MAX(CGRectGetHeight(full) - point.y, 0.0)));
     MFLog(@"[ring][diag] 触摸到达宿主窗口 屏幕(%.0f,%.0f) 距最近屏边 %.0fpt 带内=%@ 带=%@ | "
-          @"hidden=%d 交互=%d hiddenRC=%d 键窗口=%d level=%.0f",
+          @"窗口=%@ level=%.0f hidden=%d 交互=%d hiddenRC=%d 键窗口=%d",
           point.x, point.y, nearestEdge,
           CGRectContainsPoint(band, point) ? @"是" : @"否",
           NSStringFromCGRect(band),
+          NSStringFromClass([window class]), window.windowLevel,
           (int)window.hidden, (int)window.userInteractionEnabled,
           (int)window.rootViewController.view.hidden,
-          (int)window.isKeyWindow, window.windowLevel);
+          (int)window.isKeyWindow);
 }
+
+#pragma mark - 宿主窗口选择（0.2.3：优先"状态栏窗口"）
+
+/// 【0.2.3】把当前所有窗口打一份清单（类名 / level / 尺寸 / 可见）—— 只读、只在安装时打一次。
+/// 下次日志里一眼能看出"有没有找到状态栏窗口、它多大、我们的窗口在哪一层"。
+static void MFRingLogWindowInventory(void) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        NSArray<UIWindow *> *windows = (app != nil) ? app.windows : nil;
+        MFLog(@"[ring] 窗口清单（共 %lu 扇）：", (unsigned long)windows.count);
+        NSUInteger index = 0;
+        for (UIWindow *w in windows) {
+            if (++index > 16) {   // 只打前 16 扇，避免刷屏
+                MFLog(@"[ring]   ...（其余略）");
+                break;
+            }
+            MFLog(@"[ring]   [%lu] %@ level=%.0f frame=%@ hidden=%d 交互=%d",
+                  (unsigned long)index, NSStringFromClass([w class]), w.windowLevel,
+                  NSStringFromCGRect(w.bounds), (int)w.hidden,
+                  (int)w.userInteractionEnabled);
+        }
+    } @catch (NSException *exception) {
+        MFLog(@"[ring] 窗口清单异常：%@", exception);
+    }
+}
+
+/// 【0.2.3】取"屏幕全尺寸的窗口列表"（优先状态栏窗口）。只用**公开**入口：
+/// `UIApplication.windows`；拿不到再退一步试私有的
+/// `+[UIWindow _allWindowsIncludingInternalWindows:onlyVisibleWindows:]`（先 respondsToSelector + @try）。
+/// ⚠️ 不 hook 任何东西 —— 用户明令"前期不要多个 hook，确保不卡开机"。
+static NSArray<UIWindow *> *MFRingAllScreenWindows(void) {
+    NSMutableArray<UIWindow *> *result = [NSMutableArray array];
+    @try {
+        NSArray<UIWindow *> *regular = [UIApplication sharedApplication].windows;
+        if ([regular isKindOfClass:[NSArray class]]) {
+            [result addObjectsFromArray:regular];
+        }
+    } @catch (__unused NSException *exception) {
+    }
+    // 私有兜底：包含"内部窗口"（状态栏窗口往往只在这个列表里）
+    @try {
+        Class windowClass = [UIWindow class];
+        SEL internalSelector = NSSelectorFromString(@"_allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+        if ([windowClass respondsToSelector:internalSelector]) {
+            NSArray *internal = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)(windowClass,
+                                                                             internalSelector, YES, NO);
+            if ([internal isKindOfClass:[NSArray class]]) {
+                for (UIWindow *w in internal) {
+                    if ([w isKindOfClass:[UIWindow class]] && ![result containsObject:w]) {
+                        [result addObject:w];
+                    }
+                }
+            }
+        }
+    } @catch (__unused NSException *exception) {
+    }
+    return result;
+}
+
+/// 【0.2.3】找状态栏窗口。实证依据（归档 38 证据表）：
+///   挂在 `SBStatusBarWindow` 里的热区（tag 990042）在**全屏 App 活跃时收到过 3 次触摸**，
+///   而同一时刻 SB 自己普通窗口里的 8 个抓手一次都没收到 —— 差别只在"挂在哪个窗口"。
+///   Stheno 里同样是 `UIStatusBarWindowHook` + `_statusBarGroup`（挂状态栏窗口，不自建普通窗口）。
+/// 判定：类名含 "StatusBar"，且**尺寸接近全屏**（否则挂上去也覆盖不到屏幕右侧的触发带）。
+static UIWindow *MFRingFindStatusBarWindow(CGRect screenBounds, BOOL requireFullScreen) {
+    CGFloat minHeight = CGRectGetHeight(screenBounds) * 0.9;   // 必须几乎全屏，否则右侧触发带会落在它外面
+    UIWindow *fallback = nil;
+    for (UIWindow *w in MFRingAllScreenWindows()) {
+        @try {
+            NSString *name = NSStringFromClass([w class]);
+            if (name.length == 0 || ![name containsString:@"StatusBar"]) {
+                continue;
+            }
+            if (CGRectGetHeight(w.bounds) >= minHeight) {
+                return w;
+            }
+            if (fallback == nil) {
+                fallback = w;   // 尺寸不够也记着（强制模式用）
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    return requireFullScreen ? nil : fallback;
+}
+
+#pragma mark - 宿主覆盖层：接管状态栏窗口的 hitTest（点透）
+
+/// 覆盖层：加在**宿主窗口的最上层**，只把"触发带 / 圆盘"的触摸留下，其余**返回 nil 点透**。
+///
+/// 为什么需要它：状态栏窗口原本的 hitTest 只会问它自己的子视图；我们的条是**最后加的子视图**，
+/// 于是 UIKit 一定先问我们 —— 我们返回 nil 就等于"这一下不是我"，UIKit 继续问下一扇窗口
+/// （状态栏、POXWindow、手柄、面板全部照旧）。全程零 hook。
+@interface MFRingHostOverlayView : UIView
+@end
+
+/// 覆盖层的命中入口（在 MFRingPicker 实现之后定义；这里先声明）
+UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark - 圆盘选择器
 
 @interface MFRingPicker : NSObject <UIGestureRecognizerDelegate>
-@property (nonatomic, weak) UIWindow *hostWindow;              // 宿主：PullOver 自己的窗口
+@property (nonatomic, weak) UIWindow *hostWindow;              // 宿主窗口（状态栏窗口 或 POXWindow）
+@property (nonatomic, weak) UIWindow *pullOverWindow;          // PullOver 自己的窗口（手柄/面板仍在这里）
+@property (nonatomic, strong) UIView *hostContainerView;       // 加子视图用：覆盖层 或 窗口本身
+@property (nonatomic, strong) MFRingHostOverlayView *overlayView;  // 仅当宿主=状态栏窗口时非 nil
+@property (nonatomic, copy) NSString *hostClassName;           // 宿主窗口类名（日志用）
 @property (nonatomic, weak) PullOverViewController *hostController;
-@property (nonatomic, strong) UIView *stripView;               // 贴边透明触发条（窗口子视图）
+@property (nonatomic, strong) UIView *stripView;               // 贴边透明触发条（宿主子视图）
 @property (nonatomic, strong) UIPanGestureRecognizer *stripPan;
 @property (nonatomic, assign) CGRect hostBounds;               // 宿主窗口尺寸（变化时重建几何）
 @property (nonatomic, assign) CGRect triggerFrame;             // 触发区（窗口坐标）
@@ -657,7 +843,8 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
 @property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
 + (instancetype)shared;
 - (void)install;
-- (UIView *)hitTestViewForPoint:(CGPoint)point;
+- (void)teardownHostViews;
+- (UIView *)hitTestViewForPoint:(CGPoint)point inWindow:(UIWindow *)window;
 - (void)refreshHostGeometryIfNeeded;
 - (CGRect)triggerFrameForBounds:(CGRect)bounds;
 - (BOOL)pointBelongsToPullOverHandle:(CGPoint)point;
@@ -719,6 +906,26 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
 
 @end
 
+#pragma mark - 宿主覆盖层实现（0.2.3）
+
+@implementation MFRingHostOverlayView
+
+/// 只认"触发带 / 圆盘"，其余一律 nil —— nil 会让 UIKit 继续问下一扇窗口，
+/// 所以状态栏、手柄、面板、App 的触摸都不会被我们吃掉。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    (void)event;
+    @try {
+        UIView *target = MFRingHitTestViewForHostPoint(self.window, point);
+        if (target != nil) {
+            return target;
+        }
+    } @catch (__unused NSException *exception) {
+    }
+    return nil;
+}
+
+@end
+
 @implementation MFRingPicker
 
 + (instancetype)shared {
@@ -745,45 +952,88 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
         return;
     }
     @try {
-        // 【0.1.9】宿主 = PullOver 自己的窗口（已被真机验证能收触摸，手柄就靠它）
-        UIWindow *host = nil;
+        // ---------- ① PullOver 自己的窗口（永远需要：手柄/面板/pin/open 都在它上面） ----------
+        UIWindow *pullOverWindow = nil;
         id sharedWindow = [POXWindow sharedWindow];
         if ([sharedWindow isKindOfClass:[UIWindow class]]) {
-            host = (UIWindow *)sharedWindow;
+            pullOverWindow = (UIWindow *)sharedWindow;
         }
-        if (host == nil) {
+        if (pullOverWindow == nil) {
             MFLog(@"[ring] !! PullOver 窗口不可用，1 秒后重试");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ [self install]; });
             return;
         }
-        CGRect bounds = host.bounds;
-        if (CGRectIsEmpty(bounds)) {
-            bounds = [UIScreen mainScreen].bounds;
+        CGRect screenBounds = pullOverWindow.bounds;
+        if (CGRectIsEmpty(screenBounds)) {
+            screenBounds = [UIScreen mainScreen].bounds;
         }
-        if (CGRectIsEmpty(bounds)) {
+        if (CGRectIsEmpty(screenBounds)) {
             MFLog(@"[ring] !! 屏幕未就绪，1 秒后重试");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ [self install]; });
             return;
         }
+        self.pullOverWindow = pullOverWindow;
+
+        // ---------- ② 【0.2.3】选宿主窗口 ----------
+        // 归档 38 实证：全屏 App 活跃时，**挂在状态栏窗口里的热区仍能收到触摸**，
+        // 而 SB 自己普通窗口（=POXWindow 所在地）里的视图在屏幕中间/右侧一次都收不到。
+        // 所以优先挂状态栏窗口；找不到、或它不是全屏（挂上去也盖不住右侧触发带）就退回 POXWindow。
+        MFRingLogWindowInventory();
+        NSInteger hostMode = (NSInteger)MFRingNumber(@"mfRingHostWindow", 2.0);   // 2=自动 1=强制 0=只用 POXWindow
+        UIWindow *host = nil;
+        if (hostMode != 0) {
+            host = MFRingFindStatusBarWindow(screenBounds, hostMode != 1);
+            if (host == nil) {
+                MFLog(@"[ring] 未找到可用的状态栏窗口（mfRingHostWindow=%ld）-> 退回 PullOver 窗口",
+                      (long)hostMode);
+            }
+        }
+        BOOL usingStatusBar = (host != nil);
+        if (host == nil) {
+            host = pullOverWindow;
+        }
+
+        self.hostWindow = host;
+        self.hostClassName = NSStringFromClass([host class]);
+        CGRect bounds = host.bounds;
+        if (CGRectIsEmpty(bounds)) {
+            bounds = screenBounds;
+        }
+        self.hostBounds = bounds;
+        self.triggerFrame = [self triggerFrameForBounds:bounds];
         if (host.hidden) {
             host.hidden = NO;
             MFLog(@"[ring] 宿主窗口原为隐藏 -> 已置为可见");
         }
-        self.hostWindow = host;
-        self.hostBounds = bounds;
-        self.triggerFrame = [self triggerFrameForBounds:bounds];
 
         id controller = nil;
         @try {
-            controller = [(POXWindow *)host controller];
+            controller = [(POXWindow *)pullOverWindow controller];
         } @catch (__unused NSException *exception) {
             controller = nil;
         }
         if ([controller isKindOfClass:[PullOverViewController class]]) {
             self.hostController = (PullOverViewController *)controller;
         }
+
+        // 覆盖层：宿主不是 POXWindow（它自己有 hitTest 覆写）时，由我们接管宿主的命中判定。
+        UIView *hostContainer = host;
+        if (usingStatusBar) {
+            MFRingHostOverlayView *overlay = [[MFRingHostOverlayView alloc] initWithFrame:bounds];
+            overlay.backgroundColor = [UIColor clearColor];
+            overlay.opaque = NO;
+            overlay.userInteractionEnabled = YES;
+            overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            overlay.tag = 991000;
+            [host addSubview:overlay];
+            self.overlayView = overlay;
+            hostContainer = overlay;
+        } else {
+            self.overlayView = nil;
+        }
+        self.hostContainerView = hostContainer;
 
         // 崩溃降级判定：上次的标记还在 ⇒ 上回就是被"枚举 App / 抓图标"带走的
         gMFRingDegraded = MFRingGuardArmed();
@@ -796,13 +1046,14 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
             MFLog(@"[ring] 载入上次的自动列表：%lu 项", (unsigned long)gMFRingAutoBundleIds.count);
         }
 
-        // 贴边触发条：一个**窗口子视图**（不是自己的窗口）
+        // 贴边触发条：宿主的最上层子视图（不是自己的窗口）
         UIView *strip = [[UIView alloc] initWithFrame:bounds];
         strip.backgroundColor = [UIColor clearColor];
         strip.opaque = NO;
         strip.userInteractionEnabled = YES;
+        strip.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         strip.tag = 991001;
-        [host addSubview:strip];
+        [hostContainer addSubview:strip];
         self.stripView = strip;
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
@@ -822,19 +1073,31 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.2 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
-              @"交互=%d 键窗口=%d 控制器=%@ | 触发边=%@ 触发条=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
-              NSStringFromCGRect(bounds), host.windowLevel, (int)host.hidden,
-              (int)host.userInteractionEnabled, (int)host.isKeyWindow,
-              self.hostController != nil ? @"已就绪" : @"nil",
+        MFLog(@"[ring] 0.2.3 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+              @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
+              self.hostClassName,
+              usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
+              (long)hostMode,
+              usingStatusBar ? @"" : @"【注意：全屏 App 上可能收不到触摸】",
+              host.windowLevel, NSStringFromCGRect(bounds), (int)host.hidden,
+              (int)host.userInteractionEnabled,
               MFRingEdge(), NSStringFromCGRect(self.triggerFrame),
+              self.overlayView != nil ? @"已装" : @"无",
               (unsigned long)MFRingConfiguredBundleIds().count,
               (unsigned long)gMFRingAutoBundleIds.count,
               gMFRingDegraded ? @"是" : @"否");
+        if (!CGRectContainsRect(bounds, self.triggerFrame)) {
+            MFLog(@"[ring] ⚠️ 触发带 %@ 超出宿主 %@ —— 越界部分收不到触摸（可调 mfTriggerCenterRatio / "
+                  @"mfTriggerThickness / mfTriggerEdge，或设 mfRingHostWindow=0 退回 PullOver 窗口）",
+                  NSStringFromCGRect(self.triggerFrame), NSStringFromCGRect(bounds));
+        }
+        // 先算一次内容数量（几何缩放要用它），再打几何 —— 数量少时圆盘会自动变小
+        NSUInteger ringCount = MFRingBundleIds().count;
         {
-            MFRingGeometry geo = MFRingComputeGeometry(bounds);
-            MFLog(@"[ring] 圆盘几何：圈数=%lu 有效外圈半径=%.0f 底盘=%.0f 图标=%.0f 步距=%.0f "
-                  @"停靠比例Y=%.2f | 编辑器入口：长按贴边触发条 0.7 秒（最多 %lu 个图标）",
+            MFRingGeometry geo = MFRingComputeGeometry(bounds, ringCount);
+            MFLog(@"[ring] 圆盘几何：数量=%lu 缩放=%@ 圈数=%lu 有效外圈半径=%.0f 底盘=%.0f 图标=%.0f "
+                  @"步距=%.0f 停靠比例Y=%.2f | 编辑器入口：长按贴边触发条 0.7 秒（最多 %lu 个图标）",
+                  (unsigned long)ringCount, MFRingScaleDescription(ringCount),
                   (unsigned long)geo.rings, geo.outerRadius, geo.dialRadius,
                   geo.iconSize, geo.step,
                   MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.78), 0.5), 0.92),
@@ -851,11 +1114,42 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     }
 }
 
+/// 拆掉挂到宿主上的视图（宿主窗口失效时自愈用）
+- (void)teardownHostViews {
+    @try {
+        [self.container removeFromSuperview];
+        [self.stripView removeFromSuperview];
+        [self.overlayView removeFromSuperview];
+    } @catch (__unused NSException *exception) {
+    }
+    self.container = nil;
+    self.stripView = nil;
+    self.stripPan = nil;
+    self.stripLongPress = nil;
+    self.overlayView = nil;
+    self.hostContainerView = nil;
+    self.dialLayer = nil;
+    self.ringRoot = nil;
+    self.expanded = NO;
+}
+
 /// 宿主窗口尺寸变化（旋转等）时同步几何。回调里只做一次 rect 比较，开销可忽略。
+/// 【0.2.3】顺带做两件自愈：宿主窗口被系统回收（weak 变 nil）→ 清状态重装；
+/// 覆盖层被移出宿主（状态栏窗口偶尔会重排子视图）→ 补回去。都在触摸路径上，只做指针/rect 判断。
 - (void)refreshHostGeometryIfNeeded {
     UIWindow *window = self.hostWindow;
     if (window == nil) {
+        if (self.stripView != nil) {
+            MFLog(@"[ring] 宿主窗口已失效 -> 重新安装");
+            [self teardownHostViews];
+            [self install];
+        }
         return;
+    }
+    MFRingHostOverlayView *overlay = self.overlayView;
+    if (overlay != nil && overlay.superview == nil) {
+        [window addSubview:overlay];
+        MFLog(@"[ring] 覆盖层被移出宿主窗口 -> 已补回 %@", self.hostClassName);
     }
     CGRect bounds = window.bounds;
     if (CGRectIsEmpty(bounds) || CGRectEqualToRect(bounds, self.hostBounds)) {
@@ -865,6 +1159,9 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     self.triggerFrame = [self triggerFrameForBounds:bounds];
     if (self.stripView != nil) {
         self.stripView.frame = bounds;      // 命中区由 triggerFrame 决定，不是 frame
+    }
+    if (overlay != nil) {
+        overlay.frame = bounds;
     }
     if (self.container != nil) {
         self.container.frame = bounds;
@@ -912,10 +1209,12 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     return CGRectMake(width - thickness, originY, thickness, length);   // right（默认）
 }
 
-#pragma mark 命中判定（由 POXWindow.hitTest 调用）
+#pragma mark 命中判定（由托管窗口的 hitTest 调用）
 
 /// PullOver 手柄优先：手柄是个方形小把件（默认约 50x50pt 命中区），
 /// 命中它时把这次触摸**原样让给 PullOver**，保证浮窗手柄依旧能拖。
+/// 【0.2.3】point 是**宿主窗口**坐标；宿主可能是状态栏窗口，手柄却还在 POXWindow 里，
+/// 所以这里先做一次窗口间换算（同一台设备两扇窗口都是全屏同原点，换算后数值通常一样）。
 - (BOOL)pointBelongsToPullOverHandle:(CGPoint)point {
     PullOverViewController *controller = self.hostController;
     if (controller == nil || !controller.isViewLoaded) {
@@ -926,17 +1225,24 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
         return NO;
     }
     @try {
-        CGPoint inHandle = [handle convertPoint:point fromView:self.hostWindow];
+        UIWindow *fromWindow = self.hostWindow;
+        UIWindow *targetWindow = self.pullOverWindow;
+        CGPoint inTarget = point;
+        if (targetWindow != nil && fromWindow != nil && targetWindow != fromWindow) {
+            inTarget = [fromWindow convertPoint:point toWindow:targetWindow];
+        }
+        CGPoint inHandle = [handle convertPoint:inTarget fromView:targetWindow ?: fromWindow];
         return [handle pointInside:inHandle withEvent:nil];
     } @catch (__unused NSException *exception) {
         return NO;
     }
 }
 
-/// 返回本次触摸该落到的视图；返回 nil = 原样交回 PullOver（既有行为零改变）。
-- (UIView *)hitTestViewForPoint:(CGPoint)point {
-    UIWindow *window = self.hostWindow;
-    if (window == nil) {
+/// 返回本次触摸该落到的视图；返回 nil = 原样交回（既有行为零改变）。
+/// 【0.2.3】window 参数是"问我们的那扇窗口"：只有它 == 我们的宿主才接管，
+/// 否则一律 nil —— 这样即使圆盘改挂状态栏窗口，POXWindow 那条老路径也不会重复响应。
+- (UIView *)hitTestViewForPoint:(CGPoint)point inWindow:(UIWindow *)window {
+    if (window == nil || window != self.hostWindow) {
         return nil;
     }
     [self refreshHostGeometryIfNeeded];
@@ -1081,8 +1387,9 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
         return CGPointZero;
     }
     // 【0.2.2】用"有效几何"而不是配置半径做夹取 —— 半径可能被容量 24 自动放大过
+    // 【0.2.3】几何现在"按数量缩放"，所以取当前数量的几何（数量由 MFRingBundleIds 记录）
     CGFloat margin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
-    CGFloat extent = MFRingComputeGeometry(bounds).extent + margin;
+    CGFloat extent = MFRingCurrentGeometry(bounds).extent + margin;
     CGFloat minX = extent;
     CGFloat maxX = MAX(CGRectGetMaxX(bounds) - extent, minX);
     CGFloat minY = CGRectGetMidY(bounds);                       // 下半屏
@@ -1137,7 +1444,9 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
         container.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];   // 轻遮罩
         container.opaque = NO;
         container.userInteractionEnabled = YES;
-        [self.hostWindow addSubview:container];
+        // 【0.2.3】挂到"宿主容器"（状态栏窗口时是覆盖层）—— 这样才能在全屏 App 之上显示
+        UIView *hostContainer = self.hostContainerView ?: self.hostWindow;
+        [hostContainer addSubview:container];
         self.container = container;
         MFLog(@"[ring] <<< 建容器 ok");
 
@@ -1253,10 +1562,12 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
 #pragma mark 圆盘构建
 
 - (void)buildRingInContainer:(UIView *)container {
-    // 【0.2.2】几何统一由 MFRingComputeGeometry 算：
-    //   · 配置半径装不下 `mfRingMaxIcons`(默认 24) 时自动放大半径；
+    // 【0.2.3】几何按**实际数量**算 + 按数量缩放（数量少圆盘小、数量多圆盘大）：
+    //   · 容量目标 = 本次数量（不再固定 24），否则半径会被自动放大到装 24 个、缩放失效；
+    //   · 配置半径装不下该数量时才自动放大半径；
     //   · 底盘半径 / 视图半边长都以"有效外圈半径"为准，图标永不顶出屏幕。
-    MFRingGeometry geo = MFRingComputeGeometry(container.bounds);
+    NSArray<NSString *> *ringBundleIds = MFRingBundleIds();   // 顺带把数量记进 gMFRingCount
+    MFRingGeometry geo = MFRingComputeGeometry(container.bounds, ringBundleIds.count);
     CGFloat iconSize = geo.iconSize;
     CGFloat step = geo.step;
     CGFloat extent = geo.extent;
@@ -1264,6 +1575,8 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     CGFloat outerRadius = geo.outerRadius;
     CGFloat innerRatio = geo.innerRatio;
     CGFloat rotation = MFRingNumber(@"mfRingRotation", 0.0);
+    MFLog(@"[ring] 圆盘缩放 %@ -> 图标 %.0f 半径 %.0f",
+          MFRingScaleDescription(geo.count), iconSize, outerRadius);
 
     // 圆盘整体放在一个固定尺寸的容器里 —— 移动圆盘 = 改 ringRoot.center
     UIView *ringRoot = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, extent * 2.0, extent * 2.0)];
@@ -1287,7 +1600,7 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     self.dialLayer = dial;
 
     MFLog(@"[ring] >>> 取圆盘内容（只读配置/缓存，不查 SB）");
-    NSArray<NSString *> *bundleIds = MFRingBundleIds();
+    NSArray<NSString *> *bundleIds = ringBundleIds;   // 上面已经取过（同一份内容，避免重复读配置）
     NSUInteger count = bundleIds.count;
     MFLog(@"[ring] <<< 取圆盘内容 ok：%lu 项", (unsigned long)count);
 
@@ -1440,10 +1753,10 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
                               (unsigned long)(ring + 1), iconRadius, (unsigned long)ringCount]];
     }
     MFLog(@"[ring] <<< 图标铺好：%.0f 个图标 / %lu 圈 [%@] 图标 %.0f 步距 %.0f "
-          @"(有效外圈半径 %.0f 底盘 %.0f 上限 %lu)",
+          @"(缩放 %.0f%% 有效外圈半径 %.0f 底盘 %.0f 上限 %lu)",
           (double)placed, (unsigned long)rings,
           [layoutLog componentsJoinedByString:@" "], iconSize, step,
-          outerRadius, dialRadius, (unsigned long)MFRingMaxIcons());
+          geo.scale * 100.0, outerRadius, dialRadius, (unsigned long)MFRingMaxIcons());
 }
 
 /// 延后抓取真图标。危险动作 ⇒ 立闸门，走完并存活才撤。
@@ -1570,7 +1883,8 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
     panel.opaque = NO;
     panel.userInteractionEnabled = YES;
     panel.tag = MF_RING_EDITOR_TAG;
-    [window addSubview:panel];
+    // 【0.2.3】同样挂到宿主容器（状态栏窗口时是覆盖层），全屏 App 之上也能看到/操作
+    [(self.hostContainerView ?: window) addSubview:panel];
     self.editorPanel = panel;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 46.0, width - 130.0, 30.0)];
@@ -1878,8 +2192,9 @@ static void MFRingDiagTouch(CGPoint point, CGRect band, UIWindow *window) {
         [self applySelectionToButton:nil];
         return;
     }
-    CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
-    CGFloat hitRadius = MAX(30.0, iconSize * 0.85 + 10.0);
+    // 【0.2.3】用**当前缩放后的**图标尺寸算命中半径 —— 圆盘会随数量变小，命中区跟着一起缩
+    CGFloat iconSize = MFRingCurrentGeometry(self.hostBounds).iconSize;
+    CGFloat hitRadius = MAX(26.0, iconSize * 0.85 + 10.0);
 
     UIButton *best = nil;
     CGFloat bestDistance = CGFLOAT_MAX;
@@ -2035,19 +2350,25 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
 /// 窗口命中判定：圆盘展开态整窗接管、收起态只认贴边触发条；其余返回 nil，
 /// 由 POXWindow 原样交回 PullOver 控制器 —— 对既有手柄/面板行为零改变。
-UIView *MFRingHitTestViewForWindowPoint(UIWindow *window, CGPoint point) {
+/// 命中判定的统一入口（两个调用方：POXWindow.hitTest 与状态栏窗口的覆盖层）。
+/// 内部会核对"问我们的那扇窗口是不是我们的宿主"，所以两条路径永远不会重复响应。
+static UIView *MFRingHitTestShared(UIWindow *window, CGPoint point) {
     if (window == nil) {
         return nil;
     }
-    MFRingPicker *picker = [MFRingPicker shared];
-    if (picker.hostWindow != window) {
-        return nil;
-    }
     @try {
-        return [picker hitTestViewForPoint:point];
+        return [[MFRingPicker shared] hitTestViewForPoint:point inWindow:window];
     } @catch (__unused NSException *exception) {
         return nil;
     }
+}
+
+UIView *MFRingHitTestViewForWindowPoint(UIWindow *window, CGPoint point) {
+    return MFRingHitTestShared(window, point);
+}
+
+UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point) {
+    return MFRingHitTestShared(window, point);
 }
 
 #pragma mark - 安装入口
