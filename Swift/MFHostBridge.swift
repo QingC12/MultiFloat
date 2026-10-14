@@ -31,28 +31,24 @@ public struct MFHostBridge {
     }
 
     /// 承载一个 App（与现有点应用名同链路）
-    @discardableResult
     public static func host(_ bundleID: String) throws {
         let rc = MFBridgeHostApp(bundleID)
         guard rc == 0 else { throw MFBridgeError(rawValue: rc) ?? .notReady }
     }
 
     /// 手势松手后同步 scene.frame
-    @discardableResult
     public static func syncGeometry() throws {
         let rc = MFBridgeSyncGeometry()
         guard rc == 0 else { throw MFBridgeError(rawValue: rc) ?? .notReady }
     }
 
     /// 刷新应用列表数据源
-    @discardableResult
     public static func refreshAppList() throws {
         let rc = MFBridgeRefreshAppList()
         guard rc == 0 else { throw MFBridgeError(rawValue: rc) ?? .notReady }
     }
 
     /// 【桩】关闭浮窗 —— 核心暂无入口，调用会抛 notExposed
-    @discardableResult
     public static func closePanel() throws {
         let rc = MFBridgeClosePanel()
         guard rc == 0 else { throw MFBridgeError(rawValue: rc) ?? .notExposed }
@@ -60,14 +56,20 @@ public struct MFHostBridge {
 
     /// 订阅承载完成事件（几何同步事件后续交互层需要时再扩）。
     /// 返回的 token 需持有；不用时调用 nc.removeObserver(token)。
+    ///
+    /// 注意：桥常量在不同 SDK 的 Swift 导入器下类型会变（String 或
+    /// NSNotification.Name，26.5 SDK 实测为后者），所以通知名这里用字面量
+    /// 原值构造，保证与 MFBridge.mm post 的字符串恒等；userInfo 键走
+    /// AnyHashable，两种导入类型都能命中。
     public static func observeEvents(_ handler: @escaping (MFHostEvent) -> Void) -> NSObjectProtocol {
         let nc = NotificationCenter.default
+        let name = NSNotification.Name("MFBridgeHostDidCompleteNotification")
         return nc.addObserver(
-            forName: NSNotification.Name(MFBridgeHostDidCompleteNotification),
+            forName: name,
             object: nil, queue: .main
         ) { note in
-            let id = (note.userInfo?[MFBridgeBundleIDKey] as? String) ?? ""
-            let ok = (note.userInfo?[MFBridgeAcceptedKey] as? Bool) ?? false
+            let id = (note.userInfo?[AnyHashable("bundleID")] as? String) ?? ""
+            let ok = (note.userInfo?[AnyHashable("accepted")] as? Bool) ?? false
             handler(.hostCompleted(bundleID: id, accepted: ok))
         }
     }
