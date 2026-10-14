@@ -9,6 +9,7 @@
 // 这里按 ObjC 动态特性做最小声明（同名类运行期直接匹配），不复制实现细节。
 
 #import "MFBridge.h"
+#import <UIKit/UIKit.h>
 
 // ---- 最小类声明（只列桥接用到的成员，避免与 .xm 重复维护） ----
 @class MFFloatPanel;
