@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.17.0";
+    return @"0.18.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -292,10 +292,17 @@ void MFWriteDefaultConfigIfNeeded(void) {
                                                        //   变成"画面停一拍"。归档(15)：48 次真黑里 45 次
                                                        //   前一拍 deact 还是 0，**没有前兆**，轮询永远
                                                        //   追不上，只能在视觉侧兜住。
+        @"keepAliveSnapshotMask"  : @YES,              // 【0.18.0 新增】快照**置顶遮盖**：掉层被发现的
+                                                       //   第 1 拍把快照提到内容区最上层，盖住
+                                                       //   presentationView 的一切可见异常（黑/白/
+                                                       //   半渲染），恢复后等 2 拍归位垫底。
+                                                       //   归档(19)：每次切出/切回必掉层、垫底盖不住
+                                                       //   上层的闪烁 —— 只有置顶才能遮。
+                                                       //   0 = 退回 0.15.0 的纯垫底。
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @18,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @19,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
@@ -342,8 +349,9 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                         cfg[@"keepAliveDeactFuse"] == nil ||
                         cfg[@"keepAliveTieredRestore"] == nil ||
                         cfg[@"keepAliveSnapshot"] == nil ||
+                        cfg[@"keepAliveSnapshotMask"] == nil ||
                         cfg[@"keepAlivePreventCooldownMs"] == nil);
-    if (cur >= 18 && !missingKeys) return;
+    if (cur >= 19 && !missingKeys) return;
 
     for (NSString *path in MFConfigCandidatePaths()) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
@@ -391,6 +399,7 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
         if (up[@"keepAliveTieredRestore"] == nil) up[@"keepAliveTieredRestore"] = @YES; // 0.14.0 新增
         // ---- 0.15.0 视觉消闪 ----
         if (up[@"keepAliveSnapshot"] == nil) up[@"keepAliveSnapshot"] = @YES;           // 0.15.0 新增
+        if (up[@"keepAliveSnapshotMask"] == nil) up[@"keepAliveSnapshotMask"] = @YES;   // 0.18.0 新增
         if (up[@"keepAlivePreventCooldownMs"] == nil) up[@"keepAlivePreventCooldownMs"] = @2000; // 0.16.0 新增
         // 旧键 forceActivate 已废弃（真机实测它会让 SpringBoard 在 20 秒存活窗口内挂掉）。
         // 留着不删，代码里已经完全不读它。
@@ -614,6 +623,16 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                   @"② hostEnabled 默认 YES（用户要求；原值 was %@）",
                   wasOn ? @"YES" : @"NO");
             up[@"cfgVersion"] = @18;
+        }
+        // ---- 0.18.0：快照置顶遮盖 ----
+        // 归档(19)：每次切出/切回系统必掉层（47 次真黑），垫底快照盖不住上层
+        // presentationView 的可见异常。置顶遮盖 = 掉层期间显示最后一帧定格画面，
+        // 恢复后等 2 拍归位。缺键补默认（YES），老配置升上来即可用。
+        if (cur < 19) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=19：快照置顶遮盖（keepAliveSnapshotMask=YES）"
+                  @"—— 掉层瞬间把最后一帧画面盖在最上层，恢复后归位；"
+                  @"归档(19) 实证每次切换必掉层、垫底盖不住上层的闪烁");
+            up[@"cfgVersion"] = @19;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];
