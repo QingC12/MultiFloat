@@ -3,9 +3,17 @@
 #ifdef __OBJC__
     #import <Foundation/Foundation.h>
 
-    // ===== 【MF 0.1.2】文件日志 =====
-    // 上游全项目几乎没有日志（只进 syslog，设备上取不到）。MFLog() 直接写
-    // /var/mobile/PullOverMF.log（Filza 可直接打开看），启动时 >2MB 自动轮转为 .old。
+    // ===== 【MF 0.1.3】文件日志 =====
+    // MFLog() 写 /var/mobile/PullOverMF.log（Filza 直接打开），启动时 >2MB 轮转为 .old。
     // 实现见 PullOverX/MFDebugLog.m。
+    //   · MFLogRawC(const char *) —— 纯 C，零 Foundation 依赖，**constructor 阶段只能用这个**
+    //     （0.1.2 的教训：constructor 里用 Foundation 会把整个 tweak 拖崩，桌面连手柄都不显示）
+    //   · MFLog(NSString *, ...) —— 正常运行时使用
     void MFLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
+    // 【MF 0.1.3】Stheno 风格圆盘选择器（边缘手势呼出）
+    void MFRingPickerInstall(void);
 #endif
+
+// 纯 C 日志：所有文件（含 .mm / 非 ObjC 单元）都能用
+void MFLogRawC(const char *message);

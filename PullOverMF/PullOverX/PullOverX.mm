@@ -1235,9 +1235,17 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     if (!objc_getClass("SpringBoard")) {
         return;
     }
-    MFLog(@"=== PullOverMF 0.1.2 加载 === 设备=%s iOS=%s",
-          [UIDevice currentDevice].model.UTF8String,
-          [UIDevice currentDevice].systemVersion.UTF8String);
+    // ⚠️ constructor 阶段 Foundation/UIKit 尚未就绪 —— 这里只能用纯 C 日志。
+    // 0.1.2 正是在这里调用 NSDateFormatter / [UIDevice currentDevice] 把整个 tweak 拖崩，
+    // 结果 dylib 加载失败、桌面连手柄都不显示。
+    MFLogRawC("=== PullOverMF 0.1.3 加载（SpringBoard）===");
+
+    // 【MF 0.1.3】Stheno 风格圆盘选择器：延迟 2 秒安装（等屏幕就绪）。
+    // 零 hook；安装失败只损失圆盘，不影响浮窗与手柄。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MFRingPickerInstall();
+    });
     POSetCameraForegroundGrantBundleIdentifier(nil);
     if (POSettingsEnabled([POApplicationHelper settings])) {
         PORegisterScreenBlankObserver();

@@ -55,4 +55,33 @@
       `scrollViewDidScroll:` 两处刷新（与上游 landscape 分支同一思路）。
     - 新增配置键 `mfPanelHandleGap`（手柄与卡片右边缘的间距，默认 6pt，0~40）。
 
+## 0.1.3 改动（崩溃修复 + Stheno 风格圆盘选择器）
+14. **修复 0.1.2 的致命崩溃**（表现为"装上后桌面连手柄都不显示"）：
+    0.1.2 在 dylib 的 constructor 里调用 MFLog，内部用了 `NSDateFormatter` 与 `[UIDevice currentDevice]`；
+    constructor 在 SpringBoard 极早期执行，Foundation/UIKit 尚未就绪 → 崩 → 整个 tweak 加载失败。
+    现在日志分两条通道：
+    - `MFLogRawC(const char *)`：**纯 C**（`clock_gettime` + `strftime` + `fopen`），constructor 阶段唯一安全入口；
+    - `MFLog(NSString *, ...)`：正常运行期使用，内部也不再用 NSDateFormatter，且对 Foundation 调用加 `@try`。
+    文件打开改为纯 C（`fopen`/`rename`），不再依赖 NSFileManager。
+
+15. **新增 Stheno 风格「圆盘」选择器**（`PullOverX/MFRingPicker.m`）：
+    设计依据来自对 Stheno 0.1.23 的逆向（`com.nx.stheno` 的 `Stheno.dylib` 字符串 + 本地化文案）：
+    - 圆盘本体类型：`RingView` / `RingShape` / `RingType` / `RingTypeSwitchView` / `RingModifySlidersView`；
+    - 形状文案：`RTSIF`=承载形状::圆盘、`RTSIH`=承载形状::半圆盘、`RTSIQ`=承载形状::直角盘、
+      `RTSIZ`=承载形状::任意(拖拽旋转最后一个图标)；几何键：`IconWidth`/`Radius`/`HeightFraction`/
+      `IntersectionHeightFraction`(键盘避让)/`RotationAngle`(旋转角)/`LastIconAngle`(尾角)/`DampingFraction`；
+    - 呼出方式：`EBCI`=触发边(可调节)、`AppearEdge`、`EdgeBarControlView`、`EgdeGestureView`、
+      `EdgeGestureShape`，并 hook 了 SpringBoard 手势链（`SBReachabilityGestureRecognizerHook` /
+      `SBReachabilityManagerHook` / `SBGrabberTongueHook` / `SBFluidSwitcherGestureManagerHook` /
+      `_SBFluidSwitcherPanGestureRecognizerHook`，处理 `_handlePullGesture:` 下拉）。
+    本 fork 的第一阶段实现（**零 hook**）：贴边半圆盘 + 图标沿弧排布（角度区间 90°→270°，
+    保证全部落在屏幕内）+ 点图标 `pinAppWithBundleId:` 后 `open` 浮窗 + 长按图标移出（写 `ringApps`）。
+    呼出：可配置边缘上的一条透明触发区，**任意方向滑动 >18pt 或单击**都能呼出。
+
+16. 新增配置项（suite `com.mlgm.pulloverx`，respring 生效）：
+    `mfRingEnabled`(默认 YES) / `mfTriggerEdge`(right|left|top|bottom，默认 right) /
+    `mfTriggerLength`(380) / `mfTriggerThickness`(56) / `mfTriggerCenterRatio`(0.78，避开手柄常驻的中部) /
+    `mfRingRadius`(150) / `mfRingIconSize`(56) / `mfRingRotation`(0) / `mfRingMaxIcons`(8) /
+    `ringApps`(bundleID 数组，圆盘自定义内容)。
+
 11. 后续改动（UI/交互/分屏能力）将逐条记录在此。
