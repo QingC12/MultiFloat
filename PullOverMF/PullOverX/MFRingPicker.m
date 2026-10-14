@@ -180,8 +180,16 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
             return;
         }
 
+        // 与浮窗窗口共用 windowScene（SpringBoard 里没有 windowScene 的窗口既不渲染也不收触摸）
         UIWindowScene *scene = nil;
-        @try { scene = [POXWindow sharedWindow].windowScene; } @catch (NSException *e) { scene = nil; }
+        @try {
+            id sharedWindow = [POXWindow sharedWindow];
+            if ([sharedWindow isKindOfClass:[UIWindow class]]) {
+                scene = [(UIWindow *)sharedWindow windowScene];
+            }
+        } @catch (NSException *exception) {
+            scene = nil;
+        }
         MFRingWindow *window = (scene != nil) ? [[MFRingWindow alloc] initWithWindowScene:scene]
                                               : [[MFRingWindow alloc] initWithFrame:screen];
         if (window == nil) {
@@ -497,11 +505,12 @@ static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
 
 - (void)openFloatWithBundleId:(NSString *)bundleId {
     @try {
-        id window = [POXWindow sharedWindow];
-        id controller = nil;
-        if ([window respondsToSelector:NSSelectorFromString(@"controller")]) {
-            controller = ((id (*)(id, SEL))objc_msgSend)(window, NSSelectorFromString(@"controller"));
+        id sharedWindow = [POXWindow sharedWindow];
+        if (![sharedWindow isKindOfClass:[UIWindow class]]) {
+            MFLog(@"[ring] !! 浮窗窗口不存在，无法打开 %@", bundleId);
+            return;
         }
+        PullOverViewController *controller = [(POXWindow *)sharedWindow controller];
         if (controller == nil) {
             MFLog(@"[ring] !! 找不到 PullOver 控制器，无法打开浮窗");
             return;
