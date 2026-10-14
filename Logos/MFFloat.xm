@@ -2808,6 +2808,8 @@ static char kMFRowBundleIDKey;
     [self.view addSubview:grip];
 
     [bar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
+    // 【0.22.0】底部条同样是移动手柄（用户需求：底部手势移动浮窗）
+    [statusBar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
     [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onResize:)]];
 
     MFLog(@"[ui] 面板就绪 %.0fx%.0f", w, h);
@@ -2852,8 +2854,11 @@ static char kMFRowBundleIDKey;
 // 拉大/缩小，松手后 syncContentGeometry 把错误尺寸写进 scene.frame（日志实测
 // 内容区在 448→605→367→432→340 之间乱跳），掉层恢复期间 App 常是挂起定格状态，
 // 挂起的最后帧按放大后的尺寸显示 = 用户看到的"画面定格成一张放大的图片"。
+// 【0.22.0】缩放改为"等比例"：手势起点锁定宽高比，平移沿对角线方向投影出
+// 统一缩放量 —— 右下角向左上拖=缩小、向右下拖=放大，内容永不变形（用户需求）。
 static CGRect     gMFResizeStartFrame = CGRectZero;
 static NSDate    *gMFResizeStartDate  = nil;
+static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -2862,6 +2867,9 @@ static NSDate    *gMFResizeStartDate  = nil;
     if (g.state == UIGestureRecognizerStateBegan) {
         gMFResizeStartFrame = win.frame;
         gMFResizeStartDate  = [NSDate date];
+        if (gMFResizeStartFrame.size.height > 0)
+            gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
+        if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
     }
 
     // 【0.20.0】误触判定：手势开始后 0.8s 内累计变化"几乎纯竖直且幅度大"
@@ -2870,9 +2878,9 @@ static NSDate    *gMFResizeStartDate  = nil;
     // scene.frame 从头到尾不被污染（Changed 期间本来也不写 scene.frame）。
     if (gMFResizeStartDate != nil && gMFResizeStartFrame.size.width > 0) {
         NSTimeInterval el = -[gMFResizeStartDate timeIntervalSinceNow];
-        CGFloat dx = win.frame.size.width  - gMFResizeStartFrame.size.width;
-        CGFloat dy = win.frame.size.height - gMFResizeStartFrame.size.height;
-        if (el < 0.8 && fabs(dy) > 60.0 && fabs(dy) > 3.0 * fabs(dx)) {
+        CGFloat ddx = win.frame.size.width  - gMFResizeStartFrame.size.width;
+        CGFloat ddy = win.frame.size.height - gMFResizeStartFrame.size.height;
+        if (el < 0.8 && fabs(ddy) > 60.0 && fabs(ddy) > 3.0 * fabs(ddx)) {
             win.frame = gMFResizeStartFrame;
             gMFResizeStartDate = nil;
             [g setEnabled:NO];   // 废掉本次手势，后续 Changed/Ended 不再来
@@ -2882,14 +2890,22 @@ static NSDate    *gMFResizeStartDate  = nil;
         }
     }
 
+    // 【0.22.0】等比例缩放：把手指平移投影到"右下-左上"对角线方向，
+    // 得到统一缩放量 proj（正=放大，负=缩小），宽高按同一比例增减。
     CGPoint t = [g translationInView:win];
-    CGRect f = win.frame;
-    f.size.width = MAX(190.0, f.size.width + t.x);
-    f.size.height = MAX(170.0, f.size.height + t.y);
+    CGFloat sw = gMFResizeStartFrame.size.width, sh = gMFResizeStartFrame.size.height;
+    CGFloat diag = sqrt(sw * sw + sh * sh);
+    CGFloat proj = (t.x * sw + t.y * sh) / diag;      // 对角线方向投影
+
     CGRect screen = [UIScreen mainScreen].bounds;
-    if (f.origin.x + f.size.width > screen.size.width) f.size.width = screen.size.width - f.origin.x;
-    if (f.origin.y + f.size.height > screen.size.height) f.size.height = screen.size.height - f.origin.y;
-    win.frame = f;
+    CGFloat newW = sw + proj;
+    // 夹取：最小可用尺寸 + 不超屏（右/下边贴住屏幕边缘为止）
+    newW = MAX(150.0, newW);
+    newW = MIN(newW, screen.size.width  - gMFResizeStartFrame.origin.x);
+    CGFloat newH = newW / gMFResizeStartAR;           // ★ 锁比例：高度由宽度唯一决定
+    newH = MIN(newH, screen.size.height - gMFResizeStartFrame.origin.y);
+    if (newH < 150.0) { newH = 150.0; newW = newH * gMFResizeStartAR; }
+    win.frame = CGRectMake(gMFResizeStartFrame.origin.x, gMFResizeStartFrame.origin.y, newW, newH);
     [g setTranslation:CGPointZero inView:win];
 
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
@@ -3035,7 +3051,9 @@ static NSDate    *gMFResizeStartDate  = nil;
     CGRect screen = [UIScreen mainScreen].bounds;
     CGFloat w = MAX(230.0, screen.size.width * 0.62);
     CGFloat h = MIN(screen.size.height * 0.65, w * 1.48);
-    CGRect frame = CGRectMake(screen.size.width - w - 14.0, 118.0, w, h);
+    // 【0.22.0】按用户需求：浮窗默认打开在屏幕中心（原为右上角停靠）
+    CGRect frame = CGRectMake((screen.size.width  - w) / 2.0,
+                              (screen.size.height - h) / 2.0, w, h);
 
     UIWindow *win = nil;
     if (scene != nil) {
