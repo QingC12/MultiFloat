@@ -1933,10 +1933,28 @@ static void MFKeepAliveTick(void) {
 
     gMFKeepAliveTicks += 1;
 
+    // 【0.28.0 归档30 修复】快速多次缩放后浮窗内触摸失效的根因：
+    // 掉层/恢复窗口期 FBScene.isValid 会**瞬时**翻 NO（1 拍内自愈），
+    // 旧逻辑单拍 NO 就停守护 -> 无人再把 scene 拉回 cs=2（前台可交互态）
+    // -> 画面还在（layers>0）但 scene 卡在非交互态，内容区触摸/点击全死。
+    // 修法：isValid 必须**连续 3 拍（~600ms）**NO 才停守护；
+    // 瞬时 NO 只跳过本拍写入（不摸一个正在翻转的 scene），下一拍照常。
+    static NSInteger sInvalidTicks = 0;
     if (!MFBoolProp(scene, NSSelectorFromString(@"isValid"))) {
-        MFLogS(@"[keepalive] scene 已失效 -> 停止守护；点 ↻ 重新拉应用列表再点一次应用名即可重挂");
-        MFStopSceneKeepAlive(@"scene 失效");
+        sInvalidTicks += 1;
+        if (sInvalidTicks == 1) {
+            MFLogS(@"[keepalive] scene.isValid 瞬时 NO（掉层窗口期常见）-> 跳过本拍，继续观察");
+        }
+        if (sInvalidTicks >= 3) {
+            MFLogS(@"[keepalive] scene 连续 3 拍失效 -> 停止守护；点 ↻ 重新拉应用列表再点一次应用名即可重挂");
+            MFStopSceneKeepAlive(@"scene 失效");
+        }
         return;
+    }
+    if (sInvalidTicks > 0) {
+        MFLog(@"[keepalive] scene.isValid 自愈（此前连续 %ld 拍 NO）-> 恢复守护写入",
+              (long)sInvalidTicks);
+        sInvalidTicks = 0;
     }
 
     // 状态一变就记一行：这是"到底是谁把它改回去的"的唯一证据。
@@ -3019,12 +3037,14 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
     // 【0.26.0 归档28 修复】缩放中出现"静态图片"、松手才回实时画面 ——
     // 根因：缩放中 win.frame 每拍变，但 scene.frame 只在 Ended 同步一次；
     // 掉层窗口期间垫底快照显示定格帧（且随窗口一起被拉伸）。
-    // 修法：Changed 期间按 250ms 节流同步 scene.frame，让实时渲染跟上手指。
-    // （updateSettings 每发=一帧重提交，但缩放时画面本来就在动，可接受。）
+    // 修法：Changed 期间节流同步 scene.frame，让实时渲染跟上手指。
+    // 【0.28.0 归档30】250ms -> 120ms：日志证实 resize 全程 AR 数学等比（0.535 锁定），
+    // 用户看到的"非等比"= win.frame 已变、scene.frame 未跟上期间 presentationView
+    // 被拉伸的视觉变形 —— 缩短同步间隙直接减轻观感变形。
     if (g.state == UIGestureRecognizerStateChanged) {
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (gMFResizeLastSync == nil ||
-            now - [gMFResizeLastSync timeIntervalSinceReferenceDate] > 0.25) {
+            now - [gMFResizeLastSync timeIntervalSinceReferenceDate] > 0.12) {
             gMFResizeLastSync = [NSDate date];
             [[MFFloatManager shared] syncContentGeometry];
             MFLogS(@"[ui] resize 中 -> 节流同步 scene.frame（实时画面跟手）");
@@ -3230,6 +3250,30 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
     double level = 1010.0;
     id cfgLevel = self.config[@"windowLevel"];
     if ([cfgLevel respondsToSelector:@selector(doubleValue)]) level = [cfgLevel doubleValue];
+    // 【0.28.0 归档30】App 前台时浮窗手势失效（能看见、点不到）：
+    // 0.27 证实 statusBar 与主窗口同一 scene，换 scene 方案作废。
+    // 新假说：触摸仲裁按 windowLevel 分层，前台 App 内容路由压过了 level=1010 的浮窗。
+    // 状态栏窗口在 App 前台时仍保触摸路由（灵动岛可点即证）——
+    // 未显式配置 windowLevel 时，自动把浮窗提到 UIStatusBarWindow.level + 100。
+    @try {
+        if (cfgLevel == nil) {
+            id sbw = MFClassSharedInstance(@"UIStatusBarWindow");
+            double sbLevel = -1;
+            if ([sbw respondsToSelector:@selector(windowLevel)]) {
+                sbLevel = [(UIWindow *)sbw windowLevel];
+            }
+            if (sbLevel > 0 && sbLevel + 100.0 > level) {
+                level = sbLevel + 100.0;
+                MFLog(@"[ui] windowLevel 自动提升 -> %.0f（UIStatusBarWindow.level=%.0f，修 App 前台手势失效）",
+                      level, sbLevel);
+            } else {
+                MFLog(@"[ui] statusBar windowLevel=%.0f 不可用/未超过，浮窗维持 level=%.0f",
+                      sbLevel, level);
+            }
+        }
+    } @catch (NSException *e) {
+        MFLog(@"[ui] !! statusBar windowLevel 探测异常：%@ -> 维持 level=%.0f", e, level);
+    }
     win.windowLevel = level;
 
     MFFloatPanel *panel = [[MFFloatPanel alloc] init];

@@ -6,6 +6,15 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.28.0 变更（第 31 轮：归档30 三修）：
+#   - ① 快速多次缩放后浮窗内触摸失效：根因 = 掉层窗口期 FBScene.isValid 瞬时翻 NO，
+#     旧守护单拍 NO 即自杀 -> 无人把 scene 拉回 cs=2（画面在、触摸死）。
+#     修法：连续 3 拍 NO 才停守护；瞬时 NO 跳过本拍写入，自愈即恢复。
+#   - ② 非桌面时手势失效：0.27 证明 statusBar 与主窗口同 scene（换 scene 作废）；
+#     改窗口仲裁路线 —— 未配置 windowLevel 时自动提到 UIStatusBarWindow.level+100。
+#   - ③ 缩放"非等比"观感：数学全程 AR=0.535 等比（日志实锤），变形来自
+#     win.frame 领先 scene.frame 的拉伸间隙 -> 拖动节流 250ms -> 120ms。
+#
 # 0.26.0 变更（第 29 轮：归档28 四连修）：
 #   - ① ↻/✕ 按钮点不到：容器 userInteractionEnabled=NO 会掐死整个子树触摸
 #     （UIKit hitTest 铁律）—— 容器恢复默认 YES（透明 UIView 本身不拦触摸）。
