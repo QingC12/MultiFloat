@@ -3497,29 +3497,43 @@ static void MFPickerHide(void) {
 }
 
 - (void)summonPan:(UIPanGestureRecognizer *)g {
-    // 【0.39.0】右缘"拾取带"状态机（用户指定 + 归档38 实证：屏幕边缘区域在前台 App 上仍能收触摸）：
-    //   ① 带内竖向/斜向拖动  -> 直接移动浮窗（前台 App 也有效）
-    //   ② 带内明显向左滑 >30pt -> 呼出圆弧选择器（弧心固定在屏幕垂直中心，只让高亮跟手指）
-    // 手指按下时不立刻决定，等位移够了再分流（避免"想移动却弹出选择器"）。
-    CGPoint p = [g.view.window convertPoint:[g locationInView:nil] toWindow:nil];   // -> 屏幕坐标
-    CGPoint t = [g translationInView:g.view];
+    // 【0.41.0】右缘拾取带 —— 归档40 实证：贴边 20pt 区(tag=990050)能收到触摸，
+    // 但用户左滑的 translation 只有 -10~-14pt 就结束了（疑似被系统边缘返回手势抢走），
+    // 于是永远达不到 0.39/0.40 的 -20pt 阈值 -> 圆弧呼不出来。
+    // 对策：① 贴边区(990050/990052/990062) **按下即呼出**圆弧（不再等位移）；
+    //      ② 阈值降到 8pt，且"移动中"若向左累计 >20pt 也切回选择器；
+    //      ③ 手势被系统 Cancelled 时**保持选择器打开**（改点图标选择，不让一次抢走白费）。
+    UIView *v = g.view;
+    CGPoint p = [v.window convertPoint:[g locationInView:nil] toWindow:nil];   // -> 屏幕坐标
+    CGPoint t = [g translationInView:v];
+    BOOL edgeZone = (v.tag == 990050 || v.tag == 990052 || v.tag == 990062);
     if (g.state == UIGestureRecognizerStateBegan) {
         gMFBandMode = 0;
-        gMFBandStartY = p.y;
-        MFLog(@"[band] 按下 来源=%@(tag=%ld) 起点=(%.0f,%.0f)",
-              NSStringFromClass([g.view.window class]), (long)g.view.tag, p.x, p.y);
-    } else if (g.state == UIGestureRecognizerStateChanged) {
+        MFLog(@"[band] 按下 来源=%@(tag=%ld) 起点=(%.0f,%.0f) v.frame=%@",
+              NSStringFromClass([v.window class]), (long)v.tag, p.x, p.y, NSStringFromCGRect(v.frame));
+        if (edgeZone) {
+            gMFBandMode = 1;
+            MFLogS(@"[band] 贴边区按下 -> 立即呼出圆弧选择器");
+            gMFPickerGestureMode = YES;
+            [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
+        }
+        return;
+    }
+    if (g.state == UIGestureRecognizerStateChanged) {
+        if (gMFBandMode == 2 && t.x < -20.0) {          // 已判移动，但明显向左 -> 改判选择器
+            gMFBandMode = 1;
+            MFLog(@"[band] 移动中改判=呼出圆弧选择器（dx=%.0f）", t.x);
+            gMFPickerGestureMode = YES;
+            [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
+        }
         if (gMFBandMode == 0) {
-            // 【0.40.0 修正】左滑优先给"选择器"（0.39 要求横向主导 -> 用户的左滑被判成移动，
-            // 导致圆弧呼不出来 = 回归）。规则：只要向左 >20pt 就是选择器；否则有位移就是移动。
-            if (t.x < -20.0) {
-                gMFBandMode = 1;   // 选择器
+            if (t.x < -8.0) {
+                gMFBandMode = 1;
                 MFLog(@"[band] 判定=呼出圆弧选择器（dx=%.0f dy=%.0f）", t.x, t.y);
                 gMFPickerGestureMode = YES;
                 [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
-            } else if (fabs(t.y) > 10.0 || fabs(t.x) > 10.0) {
-                gMFBandMode = 2;   // 移动浮窗
-                // 【0.40.0 修正】浮窗被 ▦ 隐藏时先显示出来，否则"移动了但看不到"
+            } else if (fabs(t.y) > 12.0) {
+                gMFBandMode = 2;
                 MFFloatPanel *p2 = self.panel;
                 BOOL hidden = (p2 != nil) ? p2.hostWindow.isHidden : YES;
                 if (p2 == nil || p2.view.superview == nil || hidden) {
@@ -3532,18 +3546,27 @@ static void MFPickerHide(void) {
             }
         }
         if (gMFBandMode == 1) {
-            [self arcPickerUpdateAtY:gMFPickerCY finger:p];   // 弧固定，只更新高亮
+            [self arcPickerUpdateAtY:gMFPickerCY finger:p];
         } else if (gMFBandMode == 2) {
             [self moveFloatByTranslation:t];
-            [g setTranslation:CGPointZero inView:g.view];
+            [g setTranslation:CGPointZero inView:v];
         }
         return;
     }
     // Ended / Cancelled
+    if (g.state == UIGestureRecognizerStateCancelled) {
+        if (gMFBandMode == 1) {
+            MFLogS(@"[band] 手势被系统取消 -> **保持圆弧选择器打开**（点图标即可选择）");
+        } else {
+            MFLogS(@"[band] 手势被系统取消（未产生动作）");
+        }
+        gMFBandMode = 0;
+        return;
+    }
     if (gMFBandMode == 1) {
         [self arcPickerCommitWithTranslation:t];
     } else if (gMFBandMode == 2) {
-        [self syncContentGeometry];   // 移动结束：几何再对一次（尺寸未变，安全）
+        [self syncContentGeometry];
         MFLogS(@"[band] 移动结束（几何同步）");
     } else {
         MFLogS(@"[band] 松手（未产生位移）");
@@ -5046,6 +5069,21 @@ static void MFInstallSDTouchOverlay(void) {
         e2Pinch.maximumNumberOfTouches = 2;
         [edge2 addGestureRecognizer:e2Pinch];
         [sb addSubview:edge2];
+
+        // 【0.41.0】决定性探针：**只存在于状态栏窗口**的左缘贴边 20x300 区（tag 990062）。
+        // 左边缘没有任何我们自己的窗口遮挡 -> 若在"全屏 App"里从左边往右滑能打出
+        // `来源=SBStatusBarWindow(tag=990062)`，就证明"状态栏窗口在全屏 App 上仍能收触摸"
+        // （路线②成立）；否则说明连状态栏窗口也被前台 App 拿走 -> 直接上 App 进程注入。
+        CGRect lzone = CGRectMake(0.0, (sbH - 300.0) / 2.0, 20.0, 300.0);
+        UIView *lprobe = [[UIView alloc] initWithFrame:lzone];
+        lprobe.backgroundColor = [UIColor clearColor];
+        lprobe.tag = 990062;
+        UIPanGestureRecognizer *lp = [[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                         action:@selector(summonPan:)];
+        lp.maximumNumberOfTouches = 1;
+        [lprobe addGestureRecognizer:lp];
+        [sb addSubview:lprobe];
+        MFLog(@"[summon] 左缘探针已装 frame=%@（全屏 App 时从左边往右滑，看是否打日志）", NSStringFromCGRect(lzone));
         gMFOverlayStrip = strip;
 
         gMFOverlayViews = arr;
