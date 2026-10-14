@@ -2946,7 +2946,6 @@ static CGFloat    gMFResizeCurW        = 0.0;   // 【0.23.1】增量式当前�
 static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日志计数
 static CGPoint    gMFResizeAnchor      = CGPointZero;  // 【0.25.0】锚角（拖动角的对角，固定不动）
 static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 12=右上 13=左下 14=右下
-static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 scene.frame 节流同步时刻
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -3034,35 +3033,35 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
              nf.origin.x, nf.origin.y);
     }
 
-    // 【0.26.0 归档28 修复】缩放中出现"静态图片"、松手才回实时画面 ——
-    // 根因：缩放中 win.frame 每拍变，但 scene.frame 只在 Ended 同步一次；
-    // 掉层窗口期间垫底快照显示定格帧（且随窗口一起被拉伸）。
-    // 修法：Changed 期间节流同步 scene.frame，让实时渲染跟上手指。
-    // 【0.28.0 归档30】250ms -> 120ms：日志证实 resize 全程 AR 数学等比（0.535 锁定），
-    // 用户看到的"非等比"= win.frame 已变、scene.frame 未跟上期间 presentationView
-    // 被拉伸的视觉变形 —— 缩短同步间隙直接减轻观感变形。
-    if (g.state == UIGestureRecognizerStateChanged) {
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-        if (gMFResizeLastSync == nil ||
-            now - [gMFResizeLastSync timeIntervalSinceReferenceDate] > 0.12) {
-            gMFResizeLastSync = [NSDate date];
-            [[MFFloatManager shared] syncContentGeometry];
-            MFLogS(@"[ui] resize 中 -> 节流同步 scene.frame（实时画面跟手）");
-        }
-    }
+    // 【0.29.0 归档31 破案】触摸失效的真正根因不在守护，而在**拖动期间的 scene.frame 写入本身**：
+    // 归档31 日志实锤 resize 期间 `presenter isActive=0 isHosting=0 isInvalidated=1`，
+    // 且 isValid 连续 3+ 拍 NO（真失效 >600ms，3 拍规则扛不住）——
+    // 高频 updateSettings(frame) 把 presenter 打成 invalidated → hosting 死 → 触摸死。
+    // 修法：Changed 期间**一个字节都不写**（不碰 scene.settings、也不动承载视图 frame）
+    // —— 拖动中内容保持旧尺寸（不拉伸、不裁切、不掉层），松手后一次精确同步。
+    // 【0.26~0.28 的节流同步路线（250ms/120ms）就此废弃：它换来的"实时跟手"
+    //  是以 presenter 失效为代价的，得不偿失。】
+    // 拖动中：只改浮窗窗口自身 frame（上面 win.frame = nf，纯本地 view 操作，
+    // 无任何 scene.settings 写入）。内容区与 scene 的几何在 Ended 统一对齐。
 
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
     if (g.state == UIGestureRecognizerStateEnded) {
         gMFResizeStartDate = nil;
-        gMFResizeLastSync = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
         MFLog(@"[ui] resize 结束 frame=%@ -> 同步 scene.frame", NSStringFromCGRect(win.frame));
         [[MFFloatManager shared] syncContentGeometry];
+        // 【0.29.0】800ms 后补一次精确同步：updateSettings 异步生效（400~800ms），
+        // App 按 scene.frame 重排可能晚一步 -> presentationView 与内容区短暂错位 =
+        // 用户看到的"剪切/放大画面"。这里在重排落地后再对齐一次（单次写入，低风险）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[MFFloatManager shared] syncContentGeometry];
+            MFLogS(@"[ui] resize 后 800ms 确认同步（App 重排落地后对齐）");
+        });
     } else if (g.state == UIGestureRecognizerStateCancelled ||
                g.state == UIGestureRecognizerStateFailed) {
         gMFResizeStartDate = nil;
-        gMFResizeLastSync = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
     }
 }
@@ -3254,9 +3253,10 @@ static NSDate    *gMFResizeLastSync    = nil;          // 【0.26.0】缩放中 
     // 0.27 证实 statusBar 与主窗口同一 scene，换 scene 方案作废。
     // 新假说：触摸仲裁按 windowLevel 分层，前台 App 内容路由压过了 level=1010 的浮窗。
     // 状态栏窗口在 App 前台时仍保触摸路由（灵动岛可点即证）——
-    // 未显式配置 windowLevel 时，自动把浮窗提到 UIStatusBarWindow.level + 100。
+    // 【0.29.0 归档31 修复】默认配置里 windowLevel=@1010 是"未配置"（归档31 日志
+    // 证明 0.28 的自动提升因 cfgLevel!=nil 从未执行）——1010 视为未配置，照常自动提。
     @try {
-        if (cfgLevel == nil) {
+        if (cfgLevel == nil || level == 1010.0) {
             id sbw = MFClassSharedInstance(@"UIStatusBarWindow");
             double sbLevel = -1;
             if ([sbw respondsToSelector:@selector(windowLevel)]) {

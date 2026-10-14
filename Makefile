@@ -6,6 +6,15 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.29.0 变更（第 32 轮：归档31 破案）：
+#   - ① 触摸失效真正根因 = 拖动期间的 scene.frame 写入本身：归档31 日志实锤
+#     presenter isActive=0 isHosting=0 isInvalidated=1，isValid 连续 3+ 拍 NO
+#     （真失效 >600ms，3 拍规则扛不住）。修法：Changed 期间零写入（窗口 frame
+#     纯本地变），Ended 一次精确同步 + 800ms 后确认同步（App 异步重排落地后对齐，
+#     同时治"剪切/放大"裁切观感）。0.26~0.28 的拖动节流路线（250/120ms）废弃。
+#   - ② windowLevel 自动提升从未执行：默认配置 windowLevel=@1010 被当成显式配置
+#     -> 1010 现在视为未配置，照常提到 UIStatusBarWindow.level+100。
+#
 # 0.28.0 变更（第 31 轮：归档30 三修）：
 #   - ① 快速多次缩放后浮窗内触摸失效：根因 = 掉层窗口期 FBScene.isValid 瞬时翻 NO，
 #     旧守护单拍 NO 即自杀 -> 无人把 scene 拉回 cs=2（画面在、触摸死）。
