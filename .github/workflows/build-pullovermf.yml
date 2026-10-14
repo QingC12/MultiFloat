@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - 'PullOverMF/**'
+      - 'MultiFloat/scripts/setter_check.py'
       - '.github/workflows/build-pullovermf.yml'
   workflow_dispatch:
 
@@ -47,6 +48,11 @@ jobs:
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
           chmod +x /tmp/ldid && sudo mv /tmp/ldid /usr/local/bin/ldid && sudo chmod +x /usr/local/bin/ldid
           ldid -v || true
+
+      - name: Static checks (property setter recursion)
+        # 拦住"手写 setXxx: 与同名 @property 撞车"——这类写法会无限递归 → 栈溢出 → SIGSEGV，
+        # 宿主进程（SpringBoard）当场死、不进安全模式。0.1.6~0.1.9 四版崩溃的真凶就是它。
+        run: python3 MultiFloat/scripts/setter_check.py PullOverMF
 
       - name: Build PullOverMF package
         run: make package -C PullOverMF

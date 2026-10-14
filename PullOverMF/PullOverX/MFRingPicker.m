@@ -2,38 +2,39 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
-//  ============================ 0.1.9 核心改动 ============================
-//  **不再自建 UIWindow。** 圆盘与触发条改挂到 PullOver 自己那扇窗口（POXWindow）。
+//  ============================ 0.2.0 核心改动 ============================
+//  **找到并修掉"边缘一滑就黑屏注销"的唯一根因：属性 setter 死递归。**（见第 1179 行注释）
 //
-//  证据链（三轮失败的共同点）：
-//    · 0.1.5（可用）真机日志：`触发区按下` → 40ms 后 `圆盘已展开：5 个 App`，
-//      反复十几次都正常，还在全屏「设置」之上呼出过。
-//    · 0.1.6 / 0.1.7 / 0.1.8 三版日志：`贴边按下` 之后**再也没有任何圆盘日志**，
-//      0.4~2.4 秒后出现新的 `===== 日志会话开始 =====` ⇒ SpringBoard 被硬重启
-//      （没有 NSException、不进安全模式）。日志是无缓冲写入，最后一条一定在盘上。
-//    · 把 0.1.5 → 0.1.6 逐行 diff：按下之后我们执行的代码只多了"读手指坐标 + 几个
-//      属性赋值"这种纯读操作，**不可能**崩；0.1.7/0.1.8 更是把整个展开步骤都拆成
-//      了 `>>> / <<<` 日志，而日志连第一行都没打出来 ⇒ 崩溃发生在进入展开逻辑之前。
-//    ⇒ 结论：不是"哪一行写错"，而是**我们那扇自己造的窗口在抢屏幕边缘触摸**这件事
-//      本身触发了 SpringBoard 侧的中止。PullOver 上游那套窗口模型（level 100、
-//      全屏、hitTest 交给控制器）在真机上被反复验证可用——手柄就是靠它工作的。
+//  病根：本文件既声明 `@property (nonatomic, weak) UIButton *selectedButton;`，
+//        又手写了一个同名方法 `- (void)setSelectedButton:(UIButton *)button`，
+//        而该方法内部执行 `self.selectedButton = button;`。
+//        Objective-C 里属性赋值会被编译成 `objc_msgSend(self, @selector(setSelectedButton:), v)`，
+//        于是它调用了**自己** → 无限递归 → 栈溢出 → SIGSEGV。
+//        SIGSEGV **抓不住**（不是 NSException）、**不进安全模式**，SpringBoard 当场死 → 黑屏注销。
 //
-//  Stheno 的实证正好同向：**它也不自己造窗口**，而是把 UI 挂到系统既有的
-//  UIStatusBarWindow 上（字符串实证 UIStatusBarWindowHook / setWindowLevel: /
-//  hitTest:withEvent: / ownsHomeGesture）。结论一致：宿主用既有的，别造新的。
+//  证据链（四版全中，且只有这四版）：
+//    · 0.1.6 / 0.1.7 / 0.1.8 / 0.1.9 都新增了 `selectedButton` 属性 + 同名 setter，
+//      且 `showRing…/showAtPoint:` 第一段都有一句 `self.selectedButton = nil;`；
+//      0.1.5（唯一正常版）根本没有这个属性。
+//    · 0.1.9 真机日志：`>>> 呼出圆盘` **有**、紧接着的 `>>> 建容器` **没有** ——
+//      而 `self.selectedButton = nil;` 正是第 806 行，恰好夹在这两条日志之间。逐字吻合。
+//    · 每次滑动必挂（确定性）、耗时极短（栈溢出是毫秒级）、无崩溃弹窗 —— 全部符合特征。
 //
-//  新的触摸路径（完全复用 PullOver 已验证的一条）：
+//  修法：自定义方法改名 `applySelectionToButton:`，内部**写 ivar** `_selectedButton`。
+//  防线：新增 `scripts/setter_check.py`，任何"手写 setXxx: 与同名属性撞车"直接拦下。
+//
+//  ⚠️ 归因更正：0.1.9 曾把病因记成"自建窗口抢屏幕边缘触摸"，那是**误判**。
+//     四版崩溃与窗口模型（自建窗口 / 全屏窗口 / 挂到 POXWindow）无关。
+//     （0.1.9 改用 PullOver 窗口这件事本身是好事：少一扇窗口、少一层风险，故保留。）
+//
+//  ======================== 0.1.9 保留的架构 ==============================
+//  **不自建 UIWindow**：圆盘与触发条挂在 PullOver 自己那扇窗口（POXWindow）上。
+//  触摸路径：
 //    POXWindow.hitTest:
 //      → MFRingHitTestViewForWindowPoint()
 //          ├─ 圆盘展开态 → 返回容器里最深的那层（图标按钮可直接点）或容器本身
 //          ├─ 收起态、点落在贴边触发条内、且不在 PullOver 手柄上 → 返回 stripView
 //          └─ 其余 → nil（原样交回 PullOver 控制器，既有行为零改变）
-//    触发条是一个**窗口子视图**，挂 UIPanGestureRecognizer（与 POHandle 同款做法）。
-//
-//  为什么不会和 PullOver 手柄打架：手柄是个方形小把件（`refreshHandleSizeAnimated:`
-//  里 frame.size 被做成正方形，默认约 50x50pt 命中区），命中它时我们把这次触摸
-//  **原样让给 PullOver**（与上游 `interactiveViewForWindowPoint:` 里的判定完全一致）。
-//
 //  ======================================================================
 //
 //  设计依据（逆向自 Stheno 0.1.23，com.nx.stheno）：
@@ -78,7 +79,8 @@
 //
 //  版本备注：0.1.4 及以前圆心在屏幕边缘（半圆出屏）；0.1.5 整圆可见；0.1.6 交互重做；
 //  0.1.7 全屏窗口 + hitTest 点透；0.1.8 触摸路径零 SB 查询 + 图标延后 + 崩溃降级；
-//  **0.1.9 删掉自建窗口，改挂 PullOver 既有窗口（POXWindow）—— 本轮修复一滑就注销**。
+//  0.1.9 删掉自建窗口，改挂 PullOver 既有窗口（POXWindow，保留）；
+//  **0.2.0 修掉四版崩溃的真凶 —— setter 死递归（见文件头 0.2.0 段）。**
 //
 
 #import <UIKit/UIKit.h>
@@ -435,7 +437,8 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 - (void)refreshRingContentsIfVisible;
 - (void)scheduleAutoBundleIdEnumeration;
 - (void)updateSelectionForPoint:(CGPoint)point;
-- (void)setSelectedButton:(UIButton *)button;
+/// ⚠️ 注意：**绝不能**命名为 setSelectedButton:（详见实现处 0.2.0 血案注释）
+- (void)applySelectionToButton:(UIButton *)button;
 - (void)applySelectionVisual:(UIButton *)button selected:(BOOL)selected;
 - (void)openFloatWithBundleId:(NSString *)bundleId;
 - (CGPoint)clampRingCenter:(CGPoint)point;
@@ -563,7 +566,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         self.stripPan = pan;
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 圆盘已挂到 PullOver 窗口（0.1.9 起不再自建窗口）：窗口 %@ level=%.0f hidden=%d "
+        MFLog(@"[ring] 0.2.0 圆盘已挂到 PullOver 窗口：窗口 %@ level=%.0f hidden=%d "
               @"交互=%d 控制器=%@ | 触发边=%@ 触发条=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               NSStringFromCGRect(bounds), host.windowLevel, (int)host.hidden,
               (int)host.userInteractionEnabled,
@@ -800,6 +803,9 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
 
     MFLog(@"[ring] >>> 呼出圆盘 起点(%.0f,%.0f)", point.x, point.y);
     @try {
+        // ⚠️ 0.1.6~0.1.9 就是死在这里：下面这句属性赋值当时会递归调用自身
+        //    （手写 setSelectedButton: 与 @property selectedButton 撞名），
+        //    栈溢出 → SIGSEGV → SpringBoard 硬重启。0.2.0 已改名 + 改走 ivar。
         self.expanded = YES;
         self.buildGeneration += 1;
         self.ringLatched = NO;
@@ -810,6 +816,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.72), 0.5), 0.92);
         self.parkCenter = [self clampRingCenter:CGPointMake(CGRectGetMidX(bounds),
                                                             CGRectGetHeight(bounds) * ratio)];
+        MFLog(@"[ring] 呼出前置 ok（0.2.0：setter 死递归已修）");
 
         MFLog(@"[ring] >>> 建容器");
         MFRingContainerView *container = [[MFRingContainerView alloc] initWithFrame:bounds];
@@ -1147,7 +1154,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     // 刚固定时手指还停在原地 —— 必须真的滑动一下才算"选择"（防误开）
     if (self.hasLatchFinger &&
         hypot(point.x - self.latchFingerPoint.x, point.y - self.latchFingerPoint.y) < 22.0) {
-        [self setSelectedButton:nil];
+        [self applySelectionToButton:nil];
         return;
     }
     CGFloat iconSize = MAX(24.0, MFRingNumber(@"mfRingIconSize", 44.0));
@@ -1172,12 +1179,31 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (best == self.selectedButton) {
         return;
     }
-    [self setSelectedButton:best];
+    [self applySelectionToButton:best];
 }
 
-- (void)setSelectedButton:(UIButton *)button {
-    UIButton *previous = self.selectedButton;
-    self.selectedButton = button;
+/// 悬停选中的**应用**（不是属性的 setter —— 名字绝不能叫 setSelectedButton:）
+///
+/// 【0.2.0 血案 · 必读】
+/// `selectedButton` 是个 @property，编译器会替它合成 `-setSelectedButton:`。
+/// 如果我们再手写一个同名方法，那么**属性赋值** `self.selectedButton = x`
+/// 在编译后就变成 `objc_msgSend(self, @selector(setSelectedButton:), x)` ——
+/// 也就是调用它**自己**，于是无限递归 → 栈溢出 → SIGSEGV。
+///
+/// SIGSEGV 有两个致命特性：
+///   ① `@try/@catch` **抓不住**（不是 NSException）；
+///   ② 不产生"安全模式"，进程直接死 → 用户看到"黑屏 + 自动注销"。
+///
+/// 这正是 0.1.6 / 0.1.7 / 0.1.8 / 0.1.9 **连续四版"右边缘一滑就注销"的唯一根因**：
+/// 每一版的 `showRing…/showAtPoint:` 里都有一句 `self.selectedButton = nil;`，
+/// 而它恰好排在"第一条日志之后、第二条日志之前"——
+/// 0.1.9 具体在第 806 行，与真机日志（`>>> 呼出圆盘` 有、`>>> 建容器` 无）**逐字吻合**。
+/// 0.1.5 之所以正常，只是因为那一版还没有 `selectedButton` 这个属性。
+///
+/// 铁律：这个函数**写 ivar**（`_selectedButton = button;`），**永不自赋值属性**。
+- (void)applySelectionToButton:(UIButton *)button {
+    UIButton *previous = self.selectedButton;   // 读：走编译器合成的 getter，安全
+    _selectedButton = button;                   // 写：直接写 ivar，绝不触发 setter
     if (previous != nil && previous != button) {
         [self applySelectionVisual:previous selected:NO];
     }
