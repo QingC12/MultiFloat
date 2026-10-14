@@ -6,6 +6,21 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.23.0 变更（第 25 轮：Stheno 风无框壳 + 手势唤出选择器 + 缩放失效修复）：
+#   - 用户反馈（归档24）：居中 ✔；但 ① 右下角缩放手势失效 ② 不要四周边框/黑边，
+#     要 Stheno 那种纯内容浮窗 ③ 选择应用改成手势唤出或默认打开。
+#   - 缩放失效根因（日志佐证）：承载/恢复后的守护"几何按住"逐拍把 win/scene 几何
+#     写回旧值（t=4304 一秒内 3 次几何同步）—— 用户怎么拖都被掰回去。
+#     修法：gMFUserGestureUntil 闸门 —— resize 手势期间+结束后 1.5s，
+#     MFKeepAliveFixViewFrameIfNeeded / scene.frame 纠偏全部让路；
+#     另加 resize 开始/结束日志（下轮日志可直接验证手势是否触发）。
+#   - 无框壳：窗口背景透明、无描边；标题/状态文字隐藏；顶/底条变透明边缘条
+#     （仍是移动手柄）；内容区满窗；◢ 命中区 24→44pt（半透明提示）。
+#   - 选择器手势：pickerGesture 0=关/1=双击边缘条（默认）/2=长按边缘条；
+#     toggleAppList 在"选择器 ↔ 承载画面"间切换。
+#   - 默认打开：defaultBundleID 非空 => 浮窗出现 0.6s 后自动承载。
+#   - cfgVersion 19→20（新增 defaultBundleID / pickerGesture 两键）。
+#
 # 0.22.0 变更（第 24 轮：交互壳重做 —— Stheno 式手势操作，用户明确需求）：
 #   - "我想要的悬浮窗不是目前这样的，是 stheno 那样通过手势来操作的"：
 #     ① 浮窗默认打开在屏幕中心（原右上角停靠）；

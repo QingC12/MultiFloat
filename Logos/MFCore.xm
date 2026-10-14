@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.22.0";
+    return @"0.23.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
@@ -302,10 +302,13 @@ void MFWriteDefaultConfigIfNeeded(void) {
         @"keepAliveViewFrameMs"   : @500,              // 【0.12.0 新增】承载视图尺寸纠正的节流
         @"keepAliveViewFrameTol"  : @0.08,             // 【0.12.0 新增】承载视图尺寸容差（比例）
         @"hostStep"        : @6,                       // 承载最多走到第几步
-        @"cfgVersion"      : @19,                      // 配置结构版本（升级迁移用）
+        @"cfgVersion"      : @20,                      // 配置结构版本（升级迁移用）
         @"targetBundleID"  : @"com.apple.mobilesafari",
         @"showDelay"       : @12,
         @"windowLevel"     : @1010,
+        // 【0.23.0】Stheno 风交互：
+        @"defaultBundleID" : @"",                      // 非空 => 浮窗出现即自动承载该 App（"默认打开"）
+        @"pickerGesture"   : @1,                       // 应用选择器唤出手势：0=关 1=双击窗口边缘条（默认） 2=长按边缘条
     };
     BOOL ok = [def writeToFile:path atomically:YES];
     MFLog(@"[cfg] 写出默认配置 %@ ok=%d（enabled=true / hostEnabled=true / hostRoute=3 / hostSceneFrame=true / "
@@ -633,6 +636,18 @@ void MFUpgradeConfigIfNeeded(NSDictionary *cfg) {
                   @"—— 掉层瞬间把最后一帧画面盖在最上层，恢复后归位；"
                   @"归档(19) 实证每次切换必掉层、垫底盖不住上层的闪烁");
             up[@"cfgVersion"] = @19;
+        }
+
+        // ---- 0.22 -> 0.23：Stheno 风交互两键 ----
+        // 用户需求（归档24 口头反馈）："选择应用可以改为自选或者默认打开，
+        // 或者可以配置手势打开选择自选应用开启浮窗"。
+        if (cur < 20) {
+            MFLogS(@"[cfg] ★ 迁移到 cfgVersion=20：Stheno 风交互 ——"
+                  @" defaultBundleID（空=不自动承载；填 bundleID=浮窗出现即承载）+"
+                  @" pickerGesture（0=关 / 1=双击边缘条唤出应用列表（默认）/ 2=长按边缘条）");
+            up[@"defaultBundleID"] = up[@"defaultBundleID"] ?: @"";
+            up[@"pickerGesture"]   = up[@"pickerGesture"]   ?: @1;
+            up[@"cfgVersion"] = @20;
         }
 
         BOOL ok = [up writeToFile:path atomically:YES];

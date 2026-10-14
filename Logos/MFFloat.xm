@@ -208,6 +208,13 @@ static id        gMFCurrentContentView  = nil;  // 本轮挂上去的承载视�
 // 430x932；我们把 430x932 写回 scene.frame => 比例崩 + 又一次重排 => 下一拍又"发现漂了"再写。
 // 正反馈闭环，归档(10) 复现。从此只信 panel.contentArea.bounds（我们自己的视图，尺寸可控）。
 static CGSize gMFDesiredContentSize = {0, 0};
+// 【0.23.0】用户手势让路闸门：缩放手势进行中（及结束后 1.5s）守护不许掰几何 ——
+// 归档(24) 实证"右下角缩放手势失效"的主因：承载/恢复后的几何按住窗口里，
+// 守护逐拍把用户刚拖出的 win/scene 几何写回旧值 = 用户怎么拖都"弹回去"。
+static NSTimeInterval gMFUserGestureUntil = 0.0;
+static inline BOOL MFUserGestureActive(void) {
+    return [NSDate timeIntervalSinceReferenceDate] < gMFUserGestureUntil;
+}
 static BOOL   gMFDesiredContentValid = NO;
 
 // 【0.11.0 新增】承载视图"应该待在哪个内容区里"，以及 frame 写入备忘。
@@ -1707,6 +1714,8 @@ static void MFKeepAliveFixFrameIfNeeded(id scene, BOOL verbose) {
     }
     CGSize want = gMFDesiredContentSize;
     if (fabs(cur.size.width - want.width) < 0.5 && fabs(cur.size.height - want.height) < 0.5) return;
+    // 【0.23.0】用户缩放手势期间/刚结束：守护不纠 scene.frame（让用户改的尺寸活着）
+    if (MFUserGestureActive()) return;
     MFLog(@"[keepalive] 尺寸漂了（scene %@ -> 目标 %.0fx%.0f）-> 纠一次",
           NSStringFromCGRect(cur), want.width, want.height);
     MFSetSceneFrame(scene, CGRectMake(0, 0, want.width, want.height));
@@ -1726,6 +1735,8 @@ static void MFKeepAliveFixFrameIfNeeded(id scene, BOOL verbose) {
 ///   · 只有"偏差很大"（>25%，例如被改成整屏 430x932）才不受节流限制，立刻掰回来。
 static void MFKeepAliveFixViewFrameIfNeeded(void) {
     if (!gMFDesiredContentValid) return;
+    // 【0.23.0】用户缩放手势期间/刚结束：守护不掰承载视图（否则用户拖了白拖）
+    if (MFUserGestureActive()) return;
     if (![gMFCurrentContentView isKindOfClass:[UIView class]]) return;
     UIView *v = (UIView *)gMFCurrentContentView;
     CGSize want = gMFDesiredContentSize;
@@ -2704,15 +2715,18 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 /// 【0.8.0】浮窗被拖拽缩放后，把 scene 的渲染尺寸同步成新的内容区尺寸（保持画面比例）
 - (void)syncContentGeometry;
 - (void)refreshAppList;
+- (void)toggleAppList;      // 【0.23.0】手势唤出：选择器 ↔ 当前承载画面
 @end
 
 @interface MFFloatPanel : UIViewController
 @property (nonatomic, weak) UIWindow *hostWindow;
 @property (nonatomic, strong) UIView *titleBar;
 @property (nonatomic, strong) UIView *contentArea;
+@property (nonatomic, strong) UIView *statusBar;      // 【0.23.0】透明边缘条（移动手柄 + 选择器手势区）
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIViewController *contentVC;
+@property (nonatomic, assign) BOOL pickerVisible;     // 【0.23.0】内容区当前是否显示应用选择器
 - (void)setStatusText:(NSString *)text;
 - (void)showMessage:(NSString *)message detail:(NSString *)detail;
 - (void)showAppList:(NSArray<NSArray<NSString *> *> *)items;
@@ -2729,28 +2743,34 @@ static char kMFRowBundleIDKey;
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.view.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.94];
-    self.view.layer.cornerRadius = 14.0;
+    // 【0.23.0】Stheno 风：窗口本体完全无框 —— 透明背景、无描边，看到的只有内容圆角。
+    // 标题栏/状态条退化为"透明边缘条"：不可见但可触摸（移动手柄 + 选择器手势区）。
+    self.view.backgroundColor = [UIColor clearColor];
+    self.view.layer.cornerRadius = 16.0;
     self.view.layer.masksToBounds = YES;
-    self.view.layer.borderWidth = 1.0;
-    self.view.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
 
     const CGFloat barH = 36.0, statusH = 22.0;
     CGRect bounds = self.view.bounds;
     CGFloat w = bounds.size.width, h = bounds.size.height;
 
-    // ---- 标题栏（同时是拖动手柄）----
+    // ---- 内容区：【0.23.0】占满整个窗口（全内容、无留边）——
+    //      顶/底边缘条与按钮盖在其上（z 序更高），保证可摸。----
+    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    content.backgroundColor = [UIColor clearColor];
+    content.clipsToBounds = YES;
+    content.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:content];
+    self.contentArea = content;
+
+    // ---- 顶部边缘条（透明，保留拖动 + 顶右两个小按钮：✕ 关闭必须有退路）----
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, barH)];
-    bar.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    bar.backgroundColor = [UIColor clearColor];
     bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [self.view addSubview:bar];
     self.titleBar = bar;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 96, barH)];
-    title.text = [NSString stringWithFormat:@"MultiFloat %@", MFVersionString()];
-    title.textColor = [UIColor colorWithWhite:0.95 alpha:1.0];
-    title.font = [UIFont boldSystemFontOfSize:13];
-    title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    title.hidden = YES;    // 【0.23.0】不再显示标题文字（无框）
     [bar addSubview:title];
     self.titleLabel = title;
 
@@ -2759,49 +2779,38 @@ static char kMFRowBundleIDKey;
     UIButton *reload = [UIButton buttonWithType:UIButtonTypeCustom];
     reload.frame = CGRectMake(w - 76, 4, 34, 28);
     [reload setTitle:@"↻" forState:UIControlStateNormal];
-    [reload setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
-    reload.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [reload setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateNormal];
+    reload.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     reload.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [reload addTarget:self action:@selector(onReloadTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:reload];
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
-    close.frame = CGRectMake(w - 42, 4, 34, 28);
+    close.frame = CGRectMake(w - 40, 4, 34, 28);
     [close setTitle:@"✕" forState:UIControlStateNormal];
-    [close setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [close setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
     [close addTarget:self action:@selector(onCloseTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:close];
 
-    // ---- 内容区 ----
-    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, barH, w, h - barH - statusH)];
-    content.backgroundColor = [UIColor clearColor];
-    content.clipsToBounds = YES;
-    content.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:content];
-    self.contentArea = content;
-
-    // ---- 底部状态条 ----
+    // ---- 底部边缘条（透明）：移动手柄 + 双击/长按唤出应用选择器 ----
     UIView *statusBar = [[UIView alloc] initWithFrame:CGRectMake(0, h - statusH, w, statusH)];
-    statusBar.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    statusBar.backgroundColor = [UIColor clearColor];
     statusBar.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
     [self.view addSubview:statusBar];
+    self.statusBar = statusBar;
 
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, w - 16, statusH)];
-    status.font = [UIFont systemFontOfSize:10];
-    status.textColor = [UIColor colorWithWhite:0.80 alpha:1.0];
-    status.text = @"初始化…";
-    status.lineBreakMode = NSLineBreakByTruncatingTail;
-    status.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    status.hidden = YES;   // 【0.23.0】状态文字只在日志里看（无框）
     [statusBar addSubview:status];
     self.statusLabel = status;
 
-    // ---- 右下角缩放手柄 ----
-    UILabel *grip = [[UILabel alloc] initWithFrame:CGRectMake(w - 26, h - statusH - 26, 24, 24)];
+    // ---- 右下角缩放命中区：【0.23.0】44x44（原 24x24 太小 + 半透明 ◢ 提示可拖）----
+    UILabel *grip = [[UILabel alloc] initWithFrame:CGRectMake(w - 46, h - statusH - 46, 44, 44)];
     grip.text = @"◢";
-    grip.textColor = [UIColor colorWithWhite:0.78 alpha:0.9];
-    grip.font = [UIFont systemFontOfSize:16];
+    grip.textColor = [UIColor colorWithWhite:1.0 alpha:0.30];
+    grip.font = [UIFont systemFontOfSize:15];
     grip.textAlignment = NSTextAlignmentCenter;
     grip.userInteractionEnabled = YES;
     grip.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
@@ -2812,7 +2821,7 @@ static char kMFRowBundleIDKey;
     [statusBar addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)]];
     [grip addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onResize:)]];
 
-    MFLog(@"[ui] 面板就绪 %.0fx%.0f", w, h);
+    MFLog(@"[ui] 面板就绪 %.0fx%.0f（0.23.0 无框壳）", w, h);
 }
 
 - (void)setStatusText:(NSString *)text {
@@ -2870,6 +2879,9 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
+        // 【0.23.0】手势期间 + 结束后 1.5s：守护几何纠正全部让路（修复归档24"缩放失效"）
+        gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 10.0;
+        MFLog(@"[ui] resize 开始 frame=%@ AR=%.3f", NSStringFromCGRect(win.frame), gMFResizeStartAR);
     }
 
     // 【0.20.0】误触判定：手势开始后 0.8s 内累计变化"几乎纯竖直且幅度大"
@@ -2883,6 +2895,7 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
         if (el < 0.8 && fabs(ddy) > 60.0 && fabs(ddy) > 3.0 * fabs(ddx)) {
             win.frame = gMFResizeStartFrame;
             gMFResizeStartDate = nil;
+            gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
             [g setEnabled:NO];   // 废掉本次手势，后续 Changed/Ended 不再来
             dispatch_async(dispatch_get_main_queue(), ^{ [g setEnabled:YES]; });
             MFLogS(@"[ui] resize 手势判定为划过误触 -> 已回滚浮窗尺寸（不同步 scene.frame）");
@@ -2912,10 +2925,13 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
     if (g.state == UIGestureRecognizerStateEnded) {
         gMFResizeStartDate = nil;
+        gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
+        MFLog(@"[ui] resize 结束 frame=%@ -> 同步 scene.frame", NSStringFromCGRect(win.frame));
         [[MFFloatManager shared] syncContentGeometry];
     } else if (g.state == UIGestureRecognizerStateCancelled ||
                g.state == UIGestureRecognizerStateFailed) {
         gMFResizeStartDate = nil;
+        gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
     }
 }
 
@@ -2933,6 +2949,7 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
         self.contentVC = nil;
     }
     [self clearContentArea];
+    self.pickerVisible = NO;                  // 【0.23.0】内容区不再是选择器
     if (vc == nil) return;
 
     self.contentVC = vc;
@@ -2946,6 +2963,7 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
 
 - (void)attachContentView:(UIView *)view {
     [self attachContentViewController:nil];   // 清掉旧的承载内容
+    self.pickerVisible = NO;                  // 【0.23.0】内容区不再是选择器
     if (view == nil) return;
 
     view.frame = self.contentArea.bounds;
@@ -2985,6 +3003,7 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
 
 - (void)showAppList:(NSArray<NSArray<NSString *> *> *)items {
     [self attachContentViewController:nil];
+    self.pickerVisible = YES;                 // 【0.23.0】内容区当前是选择器
     // 【0.9.0】点 ↻ 拉列表 = 用户要重新选 App，旧画面已经不在显示 => 停守护
     MFStopSceneKeepAlive(@"拉取应用列表");
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:self.contentArea.bounds];
@@ -3090,6 +3109,48 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
     MFLog(@"[gate] hostEnabled=%d（字符串 mode 不再参与任何判断）", (int)hostEnabled);
 
     [self refreshAppList];
+
+    // ---- 【0.23.0】应用选择器唤出手势（Stheno 风：无常驻按钮，手势唤出）----
+    // 作用区 = 顶/底透明边缘条（不碰承载内容的触屏）。
+    // pickerGesture：0=关 / 1=双击（默认）/ 2=长按。
+    {
+        NSInteger pg = MFConfigInt(self.config, @"pickerGesture", 1);
+        NSArray *strips = @[ self.panel.titleBar, self.panel.statusBar ];
+        if (pg == 1 || pg == 2) {
+            for (UIView *strip in strips) {
+                UIGestureRecognizer *gr = nil;
+                if (pg == 1) {
+                    UITapGestureRecognizer *tap =
+                        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleAppList)];
+                    tap.numberOfTapsRequired = 2;
+                    gr = tap;
+                } else {
+                    UILongPressGestureRecognizer *lp =
+                        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(toggleAppList)];
+                    lp.minimumPressDuration = 0.5;
+                    gr = lp;
+                }
+                [strip addGestureRecognizer:gr];
+            }
+            MFLog(@"[ui] 选择器手势已挂（pickerGesture=%ld：%@ 边缘条）",
+                 (long)pg, pg == 1 ? @"双击" : @"长按");
+        } else {
+            MFLogS(@"[ui] 选择器手势已关闭（pickerGesture=0）");
+        }
+    }
+
+    // ---- 【0.23.0】默认打开：defaultBundleID 非空 => 浮窗出现即自动承载 ----
+    {
+        NSString *defApp = MFConfigString(self.config, @"defaultBundleID");
+        BOOL hostEnabled = MFConfigBool(self.config, @"hostEnabled", NO);
+        if (defApp.length > 0 && hostEnabled) {
+            MFLog(@"[ui] defaultBundleID=%@ -> 0.6s 后自动承载（默认打开）", defApp);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [[MFFloatManager shared] hostBundleID:defApp];
+            });
+        }
+    }
 
     if (gMFBootCrashStep.length > 0 && MFAttemptExists()) {
         [panel setStatusText:[NSString stringWithFormat:
@@ -3486,6 +3547,30 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
     if (panel == nil) return;
     MFLogS(@"[ui] 浮窗尺寸变化 -> 同步 scene.frame（保持画面比例）");
     MFSyncSceneGeometry(gMFCurrentScene, gMFCurrentContentView, panel.contentArea.bounds);
+}
+
+/// 【0.23.0】手势唤出：内容区在"应用选择器 ↔ 当前承载画面"之间切换。
+/// - 当前是选择器且有承载画面 => 贴回承载画面并同步几何（恢复守护）；
+/// - 其它情况（没有画面/不是选择器）=> 拉应用列表。
+/// 注意：贴回画面走 attachContentView（与承载链路同一挂载点），守护随后按需重启
+/// —— 这里不主动 MFStartSceneKeepAlive，交由几何同步后的常规路径；若 scene 已死，
+/// 用户重选一次即可（选择器永远可用）。
+- (void)toggleAppList {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self toggleAppList]; });
+        return;
+    }
+    MFFloatPanel *panel = self.panel;
+    if (panel == nil) return;
+    MFLog(@"[ui] 选择器手势触发（pickerVisible=%d hostedView=%@）",
+         (int)panel.pickerVisible, gMFCurrentContentView ? NSStringFromClass([gMFCurrentContentView class]) : @"nil");
+    if (panel.pickerVisible && gMFCurrentContentView != nil) {
+        [panel attachContentView:gMFCurrentContentView];
+        [self syncContentGeometry];
+        MFLogS(@"[ui] 选择器关闭 -> 贴回承载画面");
+    } else {
+        [self refreshAppList];
+    }
 }
 
 - (void)fail:(NSString *)message detail:(NSString *)detail {
