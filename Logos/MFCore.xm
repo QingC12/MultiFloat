@@ -9,7 +9,7 @@
 #pragma mark - ---------- 版本 ----------
 
 NSString *MFVersionString(void) {
-    return @"0.36.0";
+    return @"0.37.0";
 }
 
 #pragma mark - ---------- 底层落盘 ----------
