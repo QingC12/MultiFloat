@@ -21,7 +21,11 @@ PullOverMF_FILES = $(wildcard PullOverX/*.m) $(wildcard PullOverX/*.mm) POLocali
 # ARC（上游 CLANG_ENABLE_OBJC_ARC=YES）；-w 关掉上游代码的告警（不引入新错误即可）
 # -include 前缀头（上游 GCC_PRECOMPILE_PREFIX_HEADER=YES）
 PullOverMF_CFLAGS = -fobjc-arc -w -IPullOverX -I. -include PullOverX/PullOverX-Prefix.pch
-PullOverMF_FRAMEWORKS = Foundation UIKit CoreGraphics QuartzCore
+# 不显式链接系统/私有框架：
+#   · tweak 的符号在运行时由宿主进程（SpringBoard 已加载 UIKit/CoreGraphics/QuartzCore）解析；
+#   · Xcode 26 SDK 的 UIKit.tbd 会"再导出"私有框架（UIUtilities），显式 -framework UIKit
+#     会导致 ld 报 "Could not find or use auto-linked framework 'UIUtilities'" 而链接失败。
+PullOverMF_LDFLAGS = -Wl,-undefined,dynamic_lookup
 INSTALL_TARGET_PROCESSES = SpringBoard
 
 include $(THEOS_MAKE_PATH)/tweak.mk
