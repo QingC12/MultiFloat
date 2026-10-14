@@ -14,6 +14,8 @@
 @class MFFloatPanel;
 
 @interface MFFloatManager : NSObject
+@property (nonatomic, strong) MFFloatPanel *panel;
+@property (nonatomic, strong) UIWindow *window;
 + (instancetype)shared;
 - (void)hostBundleID:(NSString *)bundleID;
 - (void)syncContentGeometry;
