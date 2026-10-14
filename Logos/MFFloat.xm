@@ -3008,33 +3008,67 @@ static NSDate    *gMFResizeStartDate  = nil;
 static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
 static CGFloat    gMFResizeCurW        = 0.0;   // 【0.23.1】增量式当前宽
 static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日志计数
+// 【0.31.0 修正】0.30 把 transform/anchorPoint 直接打在 contentArea 上 ——
+// 归档33 实锤两大事故：P7-geom 崩溃回归（crashedStep=P7-geom）+ "浮窗自己缩到
+// 最小无法操作"。根因：contentArea 在 autoresizing/presenter 布局链上，对带
+// 非恒等 transform 的视图设 frame 是未定义行为（Apple 文档明令）。
+// Stheno 能缩是因为它缩放自己独立的容器视图（不在 FBScene 呈现链上）。
+// 修正：transform 只打在**独立预览视图**（拖动开始抓一帧盖在最上层）——
+// 不参与任何布局链、anchorPoint 手术安全；松手移除预览 + 一次 scene.frame 同步。
+static UIImageView *gMFPreviewImgView = nil;   // 实时缩放预览（独立视图，零布局链）
+static BOOL        gMFPreviewAnchorSet = NO;
+
+/// 预览视图的锚点移到钉死对角（带 position 补偿；只对独立预览视图做，安全）
+static void MFPreviewAnchorTo(UIView *pv, CGPoint ap) {
+    CALayer *ly = pv.layer;
+    CGPoint oldAP = ly.anchorPoint;
+    if (oldAP.x == ap.x && oldAP.y == ap.y) return;
+    CGSize bs = pv.bounds.size;
+    CGPoint oldPos = ly.position;
+    ly.anchorPoint = ap;
+    ly.position = CGPointMake(oldPos.x + (ap.x - oldAP.x) * bs.width,
+                              oldPos.y + (ap.y - oldAP.y) * bs.height);
+    gMFPreviewAnchorSet = YES;
+}
+
+static void MFPreviewEnd(void) {
+    if (gMFPreviewImgView != nil) {
+        [gMFPreviewImgView removeFromSuperview];
+        gMFPreviewImgView = nil;
+    }
+    gMFPreviewAnchorSet = NO;
+}
+
+/// 拖动开始：抓内容区当前画面生成预览视图（盖在 area 的 superview 最上层）
+static void MFPreviewBegin(UIView *area) {
+    MFPreviewEnd();
+    if (![area isKindOfClass:[UIView class]] || area.superview == nil) return;
+    if (area.bounds.size.width < 1.0) return;
+    @try {
+        UIGraphicsImageRenderer *r =
+            [[UIGraphicsImageRenderer alloc] initWithBounds:area.bounds];
+        UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *rc) {
+            [area drawViewHierarchyInRect:area.bounds afterScreenUpdates:NO];
+        }];
+        if (img == nil) return;
+        UIImageView *pv = [[UIImageView alloc] initWithFrame:area.frame];
+        pv.image = img;
+        pv.contentMode = UIViewContentModeScaleToFill;
+        pv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        pv.userInteractionEnabled = NO;   // 预览绝不挡触摸
+        pv.tag = 990030;
+        [area.superview addSubview:pv];
+        [area.superview bringSubviewToFront:pv];
+        gMFPreviewImgView = pv;
+        MFLogS(@"[ui] 实时缩放预览已建立（独立视图，Stheno _dragScale 式，零布局链）");
+    } @catch (NSException *e) {
+        gMFPreviewImgView = nil;
+    }
+}
+
 static CGPoint    gMFResizeAnchor      = CGPointZero;  // 【0.25.0】锚角（拖动角的对角，固定不动）
 static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 12=右上 13=左下 14=右下
 
-// 【0.30.0 Stheno 式实时缩放】归档32 用户明确：松手才显示实时大小不可接受。
-// Stheno.dylib 实证：_dragScale / baseScaleLast / finalScale / containerScale
-// —— 拖动中用 transform 缩放容器，画面实时跟随，松手才落最终尺寸。
-// 复刻：拖动中 contentArea 用 transform 等比缩放（锚点=被拖角的对角），
-// 零 scene 写入（presenter 安然无恙）；松手 transform 归零 + 一次 scene.frame 同步。
-static BOOL       gMFLiveAnchorSet     = NO;   // 本次手势是否已把锚点移到钉死对角
-
-/// 把内容区的实时缩放复位（transform 归恒等 + 锚点回中心，带 position 补偿）。
-static void MFContentLiveScaleReset(void) {
-    UIView *area = (UIView *)gMFCurrentContentArea;
-    if (![area isKindOfClass:[UIView class]]) return;
-    CALayer *ly = area.layer;
-    CGPoint ap = ly.anchorPoint;
-    if (gMFLiveAnchorSet && !(ap.x == 0.5 && ap.y == 0.5)) {
-        CGSize bs = area.bounds.size;
-        CGPoint oldPos = ly.position;
-        CGPoint c = CGPointMake(0.5, 0.5);
-        ly.anchorPoint = c;
-        ly.position = CGPointMake(oldPos.x - (c.x - ap.x) * bs.width,
-                                  oldPos.y - (c.y - ap.y) * bs.height);
-    }
-    if (!CGAffineTransformIsIdentity(area.transform)) area.transform = CGAffineTransformIdentity;
-    gMFLiveAnchorSet = NO;
-}
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -3045,7 +3079,9 @@ static void MFContentLiveScaleReset(void) {
         gMFResizeStartDate  = [NSDate date];
         gMFResizeCurW       = win.frame.size.width;
         gMFResizeTick       = 0;
-        MFContentLiveScaleReset();   // 【0.30.0】上一手势若异常结束没复位，这里兜底
+        MFPreviewEnd();   // 【0.31.0】上一手势若异常结束没清预览，这里兜底
+        // 【0.31.0】拖动开始抓一帧当前画面生成独立预览视图（零布局链，Stheno _dragScale 式）
+        MFPreviewBegin((UIView *)gMFCurrentContentArea);
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
@@ -3076,7 +3112,7 @@ static void MFContentLiveScaleReset(void) {
             win.frame = gMFResizeStartFrame;
             gMFResizeStartDate = nil;
             gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
-            MFContentLiveScaleReset();   // 【0.30.0】实时缩放一起回滚
+            MFPreviewEnd();   // 【0.31.0】预览一起撤掉
             [g setEnabled:NO];   // 废掉本次手势，后续 Changed/Ended 不再来
             dispatch_async(dispatch_get_main_queue(), ^{ [g setEnabled:YES]; });
             MFLogS(@"[ui] resize 手势判定为划过误触 -> 已回滚浮窗尺寸（不同步 scene.frame）");
@@ -3126,18 +3162,15 @@ static void MFContentLiveScaleReset(void) {
 
     // 【0.29.0 归档31 破案】拖动期间的 scene.frame 写入会把 presenter 打成
     // isInvalidated=1（hosting 死 → 触摸死）。Changed 期间零 scene 写入是底线。
-    // 【0.30.0 Stheno 式实时缩放】归档32 用户明确不要"松手才变"。
-    // Stheno.dylib 实证 _dragScale/baseScaleLast/finalScale/containerScale ——
-    // 拖动中 transform 缩放容器、画面实时跟随、松手才落最终尺寸。
-    // 复刻：把 contentArea 用 transform 等比缩放（锚点=钉死的对角），
-    // 画面实时跟手且零 scene 写入；松手 transform 归零 + 一次精确同步。
+    // 【0.31.0】实时缩放预览：transform/anchor 只打在独立预览视图上
+    //（0.30 打在 contentArea 上 = P7-geom 崩溃回归 + "自己缩到最小"，
+    //  因为 contentArea 在 autoresizing/presenter 布局链上，带 transform 设 frame
+    //  是未定义行为；Stheno 缩的是自己独立的容器所以没事）。
     if (g.state == UIGestureRecognizerStateChanged) {
-        UIView *area = (UIView *)gMFCurrentContentArea;
-        if ([area isKindOfClass:[UIView class]] && gMFResizeStartFrame.size.width > 0.5) {
+        if (gMFPreviewImgView != nil && gMFResizeStartFrame.size.width > 0.5) {
             CGFloat s = newW / gMFResizeStartFrame.size.width;
             if (s > 0.05 && s < 20.0) {
-                // 首拍：把锚点从中心移到钉死对角（补 position，frame 不跳）
-                if (!gMFLiveAnchorSet) {
+                if (!gMFPreviewAnchorSet) {
                     CGPoint ap = CGPointZero;
                     switch (gMFResizeCorner) {
                         case 11: ap = CGPointMake(1, 1); break;  // 拖左上 -> 钉右下
@@ -3145,19 +3178,9 @@ static void MFContentLiveScaleReset(void) {
                         case 13: ap = CGPointMake(1, 0); break;  // 拖左下 -> 钉右上
                         default: ap = CGPointMake(0, 0); break;  // 拖右下 -> 钉左上
                     }
-                    CALayer *ly = area.layer;
-                    CGSize bs = area.bounds.size;
-                    CGPoint oldAP = ly.anchorPoint;
-                    CGPoint oldPos = ly.position;
-                    CGPoint newPos = CGPointMake(oldPos.x + (ap.x - oldAP.x) * bs.width,
-                                                 oldPos.y + (ap.y - oldAP.y) * bs.height);
-                    ly.anchorPoint = ap;
-                    ly.position = newPos;
-                    gMFLiveAnchorSet = YES;
-                    MFLog(@"[ui] 实时缩放启动 scale 基准=%.0f 锚点=(%.0f,%.0f)（Stheno _dragScale 式）",
-                          gMFResizeStartFrame.size.width, ap.x, ap.y);
+                    MFPreviewAnchorTo(gMFPreviewImgView, ap);
                 }
-                area.transform = CGAffineTransformMakeScale(s, s);
+                gMFPreviewImgView.transform = CGAffineTransformMakeScale(s, s);
             }
         }
     }
@@ -3167,7 +3190,7 @@ static void MFContentLiveScaleReset(void) {
     if (g.state == UIGestureRecognizerStateEnded) {
         gMFResizeStartDate = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
-        MFContentLiveScaleReset();   // 【0.30.0】transform 归位（写真实尺寸前必须归零）
+        MFPreviewEnd();   // 【0.31.0】撤预览（真实尺寸接管）
         MFLog(@"[ui] resize 结束 frame=%@ -> 同步 scene.frame", NSStringFromCGRect(win.frame));
         [[MFFloatManager shared] syncContentGeometry];
         // 【0.29.0】800ms 后补一次精确同步：updateSettings 异步生效（400~800ms），
@@ -3182,7 +3205,7 @@ static void MFContentLiveScaleReset(void) {
                g.state == UIGestureRecognizerStateFailed) {
         gMFResizeStartDate = nil;
         gMFUserGestureUntil = [NSDate timeIntervalSinceReferenceDate] + 1.5;
-        MFContentLiveScaleReset();   // 【0.30.0】取消也要归位（否则内容停在被缩放态）
+        MFPreviewEnd();   // 【0.31.0】取消也要撤预览
     }
 }
 

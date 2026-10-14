@@ -6,6 +6,14 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.31.0 变更（第 34 轮：归档33 崩溃修正）：
+#   - ① P7-geom 崩溃回归 + 浮窗"自己缩到最小"根因 = 0.30 对 contentArea 直接
+#     transform/anchorPoint —— 它在 autoresizing/presenter 布局链上，带非恒等
+#     transform 设 frame 是未定义行为（Stheno 缩的是独立容器所以没事）。
+#     修正：拖动开始抓一帧生成**独立预览视图**（零布局链），transform/锚点手术
+#     只打在预览上；松手/取消/误触回滚移除预览 + 一次 scene.frame 同步。
+#   - ② windowLevel 提升真机已生效（SBStatusBarWindow=999 -> 浮窗 1099）。
+#
 # 0.30.0 变更（第 33 轮：归档32，Stheno 式实时缩放）：
 #   - ① 实时缩放复刻 Stheno（dylib 实证 _dragScale/baseScaleLast/finalScale/containerScale）：
 #     拖动中 contentArea 用 transform 等比缩放（锚点=钉死对角），画面实时跟手、
