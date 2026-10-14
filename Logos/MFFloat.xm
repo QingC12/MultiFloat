@@ -3510,14 +3510,23 @@ static void MFPickerHide(void) {
               NSStringFromClass([g.view.window class]), (long)g.view.tag, p.x, p.y);
     } else if (g.state == UIGestureRecognizerStateChanged) {
         if (gMFBandMode == 0) {
-            if (t.x < -30.0 && fabs(t.x) > fabs(t.y)) {
+            // 【0.40.0 修正】左滑优先给"选择器"（0.39 要求横向主导 -> 用户的左滑被判成移动，
+            // 导致圆弧呼不出来 = 回归）。规则：只要向左 >20pt 就是选择器；否则有位移就是移动。
+            if (t.x < -20.0) {
                 gMFBandMode = 1;   // 选择器
-                MFLogS(@"[band] 判定=呼出圆弧选择器（弧心固定屏幕中心）");
+                MFLog(@"[band] 判定=呼出圆弧选择器（dx=%.0f dy=%.0f）", t.x, t.y);
                 gMFPickerGestureMode = YES;
                 [self arcPickerShowAtY:([UIScreen mainScreen].bounds.size.height / 2.0) gesture:YES];
-            } else if (fabs(t.y) > 6.0 || fabs(t.x) > 6.0) {
+            } else if (fabs(t.y) > 10.0 || fabs(t.x) > 10.0) {
                 gMFBandMode = 2;   // 移动浮窗
-                MFLogS(@"[band] 判定=移动浮窗（前台 App 也走这条）");
+                // 【0.40.0 修正】浮窗被 ▦ 隐藏时先显示出来，否则"移动了但看不到"
+                MFFloatPanel *p2 = self.panel;
+                BOOL hidden = (p2 != nil) ? p2.hostWindow.isHidden : YES;
+                if (p2 == nil || p2.view.superview == nil || hidden) {
+                    MFLogS(@"[band] 移动前：浮窗不存在或已隐藏 -> 先显示");
+                    [self setFloatVisible:YES];
+                }
+                MFLog(@"[band] 判定=移动浮窗（dx=%.0f dy=%.0f）", t.x, t.y);
             } else {
                 return;
             }
@@ -4837,6 +4846,23 @@ static void MFInstallSummonGesture(void) {
         [strip addGestureRecognizer:pinch];
         [sw addSubview:strip];
 
+        // 【0.40.0】极边缘 20pt 全能区：与内带同行为，单独 tag 便于日志区分
+        //（用途：验证"全屏 App 时最贴边的那 20pt 是否仍能收到触摸"）
+        UIView *edge = [[UIView alloc] initWithFrame:CGRectMake(kZoneW - 20.0, 0.0, 20.0, 300.0)];
+        edge.backgroundColor = [UIColor clearColor];
+        edge.userInteractionEnabled = YES;
+        edge.tag = 990050;
+        UIPanGestureRecognizer *ePan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(summonPan:)];
+        ePan.maximumNumberOfTouches = 1;
+        [edge addGestureRecognizer:ePan];
+        UIPanGestureRecognizer *ePinch = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[MFFloatManager shared] action:@selector(bandPinch:)];
+        ePinch.minimumNumberOfTouches = 2;
+        ePinch.maximumNumberOfTouches = 2;
+        [edge addGestureRecognizer:ePinch];
+        [sw addSubview:edge];
+
         // 悬浮按钮：半透明圆形 "▦"（点=显隐浮窗；长按=圆弧选择器；上下拖=整个热区窗口跟随移动）
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(10.0, 24.0, 44.0, 44.0);
@@ -5004,6 +5030,22 @@ static void MFInstallSDTouchOverlay(void) {
         mPinch.maximumNumberOfTouches = 2;
         [strip addGestureRecognizer:mPinch];
         [sb addSubview:strip];
+
+        // 【0.40.0】镜像层的极边缘 20pt 区（tag 990052）：全屏 App 下的关键验证点
+        CGRect ezone = CGRectMake(sbW - 20.0, (sbH - 300.0) / 2.0, 20.0, 300.0);
+        UIView *edge2 = [[UIView alloc] initWithFrame:ezone];
+        edge2.backgroundColor = [UIColor clearColor];
+        edge2.tag = 990052;
+        UIPanGestureRecognizer *e2Pan = [[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                            action:@selector(summonPan:)];
+        e2Pan.maximumNumberOfTouches = 1;
+        [edge2 addGestureRecognizer:e2Pan];
+        UIPanGestureRecognizer *e2Pinch = [[UIPanGestureRecognizer alloc] initWithTarget:[MFFloatManager shared]
+                                                                                action:@selector(bandPinch:)];
+        e2Pinch.minimumNumberOfTouches = 2;
+        e2Pinch.maximumNumberOfTouches = 2;
+        [edge2 addGestureRecognizer:e2Pinch];
+        [sb addSubview:edge2];
         gMFOverlayStrip = strip;
 
         gMFOverlayViews = arr;
