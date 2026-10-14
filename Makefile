@@ -6,6 +6,16 @@
 #   - 需要 roothide/theos 才能识别 roothide scheme
 #   - SDK 版本由 CI 经 MF_SDK_VERSION 传入
 #
+# 0.35.0 变更（第 38 轮：归档36 日志实证——呼出 UI 装不上的真因）：
+#   - 日志铁证：bootstrap 阶段 `[UIScreen mainScreen]` 为 nil，创建 UIWindow 抛
+#     "returning nil screen from mainScreen is not allowed!" -> 0.33（以及同样
+#     先取 mainScreen 的 0.34）呼出 UI 永远装不上。
+#   - 修：MFInstallSummonGesture 屏幕未就绪/抛异常 -> 1s 后重试（最多 40 次）；
+#     成功后才写 gMFStripWin（失败不污染幂等守卫）；startWithConfig 内二次安装
+#     （此刻屏幕必定就绪）。前向声明提前到文件顶部。
+#   - 日志同时实证：浮窗"已挂进 SBStatusBarReusePoolWindow + 健康检查通过"但不可见
+#     -> 状态栏窗口路线在本机确实不渲染（0.34 已默认回退独立 UIWindow）。
+#
 # 0.34.0 变更（第 37 轮：归档36 反馈——左上角呼出条没出现 + 注销后不自动弹出）：
 #   - ① 根因嫌疑：挂进 SBStatusBarWindow 的视图不渲染（呼出条与浮窗容器双双
 #     不可见，症状一致）-> 浮窗 embed 默认改回 NO（cfgVersion 23 强制迁移），

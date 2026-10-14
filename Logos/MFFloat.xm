@@ -2805,9 +2805,12 @@ static void MFWritePresenterReport(NSString *bundleID, id scene, id handle, id h
 
 /// 【0.33.0 手势呼出器】状态栏窗口内的隐形呼出条（左上角 70x44，Stheno/TrollOpen 风格）
 /// 强引用持有：superview 摘除后对象仍存活，重建守卫才有效
-static UIView *gMFStripView = nil;      // 隐形呼出条（挂在状态栏窗口）
-static UIWindow *gMFStripWin = nil;     // 兜底独立小窗口（找不到状态栏窗口时）
+static UIView *gMFStripView = nil;      // 呼出 UI 的悬浮按钮（挂在独立窗口）
+static UIWindow *gMFStripWin = nil;     // 右缘呼出窗口（兜底/主用，强引用保活）
 static NSDictionary *gMFBootConfig = nil; // bootstrap 时的配置快照（首次呼出用）
+static NSInteger gMFSummonTries = 0;      // 【0.35.0】呼出 UI 安装重试计数
+
+static void MFInstallSummonGesture(void);   // 【0.35.0】前向声明（Manager 内也要调用）
 
 @interface MFFloatManager : NSObject
 @property (nonatomic, strong) NSDictionary *config;
@@ -3430,6 +3433,10 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
     self.config = config;
 
     MFLogS(@"[mf] ---- start ----");
+
+    // 【0.35.0】二次安装呼出 UI：此刻屏幕必定就绪（0.33 实证 bootstrap 阶段会失败）。
+    // 幂等：已装过则内部直接 return。
+    MFInstallSummonGesture();
     UIWindowScene *scene = MFMainWindowScene();
     MFLog(@"[ui] windowScene=%@", scene ? NSStringFromClass([scene class]) : @"nil");
 
@@ -4237,17 +4244,38 @@ static NSInteger  gMFResizeCorner      = 0;            // 【0.25.0】11=左上 
 //   ① 右缘全高 20pt 透明热区：向左滑 >25pt → toggle
 //   ② 可见悬浮按钮（半透明圆形 "▦"）：点击 toggle，垂直拖动换位
 // 浮窗本体的 embed 挂载默认改回 NO（见 MFCore cfgVersion=23 迁移）。
+// 【0.35.0 关键修复】0.33/0.34 日志实证：bootstrap 阶段屏幕尚未就绪，
+//   `[UIScreen mainScreen]` 为 nil，创建 UIWindow 抛
+//   "returning nil screen from mainScreen is not allowed!" -> 呼出 UI 永远装不上。
+//   → 屏幕未就绪 / 抛异常时 1s 后重试（最多 40 次），并在浮窗启动时二次安装。
+static void MFInstallSummonGesture(void);   // 前向声明（重试用）
+
+static void MFScheduleSummonRetry(void) {
+    if (gMFSummonTries >= 40) {
+        MFLogS(@"[summon] 重试 40 次仍未就绪 -> 放弃安装呼出 UI（浮窗功能不受影响）");
+        return;
+    }
+    gMFSummonTries++;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MFInstallSummonGesture(); });
+}
+
 static void MFInstallSummonGesture(void) {
     if (gMFStripWin != nil) return;   // 幂等：respring 前只装一次
     @try {
-        CGRect scr = [UIScreen mainScreen].bounds;
+        UIScreen *scrObj = [UIScreen mainScreen];   // 【0.35.0】可能为 nil（屏幕未就绪）
+        if (scrObj == nil) {
+            MFLogS(@"[summon] 屏幕尚未就绪（mainScreen=nil）-> 1s 后重试");
+            MFScheduleSummonRetry();
+            return;
+        }
+        CGRect scr = scrObj.bounds;
         CGFloat W = scr.size.width, H = scr.size.height;
         UIWindow *sw = [[UIWindow alloc] initWithFrame:CGRectMake(W - 64.0, 0.0, 64.0, H)];
         sw.windowLevel = 1100.0;
         sw.backgroundColor = [UIColor clearColor];
         sw.userInteractionEnabled = YES;
         sw.hidden = NO;
-        gMFStripWin = sw;   // 强引用保活
 
         // 右缘滑动热区：贴右边缘 20pt 全高，透明不挡视线
         UIView *strip = [[UIView alloc] initWithFrame:CGRectMake(44.0, 0.0, 20.0, H)];
@@ -4277,10 +4305,12 @@ static void MFInstallSummonGesture(void) {
         [sw addSubview:btn];
 
         gMFStripView = btn;
+        gMFStripWin = sw;   // 【0.35.0】成功后才落库（此前异常不会污染幂等守卫 -> 可重试）
         MFLog(@"[summon] 右缘呼出 UI 已安装（悬浮按钮 + 右缘左滑热区）win=%@ frame=%@",
               NSStringFromClass([sw class]), NSStringFromCGRect(sw.frame));
     } @catch (NSException *e) {
-        MFLog(@"[summon] !! 安装异常（浮窗功能不受影响，仅无呼出入口）：%@", e);
+        MFLog(@"[summon] !! 安装异常（1s 后重试）：%@", e);
+        MFScheduleSummonRetry();
     }
 }
 
