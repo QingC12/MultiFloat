@@ -3417,7 +3417,6 @@ static const CGFloat kMFPickerIconSize = 44.0;   // 【0.38.0】图标缩小（�
 static const CGFloat kMFPickerRadius   = 152.0;
 // 【0.39.0】右缘"拾取带"手势状态：0=未定 1=选择器 2=移动浮窗
 static NSInteger gMFBandMode = 0;
-static CGFloat   gMFBandStartY = 0.0;       // 手势起点（屏幕 y，备用）
 static CGFloat   gMFBandPinchBaseW = 0.0;   // 两指缩放基准宽度
 
 /// App 图标（SpringBoard 私有 API；取不到返回 nil -> 用首字母兜底）
