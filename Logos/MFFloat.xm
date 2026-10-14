@@ -2868,6 +2868,8 @@ static char kMFRowBundleIDKey;
 static CGRect     gMFResizeStartFrame = CGRectZero;
 static NSDate    *gMFResizeStartDate  = nil;
 static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
+static CGFloat    gMFResizeCurW        = 0.0;   // 【0.23.1】增量式当前宽
+static NSInteger  gMFResizeTick        = 0;     // 【0.23.1】Changed 节流日志计数
 
 - (void)onResize:(UIPanGestureRecognizer *)g {
     UIWindow *win = self.hostWindow;
@@ -2876,6 +2878,8 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
     if (g.state == UIGestureRecognizerStateBegan) {
         gMFResizeStartFrame = win.frame;
         gMFResizeStartDate  = [NSDate date];
+        gMFResizeCurW       = win.frame.size.width;
+        gMFResizeTick       = 0;
         if (gMFResizeStartFrame.size.height > 0)
             gMFResizeStartAR = gMFResizeStartFrame.size.width / gMFResizeStartFrame.size.height;
         if (gMFResizeStartAR < 0.2 || gMFResizeStartAR > 5.0) gMFResizeStartAR = 0.62;  // 兜底
@@ -2903,23 +2907,33 @@ static CGFloat    gMFResizeStartAR     = 0.0;   // 起点宽高比 w/h
         }
     }
 
-    // 【0.22.0】等比例缩放：把手指平移投影到"右下-左上"对角线方向，
-    // 得到统一缩放量 proj（正=放大，负=缩小），宽高按同一比例增减。
+    // 【0.23.1】等比例缩放（改回**增量式**）：onDrag 的增量模式在本项目实证可用，
+    // 0.22.0 的"起点锚定+绝对尺寸"实机失效（归档25：手势触发但 frame 一像素未动）。
+    // 做法：每拍平移沿"右下-左上"对角线投影出统一缩放量 dW（正=放大/负=缩小），
+    // 累加到当前宽上；高度 = 宽 / AR（锁比例，内容永不变形）。
     CGPoint t = [g translationInView:win];
     CGFloat sw = gMFResizeStartFrame.size.width, sh = gMFResizeStartFrame.size.height;
     CGFloat diag = sqrt(sw * sw + sh * sh);
-    CGFloat proj = (t.x * sw + t.y * sh) / diag;      // 对角线方向投影
+    CGFloat dW = (t.x * sw + t.y * sh) / diag;        // 对角线方向投影（增量）
 
     CGRect screen = [UIScreen mainScreen].bounds;
-    CGFloat newW = sw + proj;
-    // 夹取：最小可用尺寸 + 不超屏（右/下边贴住屏幕边缘为止）
+    CGFloat newW = gMFResizeCurW + dW;
     newW = MAX(150.0, newW);
     newW = MIN(newW, screen.size.width  - gMFResizeStartFrame.origin.x);
     CGFloat newH = newW / gMFResizeStartAR;           // ★ 锁比例：高度由宽度唯一决定
     newH = MIN(newH, screen.size.height - gMFResizeStartFrame.origin.y);
     if (newH < 150.0) { newH = 150.0; newW = newH * gMFResizeStartAR; }
+    gMFResizeCurW = newW;
     win.frame = CGRectMake(gMFResizeStartFrame.origin.x, gMFResizeStartFrame.origin.y, newW, newH);
     [g setTranslation:CGPointZero inView:win];
+
+    // 【0.23.1】Changed 节流日志（每 4 拍 1 条）：下轮日志直接区分"没 Changed"还是
+    // "Changed 但被写回"——归档25 的两种假设只有它能裁决。
+    gMFResizeTick++;
+    if (g.state == UIGestureRecognizerStateChanged && (gMFResizeTick % 4) == 1) {
+        MFLog(@"[ui] resize 变化 #%ld t=(%.1f,%.1f) dW=%.1f -> W=%.0f H=%.0f",
+             (long)gMFResizeTick, t.x, t.y, dW, newW, newH);
+    }
 
     // 【0.8.0】松手后把 scene 的渲染尺寸一起改掉 —— 否则浮窗变了形，里面还是老的宽高比，
     // 就是"画面比例不对"的另一个来源。拖动过程中不调，避免高频 updateSettingsWithBlock。
