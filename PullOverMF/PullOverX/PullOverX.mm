@@ -1255,8 +1255,12 @@ static void POPosixDeleteFile(const char *path) {
 // hook 目标：SBReachabilityGestureRecognizer._handlePullGesture:（便捷访问手势 = 底部边缘下滑）。
 // Stheno 实证路线（analysis/stheno-ring-gesture-study.md §3.1）；该手势在**任何界面**（含全屏
 // App）都由系统识别，绕开归档 38 的"触摸归属"限制。
-extern BOOL MFRingWantsSystemGestureSummon(void);
-extern void MFRingSummonFromSystemGesture(void);
+// ⚠️ 铁律 2：MFRingPicker.m 是 ObjC（C 链接），本文件是 ObjC++ —— 声明必须 extern "C"，
+// 否则 C++ 修饰名（__Z29MFRing…）未定义 → dyld 拒绝加载整个 dylib（0.2.4 自检曾抓到）。
+extern "C" {
+BOOL MFRingWantsSystemGestureSummon(void);
+void MFRingSummonFromSystemGesture(void);
+}
 
 static void (*_po_orig_SBReachability_handlePullGesture)(id, SEL, id);
 
