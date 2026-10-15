@@ -66,9 +66,9 @@
                                                  //   TrollOpen 用 topLeft/topRight/bottomLeft **ResizeHandle**
                                                  //   挂在窗口自身的角上（analysis/multi-floating-split-chain-report.txt）；
                                                  //   两者都把"角"当成一块**方形把手**，而不是一条浅带子。
-#define MF_CARD_DOCK_WIDTH_RATIO 0.145           // 【0.3.23】小窗宽 ≈ 屏高 14.5%（本机 932 → 135），
-                                                 //   高 = 宽 × 16/9 ≈ 240（竖屏小窗，不再按横屏算）
-#define MF_CARD_DOCK_MIN_WIDTH 96.0
+#define MF_CARD_DOCK_WIDTH_RATIO 0.1378          // 【0.3.25】小窗宽 ≈ 屏高 13.78%（原 14.5% 再缩 5%：本机 932 → 128×228）
+                                                 //   高 = 宽 × 16/9（9:16 竖屏小窗）
+#define MF_CARD_DOCK_MIN_WIDTH 91.0
 #define MF_CARD_DOCK_MAX_WIDTH_RATIO 0.42        // 小窗最宽不超过屏宽 42%（本机 430 → 180）
 #define MF_CARD_DOCK_MAX_HEIGHT_RATIO 0.46       // 小窗最高不超过屏高 46%（本机 932 → 429）
 #define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部移动热区带
@@ -2989,7 +2989,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.3.24 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.3.25 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
