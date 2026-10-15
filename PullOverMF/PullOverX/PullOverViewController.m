@@ -2779,8 +2779,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         band.backgroundColor = [UIColor clearColor];
         if ([key isEqualToString:@"bottom"]) {
             band.tag = MF_CARD_EDGE_HOTZONE_TAG_BOTTOM;
-            [band addGestureRecognizer:[[UIPanGestureRecognizer alloc]
-                initWithTarget:self action:@selector(mfCardMovePan:)]];
+            // 【0.3.21 血泪 log30】移动 pan 不再挂在底带这个**子视图**上：log30 实证底带的 pan
+            // Began/Ended 落在同一毫秒、Changed 一次都没进（同期挂在宿主上的捏合 pan 却收得到
+            // 连续 Changed，缩放正常）⇒ 改挂宿主（同一套已被实证可用的机制），位置在 Began 里用
+            // 触点在"底带（去掉右端缩放区）+ 停靠小窗盖层"内自行判定。
         } else if ([key isEqualToString:@"top"]) {
             band.tag = MF_CARD_EDGE_HOTZONE_TAG_TOP;
             [band addGestureRecognizer:[[UITapGestureRecognizer alloc]
@@ -2793,6 +2795,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         [mfEdgeBandHost addSubview:band];
     }];
+    // 【0.3.21】自由移动 pan：挂宿主，Began 时按触点位置判定归属（底带左段 / 停靠小窗）
+    UIPanGestureRecognizer *movePan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(mfCardMovePan:)];
+    [mfEdgeBandHost addGestureRecognizer:movePan];
     // 【0.3.21】底带右端 = 滑动缩放区（用户 log30：双指捏合太麻烦，改成右下角滑动缩放）。
     // 独立子视图 + 独立 pan（与底带移动 pan 不会互抢）；mfUpdateEdgeBands 里被 bringSubviewToFront 压在最上层。
     mfEdgeBandBottomRight.translatesAutoresizingMaskIntoConstraints = YES;
@@ -2808,8 +2814,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     mfDockedTapView.backgroundColor = [UIColor clearColor];
     [mfDockedTapView addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(mfDockedCardTap:)]];
-    [mfDockedTapView addGestureRecognizer:[[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(mfCardMovePan:)]];
+    // 拖动（移动小窗）由宿主的移动 pan 按位置接管，这里不再挂 pan（避免两个 pan 抢同一触点）
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
@@ -3015,14 +3020,26 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 /// 【0.3.13】底部热区：pan 自由移动（X+Y 跟手，松手停在哪就是哪，不吸附）。
-/// 【0.3.21 血泪 log30】底带 pan 的 `按下/开始/结束` 三行落在**同一毫秒**、且全程没有
-/// `跟手首帧` ⇒ Changed 一次都没进来（begin 后立刻 end，位移(0,0)），用户感知"底部手势失效"。
-/// 本版：① 删掉 Changed 里的 `numberOfTouches>=2` 早退（捏合已移除，这是最可能的元凶）；
-///        ② 加触点数诊断；③ 松手时若从未进过 Changed 但总位移非零 → 按总位移补一次移动。
+/// 【0.3.21 血泪 log30】0.3.20 把 pan 挂在**底带子视图**上：log30 实证 `按下/开始/结束` 三行落在
+/// **同一毫秒**、全程没有 `跟手首帧` ⇒ Changed 一次都没进来（Began 后立刻 Ended、位移(0,0)），
+/// 用户感知"底部手势失效"；而同版挂在**宿主**上的捏合 pan 收得到连续 Changed（缩放正常）。
+/// 本版把移动 pan 改挂宿主，Began 时用触点位置判定归属：**底带（去掉右端缩放区）** 或 **停靠小窗盖层**。
 -(void)mfCardMovePan:(UIPanGestureRecognizer *)pan{
     if (pan.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[card] 移动热区按下 canDrag=%d 触点数=%lu mode=%ld",
-              [self mfCanDragCardEdgeNow], (unsigned long)pan.numberOfTouches, (long)mfEdgeDragMode);
+        // 归属判定：只有落在"底带左段（去掉右端缩放区）"或"停靠小窗盖层"才认领
+        CGPoint p = [pan locationInView:mfEdgeBandHost];
+        BOOL inScaleZone = mfEdgeBandBottomRight != nil && !mfEdgeBandBottomRight.hidden &&
+            CGRectContainsPoint(mfEdgeBandBottomRight.frame, p);
+        BOOL inMoveZone = (mfEdgeBandBottom != nil && !mfEdgeBandBottom.hidden &&
+                           CGRectContainsPoint(mfEdgeBandBottom.frame, p)) ||
+                          (mfDockedTapView != nil && !mfDockedTapView.hidden &&
+                           CGRectContainsPoint(mfDockedTapView.frame, p));
+        MFLog(@"[card] 移动热区按下 canDrag=%d 触点数=%lu 触点(%.0f,%.0f) 移动带内=%d 缩放带内=%d mode=%ld",
+              [self mfCanDragCardEdgeNow], (unsigned long)pan.numberOfTouches, p.x, p.y,
+              inMoveZone, inScaleZone, (long)mfEdgeDragMode);
+        if (!inMoveZone || inScaleZone) {
+            return;   // 不认领（不占 mode，让缩放 pan 正常工作）
+        }
         if (![self mfCanDragCardEdgeNow]) {
             pan.enabled = NO;
             pan.enabled = YES;
