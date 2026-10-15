@@ -300,7 +300,7 @@
 //  配置项（suite com.mlgm.pulloverx，改完 respring 生效）：
 //    mfRingEnabled      BOOL   是否启用圆盘（默认 YES）
 //    mfTriggerEdge      string 触发边：right(默认) / left / top / bottom
-//    mfTriggerLength    number 触发区长度（默认 300）
+//    mfTriggerLength    number 触发区长度（默认 0 = 屏高 30%；显式设置 >0 生效，下限 80）
 //    mfTriggerThickness number 触发区厚度（0.3.0 默认 28；0.2.x 曾 56，用户反馈太宽易误触）
 //    mfTriggerCenterRatio number 触发区中心位置 0~1（默认 0.78）
 //    mfTriggerBottomInset number 触发区距屏幕底边最少留白（默认 44；bottom 边默认 0 = 贴死底边）
@@ -1376,7 +1376,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.3.12 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.3.13 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1489,7 +1489,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     // 【0.3.0】厚度 56 → 28：用户实测"太宽，容易误触"。窄一半仍够用：
     //   呼出主力是系统边缘手势（识别器自身区域 20pt + 带门外扩 60pt），判定不受厚度影响。
     CGFloat thickness = MAX(16.0, MFRingNumber(@"mfTriggerThickness", 28.0));
-    CGFloat length = MAX(80.0, MFRingNumber(@"mfTriggerLength", 300.0));
+    // 【0.3.13】长度默认 0 = 动态屏高 30%（用户指定：触发条只占屏幕边缘约 30%，
+    //   减少与全屏 App 手势的重叠冲突——抖音左滑个人主页 / iOS 右缘返回同属右缘区域，
+    //   跨进程手势无法互斥，缩窄触发带是系统限制下最有效的缓解）。
+    //   显式设置 mfTriggerLength（>0）仍生效，下限 80。
+    CGFloat lengthRaw = MFRingNumber(@"mfTriggerLength", 0.0);
+    CGFloat length = lengthRaw > 0.0 ? MAX(80.0, lengthRaw) : MAX(80.0, height * 0.30);
     CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
     NSString *edge = MFRingEdge();
     // 下边缘条默认**不留底边距**（贴死屏幕底边）；其余方向沿用 44pt 避让主屏手势区
@@ -3093,27 +3098,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.3.12 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.3.13 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.3.12 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.13 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.3.12 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.3.13 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.3.12 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.13 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.3.12 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.13 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -3152,7 +3157,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.3.12 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.3.13 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
