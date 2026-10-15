@@ -2,6 +2,20 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.3.0 核心改动（用户指定）============================
+//  圆盘手势逻辑**一处未动**（0.2.14 交互已获"非常完美"确认）。本版只做两件事：
+//  ① **动画全面弹簧化（借鉴 Stheno）**：Stheno 逆向实证（analysis/stheno-ring-gesture-study.md）
+//     其圆盘手感来自贯穿全场的 spring 弹性（`CustomSpringAnimation`/阻尼系数可配）+
+//     选中图标缩放（`_scaleToIcon`/`_selected`）+ SwiftUI scale/opacity 过渡。落地：
+//       · 呼出：0.15s 纯淡入 → 55% 缩放弹性放大 + 淡入（damping 0.68，0.45s）；
+//       · 滑选图标：0.12s 线性 1.18 → 弹性放大 1.25（damping 0.5，明显过冲回弹），
+//         滑走弹簧缩回（damping 0.65）；
+//       · 停靠：0.16s ease-out → 弹簧滑入（damping 0.72，0.42s）；
+//       · 收起：0.15s 淡出 → 缩小 0.7 + 淡出（0.18s，干脆收场）。
+//     全部用公开 API animateWithDuration:usingSpringWithDamping:（iOS 7+），无私有依赖。
+//  ② **右下侧呼出手势条改窄**：mfTriggerThickness 默认 56 → 28（用户实测"太宽，容易
+//     误触"）。呼出主力是系统边缘手势（识别器区域 20pt + 带门外扩 60pt），判定不受影响。
+//
 //  ============================ 0.2.15 核心改动（log20 用户反馈）============================
 //  0.2.14 交互已获用户确认"非常完美"，圆盘手势逻辑冻结不再动。本轮只删一个不合理行为：
 //  **松手回退打开**——0.2.12 引入的"松手点无选中时，回退开时间窗内最近悬停选中的 App"
@@ -287,7 +301,7 @@
 //    mfRingEnabled      BOOL   是否启用圆盘（默认 YES）
 //    mfTriggerEdge      string 触发边：right(默认) / left / top / bottom
 //    mfTriggerLength    number 触发区长度（默认 300）
-//    mfTriggerThickness number 触发区厚度（默认 56）
+//    mfTriggerThickness number 触发区厚度（0.3.0 默认 28；0.2.x 曾 56，用户反馈太宽易误触）
 //    mfTriggerCenterRatio number 触发区中心位置 0~1（默认 0.78）
 //    mfTriggerBottomInset number 触发区距屏幕底边最少留白（默认 44；bottom 边默认 0 = 贴死底边）
 //    mfRingSummonThreshold number 手势呼出阈值，pt（默认 12）
@@ -1362,7 +1376,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.15 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.3.0 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1472,7 +1486,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (CGRect)triggerFrameForBounds:(CGRect)bounds {
     CGFloat width = CGRectGetWidth(bounds);
     CGFloat height = CGRectGetHeight(bounds);
-    CGFloat thickness = MAX(16.0, MFRingNumber(@"mfTriggerThickness", 56.0));
+    // 【0.3.0】厚度 56 → 28：用户实测"太宽，容易误触"。窄一半仍够用：
+    //   呼出主力是系统边缘手势（识别器自身区域 20pt + 带门外扩 60pt），判定不受厚度影响。
+    CGFloat thickness = MAX(16.0, MFRingNumber(@"mfTriggerThickness", 28.0));
     CGFloat length = MAX(80.0, MFRingNumber(@"mfTriggerLength", 300.0));
     CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
     NSString *edge = MFRingEdge();
@@ -1807,10 +1823,22 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.ringRoot.center = [self clampRingCenter:point];
 
+        // 【0.3.0】呼出动画借鉴 Stheno（逆向实证：SwiftUI AnyTransition.scale + opacity +
+        //   spring 弹性，`CustomSpringAnimation`/阻尼系数是其标志）：圆盘从 55% 缩放 + 全透明
+        //   弹性放大到原尺寸 + 淡入。AllowUserInteraction 保证弹出过程中就能跟手/点按。
         container.alpha = 0.0;
-        [UIView animateWithDuration:0.15 animations:^{
+        container.transform = CGAffineTransformMakeScale(0.55, 0.55);
+        [UIView animateWithDuration:0.45
+                              delay:0.0
+             usingSpringWithDamping:0.68
+              initialSpringVelocity:0.4
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:^{
             container.alpha = 1.0;
-        }];
+            container.transform = CGAffineTransformIdentity;
+        } completion:nil];
 
         MFLog(@"[ring] <<< 呼出完成：跟随手指(%.0f,%.0f) -> 停靠点(%.0f,%.0f)",
               point.x, point.y, self.parkCenter.x, self.parkCenter.y);
@@ -1849,8 +1877,16 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (container == nil) {
         return;
     }
-    [UIView animateWithDuration:0.15 animations:^{
+    // 【0.3.0】收起 = 缩小 + 淡出（Stheno scale+opacity 反向过渡），干脆利落不拖泥带水
+    [UIView animateWithDuration:0.18
+                          delay:0.0
+         usingSpringWithDamping:0.85
+          initialSpringVelocity:0.6
+                        options:(UIViewAnimationOptionCurveEaseIn |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
         container.alpha = 0.0;
+        container.transform = CGAffineTransformMakeScale(0.7, 0.7);
     } completion:^(__unused BOOL finished) {
         [container removeFromSuperview];
     }];
@@ -1897,8 +1933,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.hasLatchFinger = YES;
     CGPoint park = self.parkCenter;
     if (animated) {
-        [UIView animateWithDuration:0.16
+        // 【0.3.0】停靠改弹簧滑入（Stheno spring 惯例）：到点后带一点柔性回稳，不再是生硬的 ease-out
+        [UIView animateWithDuration:0.42
                               delay:0.0
+             usingSpringWithDamping:0.72
+              initialSpringVelocity:0.3
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState)
                          animations:^{
@@ -2681,11 +2720,21 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (button == nil) {
         return;
     }
-    [UIView animateWithDuration:0.12 animations:^{
-        button.transform = selected ? CGAffineTransformMakeScale(1.18, 1.18) : CGAffineTransformIdentity;
-        button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.42 : 0.14];
+    // 【0.3.0】借鉴 Stheno 的滑选图标动画（逆向实证：`_scaleToIcon`/`_selected` 选中缩放
+    //   + `CustomSpringAnimation`/阻尼系数贯穿）：选中图标**弹性**放大到 1.25 并加亮，
+    //   手指滑走时弹簧缩回。damping 0.5 = 明显的过冲回弹，正是 Stheno 圆盘的手感来源。
+    [UIView animateWithDuration:0.38
+                          delay:0.0
+         usingSpringWithDamping:(selected ? 0.5 : 0.65)
+          initialSpringVelocity:(selected ? 0.5 : 0.0)
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        button.transform = selected ? CGAffineTransformMakeScale(1.25, 1.25) : CGAffineTransformIdentity;
+        button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.45 : 0.14];
         button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.95 : 0.35].CGColor;
-    }];
+    } completion:nil];
 }
 
 #pragma mark 图标交互
@@ -3044,27 +3093,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.2.15 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.3.0 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.2.15 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.0 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.2.15 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.3.0 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.2.15 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.0 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.2.15 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.3.0 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -3103,7 +3152,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.2.15 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.3.0 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
