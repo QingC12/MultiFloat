@@ -8,7 +8,7 @@ on:
     branches: [main]
     paths:
       - 'PullOverMF/**'
-      - 'MultiFloat/scripts/setter_check.py'
+      - 'scripts/setter_check.py'
       - '.github/workflows/build-pullovermf.yml'
   workflow_dispatch:
 
@@ -52,7 +52,7 @@ jobs:
       - name: Static checks (property setter recursion)
         # 拦住"手写 setXxx: 与同名 @property 撞车"——这类写法会无限递归 → 栈溢出 → SIGSEGV，
         # 宿主进程（SpringBoard）当场死、不进安全模式。0.1.6~0.1.9 四版崩溃的真凶就是它。
-        run: python3 MultiFloat/scripts/setter_check.py PullOverMF
+        run: python3 scripts/setter_check.py PullOverMF
 
       - name: Build PullOverMF package
         run: make package -C PullOverMF

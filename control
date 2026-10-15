@@ -1,9 +1,0 @@
-Package: com.example.multifloat
-Name: MultiFloat
-Version: 0.42.0
-Architecture: iphoneos-arm64e
-Description: Multi-floating window / split-view tweak for iOS 17 (roothide / arm64e). 0.42.0 - the window and touch model was rewritten after studying PullOver-X (GPL-3.0; design ideas only, code written independently): (1) windowLevel dropped from 1099/1170 to 100, following PullOver-X's stated rule that SBStatusBarWindow sits at 999 and SBControlCenterWindow at 1080, so 100 covers apps while staying below all system windows; the old automatic level raise is now opt-in (windowLevelAutoRaise, default NO) and legacy placeholder values 1010/1099 are ignored; (2) new MFFloatWindow subclass that takes over hitTest: and returns nil for meaningless hits (e.g. the panel's own root view), so touches pass through to the app underneath; (3) showing the float now uses makeKeyAndVisible (makeKeyOnShow, default YES) and the window's userInteractionEnabled follows its visibility; (4) the invisible transparent hot zones were replaced by a VISIBLE nub handle (MFNubView: 48pt rounded chip with pointInside enlarged to at least 52pt plus 12pt towards the screen edge), with PullOver-style gesture arbitration - tap shows/hides, 0.3s long press or a leftward drag opens the arc picker, a vertical drag slides the handle along the edge, two fingers resize; (5) new level ordering: float 100 < handle window 150 < arc picker 200 < status bar 999, and the status-bar mirror touch layer is now off by default (mirrorTouchZones=true to re-enable for diagnostics); (6) cfgVersion 23 -> 24 migration fixes legacy levels and adds the new switches automatically.
-Maintainer: QingC12 <QingC12@users.noreply.github.com>
-Author: QingC12
-Section: Tweaks
-Depends: firmware (>= 15.0)

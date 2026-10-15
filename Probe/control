@@ -1,9 +1,0 @@
-Package: com.example.mfprobe
-Name: MFProbe Diagnostic
-Version: 0.5.0
-Architecture: iphoneos-arm64e
-Description: One-shot runtime diagnostic for MultiFloat (NOT the tweak). v0.5.0 is the SAFE-BY-DEFAULT rewrite: v0.4.0 crashed SpringBoard 3x in a row (safe mode) inside the LIVE scene probe. This build (1) auto-runs only the sections proven safe across two device rounds, (2) adds a new fully-static "selector owner" search over every registered class, and (3) puts all live probing behind an opt-in gate file, runs it on the MAIN thread, logs before/after every single call, and self-disarms after one attempt so a crash loop can never reach safe mode. See /var/mobile logs after install. Install, collect logs, then uninstall.
-Maintainer: QingC12 <QingC12@users.noreply.github.com>
-Author: QingC12
-Section: Tweaks
-Depends: firmware (>= 15.0)
