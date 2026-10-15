@@ -2,6 +2,18 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.13 核心改动 ============================
+//  ① **呼出即停靠（log18 实证：0.2.12 回退窗口差 0.275 秒没够着 + 悬停事件流离边即断）**：
+//     边缘手势的触摸流只在手指贴近边缘一带时可靠，手指滑到圆盘左/上/下后事件就断
+//     （用户实证"只有右边能滑动选中"）—— 这是系统手势路由的固有行为，识别器层面修不了。
+//     对策：**呼出那一刻直接把圆盘固定到停靠点**（跳过跟随阶段），后续交互不再依赖
+//     呼出触摸的后续事件：圆盘停在那儿，用户直接点图标（直接点击）或用新触摸滑动
+//     （onRingHoverPan，0.2.9），或继续用呼出触摸滑（事件还活着时照常悬停）。
+//  ② **松手回退窗口 2.0 → 5.0 秒**：log18 实测"最后选中 48.432 → 松手 50.707"间隔
+//     2.275 秒，刚好超出 2.0 秒窗口 0.275 秒 → 没回退 → 收起。5 秒覆盖真实操作节奏。
+//  ③ **松手无选中不再收起圆盘**：保留在屏幕上（点空白/点图标才有下一步），用户
+//     可以直接用新触摸继续选——消灭"手指离开屏幕后必须重新呼出"的挫败感。
+//
 //  ============================ 0.2.12 核心改动 ============================
 //  ① **"松手即打开"最终修（log17 实证：桌面/全屏都要二次点击）**：
 //     0.2.11 已修好 App 跟着滚，但松手仍常"未选中"。日志给出决定性规律：
@@ -278,7 +290,7 @@
 //                              关掉则系统手势原样放行）
 //    mfRingEdgePanDistance number 0.2.8 系统边缘手势沿边滑出多少 pt 呼出圆盘（默认 40）
 //    mfRingReleaseOpenWindow number 0.2.12 松手回退窗口：松手时无选中则开"最近悬停选中"，
-//                              只在距上次选中不超过该秒数时生效（默认 2.0；0 = 关闭回退）
+//                              只在距上次选中不超过该秒数时生效（默认 5.0；0 = 关闭回退）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -1329,7 +1341,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.12 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.13 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1611,8 +1623,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             [self hide];
             [self openFloatWithBundleId:bundleId];
         } else {
-            MFLog(@"[ring] 手指离开屏幕 -> 未选中，收起圆盘");
-            [self hide];
+            // 【0.2.13】无选中不收起：圆盘保留（点空白收起），用户可直接继续点/滑
+            MFLog(@"[ring] 手指离开屏幕 -> 无选中，圆盘保留");
         }
         return;
     }
@@ -2646,7 +2658,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if ([current isKindOfClass:[NSString class]] && current.length > 0) {
         return current;
     }
-    double window = MFRingNumber(@"mfRingReleaseOpenWindow", 2.0);
+    double window = MFRingNumber(@"mfRingReleaseOpenWindow", 5.0);
     if (window <= 0.0) {
         return nil;
     }
@@ -2847,6 +2859,10 @@ void MFRingSummonFromSystemGestureAtPoint(CGPoint point) {
         }
         MFLog(@"[ring] >>> 系统手势呼出（触点 %.0f,%.0f）", point.x, point.y);
         [picker showAtPoint:point];
+        // 【0.2.13】呼出即停靠：边缘手势的触摸流只在贴近边缘时可靠（离边即断，
+        //   用户实证"只有右边能滑动选中"），跳过跟随阶段直接固定到停靠点；
+        //   后续交互 = 直接点图标 / 新触摸滑动（onRingHoverPan）/ 呼出触摸继续滑（能用就用）。
+        [picker latchToParkAnimated:NO];
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 系统手势呼出异常：%@", exception);
     }
@@ -2943,8 +2959,8 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
             if (along < (CGFloat)distance) {
                 return;
             }
+            picker.lastFingerPoint = location;   // 先记录，呼出内部的"立即停靠"要用
             MFRingSummonFromSystemGestureAtPoint(location);
-            picker.lastFingerPoint = location;
             return;
         }
 
@@ -2973,8 +2989,9 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
                 [picker hide];
                 [picker openFloatWithBundleId:bundleId];
             } else {
-                MFLog(@"[ring] 手指离开屏幕 -> 未选中，收起圆盘（松手点 %.0f,%.0f）", location.x, location.y);
-                [picker hide];
+                // 【0.2.13】无选中不收起：圆盘保留在屏幕上（呼出即停靠后它就在停靠点），
+                //   用户可直接点图标 / 用新触摸滑动选择；点空白（容器 touchesEnded）才收起。
+                MFLog(@"[ring] 手指离开屏幕 -> 无选中，圆盘保留（松手点 %.0f,%.0f）", location.x, location.y);
             }
             return;
         }
@@ -3024,27 +3041,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.2.12 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.2.13 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.2.12 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.13 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.2.12 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.2.13 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.2.12 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.13 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.2.12 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.13 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -3083,7 +3100,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.2.12 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.2.13 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
