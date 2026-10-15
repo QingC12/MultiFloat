@@ -10,11 +10,23 @@
 #   从而所有 `#import "../POLocalization.h"` / `#import "POPPath.h"` 原样可用。
 #
 # 目标环境：[CONFIRMED] iPhone 15 Pro Max / iOS 17.3.1 / arm64e / roothide
+#
+# ===== 【0.4.7】★ 体积精简的真凶与关键修正：DEBUG 必须在 include common.mk **之前** 设为 0 =====
+# 0.4.6 用 `messages = yes` 抓到真实编译命令行，其**末尾**是：
+#     clang -c ... -Os -fobjc-arc -w -IPullOverX -I. -include PullOverX-Prefix.pch -Os  -DDEBUG -O0  -DTHEOS_INSTANCE_NAME="PullOverMF" ...
+#   ⇒ Theos 在 DEBUG=1（**roothide fork 的默认值**）时会**最后**追加 `-DDEBUG -O0`，
+#     把前面所有 `-Os` 全部覆盖（clang 取最后一个 -O 选项）—— 这才是"优化级别怎么改都不动"的真因：
+#     0.4.2~0.4.6 的 __TEXT 一直是 835584 B（__text 662760 B），即**未优化的 -O0 产物**。
+#   ⇒ 修正：`DEBUG = 0` 必须写在 `include common.mk` **之前**（写在其后无效，因为 Theos 早已据此展开 CFLAGS）。
+# ★ 安全性：已全工程 grep 确认**没有任何 `#ifdef DEBUG` / `#ifndef DEBUG` / `NDEBUG` 条件编译**，
+#   MFLog 是无条件定义的 ⇒ `DEBUG = 0` 不会关掉任何日志，只去掉 `-DDEBUG -O0`
+#   （顺带：产物名不再被追加 `+debug` 后缀）。
+DEBUG = 0
+
 ARCHS = arm64e
 THEOS_PACKAGE_SCHEME ?= roothide
 MF_SDK_VERSION ?= 16.5
-# 诊断（0.4.6）：让 Theos 打印完整编译/链接命令行 —— 前几轮始终拿不到 -O 的真实位置，
-# 本轮一次把命令行打进 CI 日志（取证完可删）。
+# 诊断（0.4.6）：让 Theos 打印完整编译/链接命令行 —— 优化级别取证用，确认后即删。
 messages = yes
 
 TARGET = iphone:clang:$(MF_SDK_VERSION):14.0
@@ -77,11 +89,11 @@ INSTALL_TARGET_PROCESSES = SpringBoard
 #   ① `-Wl,-x`：链接期不把**局部符号**写进符号表（ld 的 strip 局部符号）。
 #   ② `-Wl,-S`：不写**调试符号**。
 #   ③ `-Wl,-dead_strip`：删链上未被引用的函数/数据。
-#   ④ `DEBUG = 0` 显式声明（不带 -g）。
-#   ⑤ 优化级别 -Os 见上方【0.4.4】段（0.4.3 时只写了 xxx_CFLAGS，被 Theos 的 -O2 覆盖，无效）。
+#   ④ `-Wl,-dead_strip`：删链上未被引用的函数/数据。
+#   ⑤ 优化级别 -Os：见文件顶部【0.4.7】——真凶是 DEBUG=1 在命令行**末尾**追加的 `-DDEBUG -O0`，
+#      在顶部把它设成 0 之后，下面各处注入的 `-Os` 才真正生效。
 # 实测收益（0.4.2 → 0.4.3）：主 dylib 1258592 → 949536 B（-24.6%，__LINKEDIT 341088 → 32032 B，
 # 符号 9478 → 306）；相机 dylib 76672 → 71456 B；DEB 319754 → 275046 B（-14.0%）。
-DEBUG = 0
 PullOverMF_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 POCaptureCompat_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 
