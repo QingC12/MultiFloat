@@ -2,6 +2,25 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.3.26 核心改动（用户 log35）============================
+//  ① **呼出跟手放大再修一处**。用户原话："手指停留右侧边缘时圆盘也会变成 100%，修改为
+//     只有拖到屏幕中间固定时才能 100%；如果在中途停留，那么保持当时的大小不变"
+//     log35 实证两个元凶（都在"手指停下没动"时被触发）：
+//       · 元凶一 `scheduleSettle`（停顿 0.18s 即锁定）：贴边按下后手指只动了一下就停住，
+//         0.18s 后就被判"想固定" ⇒ 弹簧把圆盘拉到停靠点并复位成 100%。
+//         日志：`呼出跟手… 01:03:18.173` → `圆盘已固定到下半屏中心 01:03:18.354`（差 181ms）。
+//         修法：**跟手期间不再排 settle** —— 只有手指真的进到停靠容差（默认 72pt）才固定。
+//       · 元凶二 0.55s 的"兜底补间到 100%"（0.3.25 为"怕 App 吞事件流卡在 30%"加的）：
+//         日志里 `呼出跟手：手指未继续滑动 → 兜底补间到 100%` 就是它。用户明确要求中途停留
+//         保持当时大小 ⇒ **整个删掉**。真被吞事件流时手指一抬、屏幕上任意点一下即可收起
+//         （展开态容器的 touchesEnded 就是"点空白收起"，不需要靠放大来救）。
+//       · 进度基准改成 `ringIntroSpan` = **触发点到停靠点的城市街区距离**（原来写死 120pt）。
+//         于是"拖到停靠点"与"刚好 100%"是同一个时刻：中途停在哪儿就停在哪儿的大小（单调不回退）。
+//  ② **编辑器「已添加」排序条**。用户原话："圆盘内添加的自选应用无法自定义位置，所以在添加
+//     自选应用页面为已添加应用排序"。编辑器顶部新增横滑排序条，按**圆盘真实顺序**列出已添加
+//     App（左上角序号 + 图标 + 名称），每格 ◀ / ▶ 各点一下 = 前移 / 后移一格；
+//     顺序即 `ringApps` 的顺序（点「完成」写盘，下次呼出立刻生效）。排序条与下方网格双向同步。
+//
 //  ============================ 0.3.0 核心改动（用户指定）============================
 //  圆盘手势逻辑**一处未动**（0.2.14 交互已获"非常完美"确认）。本版只做两件事：
 //  ① **动画全面弹簧化（借鉴 Stheno）**：Stheno 逆向实证（analysis/stheno-ring-gesture-study.md）
@@ -365,6 +384,14 @@
 #define MF_RING_EDITOR_CHECK     991014   // cell 右上角"已选"角标
 #define MF_RING_EDITOR_DONE      991015   // 「完成」按钮
 #define MF_RING_EDITOR_MAX_APPS  200      // 编辑器最多列出多少个 App（防爆）
+// 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
+#define MF_RING_EDITOR_ORDER_INDEX   991016   // 排序条格子左上角序号
+#define MF_RING_EDITOR_ORDER_BACK    991017   // 排序条格子「◀ 前移」
+#define MF_RING_EDITOR_ORDER_FORWARD 991018   // 排序条格子「▶ 后移」
+#define MF_RING_ORDER_CELL_W 76.0             // 排序条格子宽
+#define MF_RING_ORDER_CELL_H 102.0            // 排序条格子高
+#define MF_RING_ORDER_CELL_GAP 6.0            // 格子间距
+#define MF_RING_ORDER_INSET 10.0              // 排序条左右内边距
 
 static char kMFRingBundleIdKey;
 
@@ -1136,7 +1163,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, assign) CGPoint lastFingerPoint;         // 最近一次手指屏幕坐标
 @property (nonatomic, assign) CGPoint latchFingerPoint;        // 固定那一刻的手指坐标
 @property (nonatomic, assign) BOOL hasLatchFinger;             // 是否已记录固定时的手指位置
-@property (nonatomic, assign) NSUInteger settleGeneration;     // 手指停住计时器代次
 // 【0.2.1】圆盘应用编辑器（长按边缘触发条打开）
 @property (nonatomic, strong) UIView *editorPanel;             // 全屏编辑面板
 @property (nonatomic, strong) UIScrollView *editorScroll;      // 面板里的滚动容器
@@ -1144,23 +1170,27 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) NSMutableArray<UIView *> *editorCells;             // 网格 cell（顺序填图标）
 @property (nonatomic, strong) UILabel *editorCountLabel;       // "已选 N 个"
 @property (nonatomic, assign) NSUInteger editorIconGeneration;  // 编辑器图标填充代次
+// 【0.3.26 用户 log35】「已添加」排序条（横滑；顺序 = 圆盘上图标的位置）
+@property (nonatomic, strong) UILabel *editorOrderTitle;           // 排序条标题（含"已添加 N 个"）
+@property (nonatomic, strong) UIScrollView *editorOrderScroll;     // 排序条滚动容器
+@property (nonatomic, strong) NSMutableArray<UIView *> *editorOrderCells;  // 排序条格子
 // 【0.3.22】触发条自调（用户 log31：触发条要能自己控制大小；且右侧屏幕中段也会呼出 ⇒ 容易误触）
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
 @property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
 // 【0.3.25 用户 log34】呼出 = **跟手放大**（把 0.3.24 的"自动 0.38s 从 28% 弹到 100%"整个换掉）：
 //   触发瞬间先显示 30% 的小圆盘（贴在触发条那条屏边、跟着手指），
-//   手指沿屏幕往里滑多少、圆盘就长多少（位移→缩放线性映射，每帧带短补间 ⇒ 不是"啪"地变大），
-//   停靠/手指停住时再补间到 100%。见 mfSetRingIntroProgress:animated: / scheduleRingIntroFallback。
+//   手指沿屏幕往里滑多少、圆盘就长多少（位移→缩放线性映射，每帧带短补间 ⇒ 不是"啪"地变大）。
+//   【0.3.26 用户 log35】进度基准 = 触发点→停靠点的距离，**只有拖到停靠点才 100%**；
+//   中途停留保持当前大小（"停顿即锁定"的 settle 与"兜底补间到 100%"都已删除）。
 #define MF_RING_INTRO_MIN_SCALE 0.30        // 触发瞬间的圆盘缩放（用户指定 30%）
-#define MF_RING_INTRO_DRAG_SPAN 120.0       // 手指移动 120pt ⇒ 圆盘长到 100%
 #define MF_RING_INTRO_STEP_DURATION 0.16    // 每帧缩放补间时长（事件稀疏时也平滑长大）
-#define MF_RING_INTRO_FALLBACK_DELAY 0.55   // 手指不动时的兜底：自动补间到 100%（免得卡在 30% 用不了）
+#define MF_RING_INTRO_MIN_SPAN 100.0        // 【0.3.26】触发点离停靠点很近时的进度基准下限（pt）
 @property (nonatomic, assign) BOOL ringIntroActive;                // 呼出跟手放大进行中（= 尚未停靠）
 @property (nonatomic, assign) CGFloat ringIntroProgress;           // 跟手进度 0..1（单调递增）
 @property (nonatomic, assign) CGPoint ringIntroSummonPoint;        // 触发点（进度基准）
-@property (nonatomic, assign) NSUInteger ringIntroGeneration;      // 代次（作废过期回调/兜底计时器）
-@property (nonatomic, assign) NSUInteger ringIntroFallbackGeneration;  // 兜底补间计时器代次
+@property (nonatomic, assign) CGFloat ringIntroSpan;               // 【0.3.26】触发点→停靠点距离（进度满格值）
+@property (nonatomic, assign) NSUInteger ringIntroGeneration;      // 代次（作废过期回调）
 + (instancetype)shared;
 - (void)install;
 - (void)teardownHostViews;
@@ -1176,7 +1206,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)showAtPoint:(CGPoint)point;
 - (void)moveRingToPoint:(CGPoint)point;
 - (void)latchToParkAnimated:(BOOL)animated;
-- (void)scheduleSettle;
 - (void)buildRingInContainer:(UIView *)container;
 /// 【0.3.25】同步贴真图标（呼出时用，避免"先看 0.4s 首字母占位"）
 - (NSUInteger)fillIconsSynchronouslyForGeneration:(NSUInteger)generation;
@@ -1187,7 +1216,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 /// 【0.3.25】跟手放大三件套
 - (void)mfSetRingIntroProgress:(CGFloat)progress animated:(BOOL)animated;
 - (CGFloat)mfRingIntroProgressForPoint:(CGPoint)point;
-- (void)scheduleRingIntroFallback;
 - (CGPoint)mfClampRingCenter:(CGPoint)point scale:(CGFloat)scale;
 - (void)refreshRingContentsIfVisible;
 - (void)scheduleAutoBundleIdEnumeration;
@@ -1208,6 +1236,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
              generation:(NSUInteger)generation;
 - (void)onEditorCellTapped:(UIButton *)button;
 - (void)onEditorDone:(UIButton *)sender;
+// 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
+- (void)rebuildEditorOrderStrip;
+- (void)layoutEditorOrderCellsAnimated:(BOOL)animated;
+- (void)applyEditorOrderCellDecorations:(UIView *)cell index:(NSUInteger)index total:(NSUInteger)total;
+- (void)onEditorOrderMove:(UIButton *)button;
+- (void)moveEditorOrderBundleId:(NSString *)bundleId by:(NSInteger)delta;
 // 【0.3.22】触发条几何自调（编辑器顶部滑杆）
 - (void)buildTriggerSettingsInPanel:(UIView *)panel top:(CGFloat)top;
 - (void)onTriggerSliderChanged:(UISlider *)slider;
@@ -1714,11 +1748,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         if (!self.ringLatched) {
             [self moveRingToPoint:finger];
+            // 【0.3.26 用户 log35】跟手期间**不再"停顿即锁定"**（原来停顿 0.18s 就被判"想固定"，
+            //   于是贴在屏边不动也会被弹簧拉到停靠点、复位成 100%）。现在只有手指真的进到
+            //   停靠容差才固定 —— 中途停在哪儿，圆盘就保持哪儿的大小。
             CGFloat tolerance = MAX(12.0, MFRingNumber(@"mfRingLatchTolerance", 72.0));
             if (hypot(finger.x - self.parkCenter.x, finger.y - self.parkCenter.y) <= tolerance) {
                 [self latchToParkAnimated:YES];
-            } else {
-                [self scheduleSettle];
             }
         }
         [self updateSelectionForPoint:finger];
@@ -1769,11 +1804,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         if (gesture.state == UIGestureRecognizerStateChanged) {
             if (!self.ringLatched) {
                 [self moveRingToPoint:finger];
+                // 【0.3.26 用户 log35】同上：跟手期间不"停顿即锁定"，只有进容差才固定
                 CGFloat tolerance = MAX(12.0, MFRingNumber(@"mfRingLatchTolerance", 72.0));
                 if (hypot(finger.x - self.parkCenter.x, finger.y - self.parkCenter.y) <= tolerance) {
                     [self latchToParkAnimated:YES];
-                } else {
-                    [self scheduleSettle];
                 }
             }
             [self updateSelectionForPoint:finger];
@@ -1898,7 +1932,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.ringLatched = NO;
         self.selectedButton = nil;
         self.hasLatchFinger = NO;
-        self.settleGeneration += 1;
 
         // 【0.2.2】停靠点下移：0.72 → 0.78（用户反馈"固定后还是有点靠上"）
         CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.78), 0.5), 0.92);
@@ -1947,19 +1980,23 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         //   ★ 0.3.24 的错：改成"位移 + 自动弹大"，但位移终点是**停靠点**、缩放在 0.38s 内自动跑完 ⇒
         //     用户看到的是"自己长大"，跟他手指没关系（用户原话："不是从右边缘拖出来的"）。
         //   ★ 现在：触发瞬间就显示 **30%** 的小圆盘（圆心按 30% 的半径夹 ⇒ 能贴到屏边、跟着手指），
-        //     手指往里滑多少、圆盘就长多少（120pt → 100%，见 mfRingIntroProgressForPoint:），
+        //     手指往里滑多少、圆盘就长多少（见 mfRingIntroProgressForPoint:），
         //     每帧带 0.16s 补间 ⇒ 是"一路被拖大"，不是"啪地变大"。
+        //   ★ 【0.3.26 用户 log35】满格距离 = **触发点到停靠点**（ringIntroSpan）：
+        //     于是"拖到停靠点"与"刚好 100%"是同一时刻；中途停在哪儿就保持哪儿的大小。
         //   ★ 未停靠期间**禁止选中**（见 updateSelectionForPoint:）——手指只是拉大圆盘，不能误开 App。
         self.ringIntroActive = YES;
         self.ringIntroProgress = 0.0;
         self.ringIntroSummonPoint = point;
+        self.ringIntroSpan = MAX(MF_RING_INTRO_MIN_SPAN,
+                                 fabs(point.x - self.parkCenter.x) + fabs(point.y - self.parkCenter.y));
         self.ringIntroGeneration += 1;
         self.ringRoot.alpha = 1.0;   // 不再淡入：图标已同步贴好，直接可见（0.3.24 的淡入是"透明图标"帮凶）
         self.ringRoot.transform = CGAffineTransformMakeScale(MF_RING_INTRO_MIN_SCALE, MF_RING_INTRO_MIN_SCALE);
-        [self scheduleRingIntroFallback];
-        MFLog(@"[ring] 呼出跟手：%@ 起点(%.0f,%.0f) 小圆盘 %.0f%%，手指往里滑 %.0fpt 长到 100%%",
+        MFLog(@"[ring] 呼出跟手：%@ 起点(%.0f,%.0f) 小圆盘 %.0f%%，拖到停靠点(%.0f,%.0f)（%.0fpt）才 100%%，中途停留保持当前大小",
               MFRingEdge(), startCenter.x, startCenter.y,
-              MF_RING_INTRO_MIN_SCALE * 100.0, MF_RING_INTRO_DRAG_SPAN);
+              MF_RING_INTRO_MIN_SCALE * 100.0,
+              self.parkCenter.x, self.parkCenter.y, self.ringIntroSpan);
 
         MFLog(@"[ring] <<< 呼出完成：跟随手指(%.0f,%.0f) -> 停靠点(%.0f,%.0f)",
               point.x, point.y, self.parkCenter.x, self.parkCenter.y);
@@ -1986,9 +2023,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 - (void)hide {
     self.buildGeneration += 1;   // 作废尚未执行的图标填充
-    // 【0.3.24/0.3.25】作废呼出动画（跟手放大 + 兜底补间）—— 否则它们可能在收起后去动已脱离视图的 ringRoot
+    // 【0.3.24/0.3.25】作废呼出动画（跟手放大）—— 否则它可能在收起后去动已脱离视图的 ringRoot
     self.ringIntroGeneration += 1;
-    self.ringIntroFallbackGeneration += 1;
     self.ringIntroActive = NO;
     self.ringIntroProgress = 0.0;
     if (self.editorPanel != nil) {
@@ -2005,7 +2041,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.selectedButton = nil;
     self.ringLatched = NO;
     self.hasLatchFinger = NO;
-    self.settleGeneration += 1;
     self.expanded = NO;
     [self.iconButtons removeAllObjects];
 
@@ -2056,11 +2091,13 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.ringRoot.center = [self clampRingCenter:point];
 }
 
-/// 手指从触发点移动了多远 → 0..1（城市街区距离：对左/右/上/下任意边方向都单调）
+/// 【0.3.26 用户 log35】手指从触发点移动了多远 → 0..1（城市街区距离：对左/右/上/下任意边方向都单调）。
+/// ★ 分母 = `ringIntroSpan` = **触发点到停靠点的距离** ⇒ 只有把圆盘拖到停靠点才刚好 100%；
+///   中途停下不动 → 没人再推它（0.3.25 的 0.55s 兜底补间已删），大小就停在原地。
 - (CGFloat)mfRingIntroProgressForPoint:(CGPoint)point {
     CGPoint from = self.ringIntroSummonPoint;
     CGFloat moved = fabs(point.x - from.x) + fabs(point.y - from.y);
-    return MIN(MAX(moved / MAX(1.0, MF_RING_INTRO_DRAG_SPAN), 0.0), 1.0);
+    return MIN(MAX(moved / MAX(1.0, self.ringIntroSpan), 0.0), 1.0);
 }
 
 /// 把跟手进度写成 ringRoot 的缩放（30% → 100%）。
@@ -2087,46 +2124,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     } completion:nil];
 }
 
-/// 【0.3.25】兜底：手指触发后就不再滑动（有些 App 会吞掉后续触摸事件）⇒ 0.55s 后自动补间到 100%，
-/// 否则圆盘会永远卡在 30% 大小、看不清也没法用。
-- (void)scheduleRingIntroFallback {
-    self.ringIntroFallbackGeneration += 1;
-    NSUInteger generation = self.ringIntroFallbackGeneration;
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 (int64_t)(MF_RING_INTRO_FALLBACK_DELAY * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf == nil || generation != strongSelf.ringIntroFallbackGeneration) {
-            return;
-        }
-        if (!strongSelf.ringIntroActive || strongSelf.ringLatched || strongSelf.ringRoot == nil) {
-            return;
-        }
-        strongSelf.ringIntroProgress = 1.0;
-        [strongSelf mfSetRingIntroProgress:1.0 animated:YES];
-        MFLog(@"[ring] 呼出跟手：手指未继续滑动 → 兜底补间到 100%%");
-    });
-}
-
-/// 手指停住一小会儿就把圆盘固定到停靠点（用户自然会在停靠点附近有个停顿）
-- (void)scheduleSettle {
-    self.settleGeneration += 1;
-    NSUInteger generation = self.settleGeneration;
-    NSTimeInterval delay = MAX(0.05, MFRingNumber(@"mfRingSettleDelay", 0.18));
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf == nil || generation != strongSelf.settleGeneration) {
-            return;
-        }
-        if (!strongSelf.expanded || strongSelf.ringLatched) {
-            return;
-        }
-        [strongSelf latchToParkAnimated:YES];
-    });
-}
+/// 【0.3.26 用户 log35】原来这里有个 `scheduleRingIntroFallback`（触发后 0.55s 自动补间到 100%，
+/// 当年是为了"怕 App 吞掉事件流、圆盘卡在 30% 用不了"）。用户明确要求"中途停留保持当时大小"，
+/// 而它恰好就是"停在屏边也会变 100%"的第二个元凶 ⇒ **整段删除**。
+/// 真被吞事件流时手指一抬、屏幕上任意位置点一下即可收起（展开态容器的 touchesEnded），不需要放大来救。
 
 /// 固定到下半屏中心 —— 之后手指滑动只改变"选中"，圆盘不再跟着动
 - (void)latchToParkAnimated:(BOOL)animated {
@@ -2134,12 +2135,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         return;
     }
     // 【0.3.25】停靠 = 呼出跟手结束：先把缩放补到 100%（否则小圆盘会卡在 30%），再弹簧滑到停靠点。
+    // 【0.3.26】这条路径只在"手指真的拖进停靠容差（默认 72pt）"时才走到 ⇒ 用户要的
+    //   "只有拖到屏幕中间固定时才 100%"由它保证。
     self.ringIntroActive = NO;
     self.ringIntroProgress = 1.0;
-    self.ringIntroFallbackGeneration += 1;   // 撤掉兜底计时器
     self.ringIntroGeneration += 1;
     self.ringLatched = YES;
-    self.settleGeneration += 1;
     // 记录"固定那一刻手指在哪"：手指还没动之前不产生选中，避免刚停靠就误开某个 App
     self.latchFingerPoint = self.lastFingerPoint;
     self.hasLatchFinger = YES;
@@ -2598,7 +2599,31 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     const CGFloat settingsRows = 3.0;
     [self buildTriggerSettingsInPanel:panel top:settingsTop];
 
-    CGFloat scrollTop = settingsTop + settingsRows * rowHeight + 26.0;
+    // 【0.3.26 用户 log35】「已添加」排序条（横滑）：按**圆盘真实顺序**列出已添加的 App，
+    //   每格 ◀ / ▶ 各点一下 = 前移 / 后移一格 ⇒ 直接决定圆盘上图标的位置（顺序 = ringApps 顺序）。
+    const CGFloat orderTitleTop = settingsTop + settingsRows * rowHeight + 26.0;
+    UILabel *orderTitle = [[UILabel alloc]
+        initWithFrame:CGRectMake(18.0, orderTitleTop, width - 36.0, 16.0)];
+    orderTitle.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    orderTitle.font = [UIFont systemFontOfSize:11.5];
+    [panel addSubview:orderTitle];
+    self.editorOrderTitle = orderTitle;
+
+    const CGFloat orderStripHeight = 104.0;
+    UIScrollView *orderScroll = [[UIScrollView alloc]
+        initWithFrame:CGRectMake(0.0, orderTitleTop + 18.0, width, orderStripHeight)];
+    orderScroll.backgroundColor = [UIColor clearColor];
+    orderScroll.opaque = NO;
+    orderScroll.showsHorizontalScrollIndicator = NO;
+    orderScroll.alwaysBounceHorizontal = YES;
+    // 点 ◀ ▶ 要立刻响应（默认 delaysContentTouches=YES 会延迟 ~150ms 判滚动）；
+    // canCancelContentTouches 保持默认 YES ⇒ 起点在按钮上时横向拖动照样能滚排序条。
+    orderScroll.delaysContentTouches = NO;
+    [panel addSubview:orderScroll];
+    self.editorOrderScroll = orderScroll;
+    [self rebuildEditorOrderStrip];   // 首次按 editorSelection 的顺序铺好（含真图标/首字母占位）
+
+    CGFloat scrollTop = CGRectGetMaxY(orderScroll.frame) + 6.0;
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, scrollTop, width, MAX(120.0, height - scrollTop))];
     scroll.backgroundColor = [UIColor clearColor];
     scroll.opaque = NO;
@@ -2686,6 +2711,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (MFRingBool(@"mfRingFetchIcons", YES) && !gMFRingDegraded) {
         self.editorIconGeneration += 1;
         NSUInteger generation = self.editorIconGeneration;
+        // 【0.3.26】排序条先填（最多 24 个，缓存命中即瞬时可见），再铺 200 个网格
+        if (self.editorOrderCells.count > 0) {
+            [self fillEditorIcons:[self.editorOrderCells copy] fromIndex:0 generation:generation];
+        }
         [self fillEditorIcons:[self.editorCells copy] fromIndex:0 generation:generation];
     } else {
         MFLog(@"[ring] 编辑器跳过图标抓取（mfRingFetchIcons=false 或降级模式）");
@@ -2922,6 +2951,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
     [self applyEditorCellVisual:button selected:selected];
     [self refreshEditorCount];
+    // 【0.3.26】加入 = 追加到圆盘顺序末尾；移出 = 从顺序里删掉 ⇒ 排序条跟着重建
+    [self rebuildEditorOrderStrip];
 }
 
 - (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected {
@@ -2933,6 +2964,212 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     UIView *iconView = [cell viewWithTag:MF_RING_EDITOR_ICON];
     iconView.layer.borderWidth = selected ? 2.0 : 0.0;
     iconView.layer.borderColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0].CGColor;
+}
+
+#pragma mark - 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
+
+/// 按 `editorSelection`（= 圆盘真实顺序）**重建**排序条：序号 + 图标 + 名称 + ◀ ▶。
+/// 顺带说明：圆盘上图标的位置就是这个顺序（`ringApps` 数组顺序），点「完成」即写盘生效。
+/// ⚠️ 只做"加/减成员"后的重建；单纯换位置走 layoutEditorOrderCellsAnimated:（保留格子身份，
+///    能看见"哪个 App 挪到哪儿"），见 moveEditorOrderBundleId:by:。
+- (void)rebuildEditorOrderStrip {
+    UIScrollView *strip = self.editorOrderScroll;
+    if (strip == nil) {
+        return;
+    }
+    NSArray<NSString *> *ordered = (self.editorSelection != nil) ? self.editorSelection.array : @[];
+    for (UIView *view in [strip.subviews copy]) {
+        [view removeFromSuperview];
+    }
+    self.editorOrderCells = [NSMutableArray array];
+
+    const CGFloat cellW = MF_RING_ORDER_CELL_W;
+    const CGFloat cellH = MF_RING_ORDER_CELL_H;
+    const CGFloat gap = MF_RING_ORDER_CELL_GAP;
+    const CGFloat inset = MF_RING_ORDER_INSET;
+    const CGFloat iconSize = 48.0;
+
+    for (NSUInteger index = 0; index < ordered.count; index++) {
+        NSString *bundleId = ordered[index];
+        NSString *name = MFRingDisplayNameForBundleId(bundleId);
+        UIView *cell = [[UIView alloc] initWithFrame:CGRectMake(inset + (CGFloat)index * (cellW + gap),
+                                                                0.0, cellW, cellH)];
+        cell.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+        cell.layer.cornerRadius = 12.0;
+        objc_setAssociatedObject(cell, &kMFRingBundleIdKey, bundleId, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        UILabel *order = [[UILabel alloc] initWithFrame:CGRectMake(6.0, 3.0, 22.0, 14.0)];
+        order.tag = MF_RING_EDITOR_ORDER_INDEX;
+        order.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+        order.font = [UIFont boldSystemFontOfSize:11.0];
+        [cell addSubview:order];
+
+        // 图标视图与网格用同一个 tag ⇒ 复用 fillEditorIcons: 的贴图（含首字母占位）逻辑
+        UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake((cellW - iconSize) / 2.0,
+                                                                             4.0, iconSize, iconSize)];
+        iconView.tag = MF_RING_EDITOR_ICON;
+        iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        iconView.layer.cornerRadius = 12.0;
+        iconView.layer.masksToBounds = YES;
+        iconView.contentMode = UIViewContentModeScaleAspectFit;
+        [cell addSubview:iconView];
+
+        UILabel *placeholder = [[UILabel alloc] initWithFrame:iconView.bounds];
+        placeholder.tag = MF_RING_EDITOR_LABEL;
+        placeholder.text = (name.length > 0) ? [name substringToIndex:1] : @"?";
+        placeholder.textAlignment = NSTextAlignmentCenter;
+        placeholder.textColor = [UIColor whiteColor];
+        placeholder.font = [UIFont boldSystemFontOfSize:20.0];
+        [iconView addSubview:placeholder];
+
+        UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(1.0, 4.0 + iconSize + 2.0,
+                                                                      cellW - 2.0, 26.0)];
+        nameLabel.text = name;
+        nameLabel.textAlignment = NSTextAlignmentCenter;
+        nameLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.92];
+        nameLabel.font = [UIFont systemFontOfSize:9.5];
+        nameLabel.numberOfLines = 2;
+        [cell addSubview:nameLabel];
+
+        // ◀ 前移 / ▶ 后移：点一下挪一格（到头那一侧变暗且不响应）
+        NSArray<NSNumber *> *arrowTags = @[ @(MF_RING_EDITOR_ORDER_BACK), @(MF_RING_EDITOR_ORDER_FORWARD) ];
+        NSArray<NSString *> *arrowTitles = @[ @"◀", @"▶" ];
+        for (NSUInteger arrow = 0; arrow < arrowTags.count; arrow++) {
+            UIButton *step = [UIButton buttonWithType:UIButtonTypeCustom];
+            step.frame = CGRectMake((arrow == 0) ? 5.0 : (cellW - 33.0), cellH - 21.0, 28.0, 18.0);
+            step.tag = arrowTags[arrow].integerValue;
+            step.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
+            step.layer.cornerRadius = 6.0;
+            step.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+            [step setTitle:arrowTitles[arrow] forState:UIControlStateNormal];
+            [step setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            [step addTarget:self action:@selector(onEditorOrderMove:)
+           forControlEvents:UIControlEventTouchUpInside];
+            objc_setAssociatedObject(step, &kMFRingBundleIdKey, bundleId,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [cell addSubview:step];
+        }
+
+        [strip addSubview:cell];
+        [self.editorOrderCells addObject:cell];
+        [self applyEditorOrderCellDecorations:cell index:index total:ordered.count];
+    }
+
+    strip.contentSize = CGSizeMake(inset * 2.0 + (CGFloat)ordered.count * (cellW + gap),
+                                   cellH + 2.0);
+    if (self.editorOrderTitle != nil) {
+        self.editorOrderTitle.text = (ordered.count > 0)
+            ? [NSString stringWithFormat:@"已添加 %lu 个 · 从左到右 = 圆盘顺序（◀ ▶ 调位置，完成即生效）",
+                                         (unsigned long)ordered.count]
+            : @"已添加 0 个：点下方图标加入，再用 ◀ ▶ 调圆盘顺序";
+    }
+
+    // 图标：命中缓存是瞬时的；没命中先显示首字母，由 fillEditorIcons: 就近补齐
+    if (self.editorPanel != nil && !gMFRingDegraded && MFRingBool(@"mfRingFetchIcons", YES)
+        && self.editorOrderCells.count > 0) {
+        [self fillEditorIcons:[self.editorOrderCells copy]
+                    fromIndex:0
+                   generation:self.editorIconGeneration];
+    }
+    MFLog(@"[ring] 排序条已重建：%lu 个（从左到右 = 圆盘顺序）", (unsigned long)ordered.count);
+}
+
+/// 按数组顺序摆好每个格子（frame + 序号 + ◀▶ 可用状态）。
+/// 换位置时只调它、不重建视图 ⇒ 格子带着自己的图标/名称一起滑动，看得清"哪个 App 挪到哪去"。
+- (void)layoutEditorOrderCellsAnimated:(BOOL)animated {
+    NSArray<UIView *> *cells = [self.editorOrderCells copy];
+    void (^layout)(void) = ^{
+        for (NSUInteger index = 0; index < cells.count; index++) {
+            UIView *cell = cells[index];
+            CGRect frame = cell.frame;
+            frame.origin.x = MF_RING_ORDER_INSET + (CGFloat)index * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+            cell.frame = frame;
+            [self applyEditorOrderCellDecorations:cell index:index total:cells.count];
+        }
+        // 挪到看不着的地方就跟着滚一下（按格子宽度整格滚，避免抖）
+        UIScrollView *strip = self.editorOrderScroll;
+        if (strip != nil && cells.count > 0) {
+            CGFloat contentW = MF_RING_ORDER_INSET * 2.0 + (CGFloat)cells.count
+                * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+            CGFloat maxOffset = MAX(0.0, contentW - CGRectGetWidth(strip.bounds));
+            if (strip.contentOffset.x > maxOffset || strip.contentOffset.x < 0.0) {
+                strip.contentOffset = CGPointMake(MIN(MAX(strip.contentOffset.x, 0.0), maxOffset), 0.0);
+            }
+        }
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.18
+                              delay:0.0
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:layout
+                         completion:nil];
+    } else {
+        layout();
+    }
+}
+
+/// 序号 + 两侧箭头可用状态（第 1 个不能前移、最后一个不能后移）
+- (void)applyEditorOrderCellDecorations:(UIView *)cell index:(NSUInteger)index total:(NSUInteger)total {
+    if (cell == nil) {
+        return;
+    }
+    UILabel *order = (UILabel *)[cell viewWithTag:MF_RING_EDITOR_ORDER_INDEX];
+    order.text = [NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)];
+    BOOL canBack = (index > 0);
+    BOOL canForward = (index + 1 < total);
+    UIButton *back = (UIButton *)[cell viewWithTag:MF_RING_EDITOR_ORDER_BACK];
+    back.enabled = canBack;
+    back.alpha = canBack ? 1.0 : 0.30;
+    UIButton *forward = (UIButton *)[cell viewWithTag:MF_RING_EDITOR_ORDER_FORWARD];
+    forward.enabled = canForward;
+    forward.alpha = canForward ? 1.0 : 0.30;
+}
+
+/// 点排序条格子里的 ◀ / ▶（两个按钮都走这里，用 tag 区分方向）
+- (void)onEditorOrderMove:(UIButton *)button {
+    NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
+    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+        return;
+    }
+    NSInteger delta = (button.tag == MF_RING_EDITOR_ORDER_BACK) ? -1 : 1;
+    [self moveEditorOrderBundleId:bundleId by:delta];
+}
+
+/// 真正的顺序调整：`NSMutableOrderedSet` 的 remove + insert(at:)，再交换两个格子的位置引用、
+/// 动画重排（不重建视图 ⇒ 被挪的 App 带着图标滑到新位置）。
+/// ⚠️ 顺序就是 `ringApps` 的顺序 —— 下次呼出圆盘时图标位置照此排列。
+- (void)moveEditorOrderBundleId:(NSString *)bundleId by:(NSInteger)delta {
+    NSMutableOrderedSet<NSString *> *selection = self.editorSelection;
+    if (selection == nil || bundleId.length == 0 || delta == 0) {
+        return;
+    }
+    NSUInteger index = [selection indexOfObject:bundleId];
+    if (index == NSNotFound) {
+        return;
+    }
+    NSInteger target = (NSInteger)index + ((delta > 0) ? 1 : -1);
+    if (target < 0 || target >= (NSInteger)selection.count) {
+        return;   // 已经在队首 / 队尾
+    }
+    [selection removeObject:bundleId];
+    [selection insertObject:bundleId atIndex:(NSUInteger)target];
+    MFLog(@"[ring] 排序条：%@ 第 %lu 位 -> 第 %ld 位（圆盘顺序共 %lu 个）",
+          bundleId, (unsigned long)(index + 1), (long)(target + 1),
+          (unsigned long)selection.count);
+
+    NSMutableArray<UIView *> *cells = self.editorOrderCells;
+    if (cells.count > MAX(index, (NSUInteger)target)) {
+        [cells exchangeObjectAtIndex:index withObjectAtIndex:(NSUInteger)target];
+    }
+    [self layoutEditorOrderCellsAnimated:YES];
+    @try {
+        UIImpactFeedbackGenerator *feedback =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [feedback impactOccurred];
+    } @catch (__unused NSException *exception) {
+    }
 }
 
 - (void)refreshEditorCount {
@@ -2971,6 +3208,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorCountLabel = nil;
     self.editorSelection = nil;
     self.editorCells = nil;
+    self.editorOrderTitle = nil;      // 【0.3.26】排序条随面板一起收
+    self.editorOrderScroll = nil;
+    self.editorOrderCells = nil;
     self.triggerPreviewView = nil;    // 【0.3.22】触发条预览随面板一起收
     self.triggerValueLabels = nil;
     [panel removeFromSuperview];
@@ -3459,12 +3699,11 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
             picker.lastFingerPoint = location;
             if (!picker.ringLatched) {
                 [picker moveRingToPoint:location];   // 【0.2.14 恢复】跟随手指
+                // 【0.3.26 用户 log35】同上：跟手期间不"停顿即锁定"（只有进容差才固定）
                 CGFloat tolerance = MAX(12.0, MFRingNumber(@"mfRingLatchTolerance", 72.0));
                 if (hypot(location.x - picker.parkCenter.x,
                           location.y - picker.parkCenter.y) <= tolerance) {
                     [picker latchToParkAnimated:YES];
-                } else {
-                    [picker scheduleSettle];
                 }
             }
             [picker updateSelectionForPoint:location];
