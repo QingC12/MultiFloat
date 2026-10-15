@@ -413,6 +413,15 @@ static NSString *MFRingEdge(void) {
     return edge.lowercaseString;
 }
 
+/// 【0.3.22】写配置（编辑器滑杆用）。立即 synchronize，避免 SpringBoard 被杀导致设置丢失。
+static void MFRingSetNumber(NSString *key, double value) {
+    if (key.length == 0 || !isfinite(value)) {
+        return;
+    }
+    [MFRingDefaults() setObject:@(value) forKey:key];
+    [MFRingDefaults() synchronize];
+}
+
 /// 数值兜底：任何 NaN/Inf 都不允许进入几何计算（NaN frame = 渲染服务器直接带走进程）
 static CGFloat MFRingSafe(CGFloat value, CGFloat fallback) {
     return isfinite(value) ? value : fallback;
@@ -1135,6 +1144,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) NSMutableArray<UIView *> *editorCells;             // 网格 cell（顺序填图标）
 @property (nonatomic, strong) UILabel *editorCountLabel;       // "已选 N 个"
 @property (nonatomic, assign) NSUInteger editorIconGeneration;  // 编辑器图标填充代次
+// 【0.3.22】触发条自调（用户 log31：触发条要能自己控制大小；且右侧屏幕中段也会呼出 ⇒ 容易误触）
+@property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
+@property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
 @property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
 + (instancetype)shared;
 - (void)install;
@@ -1171,6 +1183,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
              generation:(NSUInteger)generation;
 - (void)onEditorCellTapped:(UIButton *)button;
 - (void)onEditorDone:(UIButton *)sender;
+// 【0.3.22】触发条几何自调（编辑器顶部滑杆）
+- (void)buildTriggerSettingsInPanel:(UIView *)panel top:(CGFloat)top;
+- (void)onTriggerSliderChanged:(UISlider *)slider;
+- (void)refreshTriggerGeometryAfterPrefsChange;
+- (void)syncTriggerValueLabels;
 - (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected;
 - (void)refreshEditorCount;
 - (void)closeEditorSaving:(BOOL)saving;
@@ -2356,7 +2373,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [panel addSubview:countLabel];
     self.editorCountLabel = countLabel;
 
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, 100.0, width, height - 100.0)];
+    // 【0.3.22】触发条自调区（用户 log31：触发条大小/位置要能自己控制）
+    const CGFloat settingsTop = 96.0;
+    const CGFloat rowHeight = 32.0;
+    const CGFloat settingsRows = 3.0;
+    [self buildTriggerSettingsInPanel:panel top:settingsTop];
+
+    CGFloat scrollTop = settingsTop + settingsRows * rowHeight + 26.0;
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, scrollTop, width, MAX(120.0, height - scrollTop))];
     scroll.backgroundColor = [UIColor clearColor];
     scroll.opaque = NO;
     scroll.alwaysBounceVertical = YES;
@@ -2447,6 +2471,142 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     } else {
         MFLog(@"[ring] 编辑器跳过图标抓取（mfRingFetchIcons=false 或降级模式）");
     }
+}
+
+#pragma mark - 【0.3.22】触发条自调（编辑器顶部滑杆）
+
+/// 三根滑杆：触发条**长度** / 沿边的**位置** / 呼出**灵敏度**（向屏内外扩的余量）。
+/// 拖动即写 NSUserDefaults(com.mlgm.pulloverx) 并立刻重算触发带 + 刷新高亮预览 → 所见即所得；
+/// 点「完成」不用额外保存（值在拖动时已落盘，respring 后仍生效）。
+/// 标签用中文（用户不看英文）；滑杆 tag：1=长度 2=位置 3=灵敏度。
+- (void)buildTriggerSettingsInPanel:(UIView *)panel top:(CGFloat)top {
+    CGRect bounds = self.hostBounds;
+    if (CGRectIsEmpty(bounds)) {
+        bounds = self.hostWindow.bounds;
+    }
+    CGFloat width = CGRectGetWidth(panel.bounds);
+    if (width <= 0.0) {
+        width = CGRectGetWidth(bounds);
+    }
+    NSString *edge = MFRingEdge();
+    BOOL verticalEdge = !([edge isEqualToString:@"top"] || [edge isEqualToString:@"bottom"]);
+    CGFloat along = verticalEdge ? CGRectGetHeight(bounds) : CGRectGetWidth(bounds);
+    if (along <= 0.0) {
+        along = verticalEdge ? 932.0 : 430.0;
+    }
+
+    CGFloat rawLength = MFRingNumber(@"mfTriggerLength", 0.0);
+    CGFloat currentLength = rawLength > 0.0 ? MAX(80.0, rawLength) : MAX(80.0, along * 0.30);
+    currentLength = MIN(currentLength, along);
+    CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
+    CGFloat margin = MIN(MAX(MFRingNumber(@"mfTriggerTouchMargin", 60.0), 0.0), 90.0);
+
+    // 触发条高亮预览（在 App 之上、面板之下；只做显示，不接触摸）
+    UIView *preview = [[UIView alloc] initWithFrame:CGRectZero];
+    preview.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
+    preview.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+    preview.layer.borderWidth = 1.0;
+    preview.layer.cornerRadius = 6.0;
+    preview.userInteractionEnabled = NO;
+    [panel insertSubview:preview atIndex:0];
+    self.triggerPreviewView = preview;
+
+    self.triggerValueLabels = [NSMutableArray array];
+    NSArray<NSString *> *titles = @[ @"触发条长度", @"上下位置", @"呼出灵敏度" ];
+    NSArray<NSNumber *> *mins = @[ @(60.0), @(0.05), @(0.0) ];
+    NSArray<NSNumber *> *maxs = @[ @(MAX(160.0, along * 0.55)), @(0.95), @(90.0) ];
+    NSArray<NSNumber *> *values = @[ @(currentLength), @(centerRatio), @(margin) ];
+    for (NSUInteger index = 0; index < titles.count; index++) {
+        CGFloat rowY = top + (CGFloat)index * 32.0;
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(18.0, rowY, 76.0, 30.0)];
+        name.text = titles[index];
+        name.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+        name.font = [UIFont systemFontOfSize:12.0];
+        [panel addSubview:name];
+
+        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(96.0, rowY + 3.0,
+                                                                     MAX(80.0, width - 96.0 - 92.0), 24.0)];
+        slider.minimumValue = mins[index].floatValue;
+        slider.maximumValue = maxs[index].floatValue;
+        slider.value = values[index].floatValue;
+        slider.tag = (NSInteger)index + 1;
+        slider.minimumTrackTintColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+        [slider addTarget:self action:@selector(onTriggerSliderChanged:)
+         forControlEvents:UIControlEventValueChanged];
+        [panel addSubview:slider];
+
+        UILabel *value = [[UILabel alloc] initWithFrame:CGRectMake(width - 84.0, rowY, 66.0, 30.0)];
+        value.textAlignment = NSTextAlignmentRight;
+        value.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+        value.font = [UIFont systemFontOfSize:11.0];
+        [panel addSubview:value];
+        [self.triggerValueLabels addObject:value];
+    }
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(18.0, top + 3.0 * 32.0 - 2.0, width - 36.0, 16.0)];
+    hint.text = @"白色高亮 = 屏幕边缘的呼出触发条；调整立即生效并保存（不用 respring）";
+    hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.5];
+    hint.font = [UIFont systemFontOfSize:10.5];
+    [panel addSubview:hint];
+
+    [self refreshTriggerGeometryAfterPrefsChange];   // 同时刷新预览位置 + 数值标签
+}
+
+- (void)onTriggerSliderChanged:(UISlider *)slider {
+    switch (slider.tag) {
+        case 1:
+            MFRingSetNumber(@"mfTriggerLength", slider.value);
+            break;
+        case 2:
+            MFRingSetNumber(@"mfTriggerCenterRatio", slider.value);
+            break;
+        case 3:
+            MFRingSetNumber(@"mfTriggerTouchMargin", slider.value);
+            break;
+        default:
+            break;
+    }
+    [self refreshTriggerGeometryAfterPrefsChange];
+}
+
+/// 按当前配置重算触发带，并把高亮预览摆到新位置（宿主尺寸没变也要走 —— 这里不用缓存比较）。
+- (void)refreshTriggerGeometryAfterPrefsChange {
+    UIWindow *window = self.hostWindow;
+    if (window == nil) {
+        return;
+    }
+    CGRect bounds = window.bounds;
+    if (CGRectIsEmpty(bounds)) {
+        return;
+    }
+    self.hostBounds = bounds;
+    self.triggerFrame = [self triggerFrameForBounds:bounds];
+    if (self.stripView != nil) {
+        self.stripView.frame = bounds;
+    }
+    if (self.triggerPreviewView != nil) {
+        self.triggerPreviewView.frame =
+            [self.triggerPreviewView.superview convertRect:self.triggerFrame fromView:window];
+    }
+    [self syncTriggerValueLabels];
+    MFLog(@"[ring] 触发条已更新：%@（长度 %.0fpt / 位置比例 %.2f / 灵敏度外扩 %.0fpt）",
+          NSStringFromCGRect(self.triggerFrame),
+          CGRectGetHeight(self.triggerFrame) > 0 ? CGRectGetHeight(self.triggerFrame) : CGRectGetWidth(self.triggerFrame),
+          MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95),
+          MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0)));
+}
+
+- (void)syncTriggerValueLabels {
+    if (self.triggerValueLabels.count < 3) {
+        return;
+    }
+    CGRect band = self.triggerFrame;
+    CGFloat length = CGRectGetHeight(band) > 0 && CGRectGetWidth(band) <= 64.0
+        ? CGRectGetHeight(band) : CGRectGetWidth(band);
+    self.triggerValueLabels[0].text = [NSString stringWithFormat:@"%.0f pt", length];
+    self.triggerValueLabels[1].text = [NSString stringWithFormat:@"%.0f%%",
+        MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95) * 100.0];
+    self.triggerValueLabels[2].text = [NSString stringWithFormat:@"%.0f pt",
+        MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0))];
 }
 
 /// 分批（每轮 8 个）抓取编辑器图标。闸门逐批 arm/disarm，任何一批崩了下次进降级模式。
@@ -2573,6 +2733,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorCountLabel = nil;
     self.editorSelection = nil;
     self.editorCells = nil;
+    self.triggerPreviewView = nil;    // 【0.3.22】触发条预览随面板一起收
+    self.triggerValueLabels = nil;
     [panel removeFromSuperview];
 }
 
@@ -2895,6 +3057,13 @@ BOOL MFRingWantsSystemGestureSummon(void) {
 /// hook 回调入口①b：触点是否在"配置的贴边触发带"内或临带 60pt 内。
 /// 只有边缘手势才接管 —— 手势起自屏幕中部时一律放行，系统手势（回桌面/多任务）不受影响。
 /// point 是窗口坐标（locationInView:nil）；宿主与 POXWindow 同为全屏同原点，直接比即可。
+///
+/// 【0.3.22 血泪 log31】0.3.21 用 `CGRectInset(band, -60, -60)` —— **两条轴都外扩**：
+/// 触发条只占右缘 y=587..867，但沿边方向也被撑到 527..927，于是"屏幕右侧中段（y≈530~590）
+/// 也能呼出圆盘"，用户左滑返回时极易误触（log31：`系统手势呼出（触点 367,710）` 与
+/// `距最近屏边 10pt 带内=是` 都在这一带）。
+/// 现在只外扩**垂直于边**的那一条轴，沿边方向严格等于触发条本身：
+/// 触发条多长/在哪，就只在那个范围能呼出（长度/位置可在编辑器里用滑杆自调）。
 BOOL MFRingPointNearTriggerEdge(CGPoint point) {
     @try {
         MFRingPicker *picker = [MFRingPicker shared];
@@ -2902,7 +3071,15 @@ BOOL MFRingPointNearTriggerEdge(CGPoint point) {
         if (CGRectIsEmpty(band)) {
             return NO;
         }
-        return CGRectContainsPoint(CGRectInset(band, -60.0, -60.0), point);
+        NSString *edge = MFRingEdge();
+        CGFloat margin = MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0));
+        CGRect gate = band;
+        if ([edge isEqualToString:@"left"] || [edge isEqualToString:@"right"]) {
+            gate = CGRectInset(band, -margin, 0.0);   // 只向屏内扩，纵向不扩
+        } else {
+            gate = CGRectInset(band, 0.0, -margin);   // 上/下边：只向屏内扩，横向不扩
+        }
+        return CGRectContainsPoint(gate, point);
     } @catch (NSException *exception) {
         (void)exception;
         return NO;
