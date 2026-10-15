@@ -2,6 +2,20 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.9 核心改动 ============================
+//  ① **全屏 App 内圆盘交互修复（log14 实证）**：0.2.8 后全屏呼出/固定都成功，
+//     但"只能选择右侧部分图标、且要二次点击才打开"。两个根因：
+//     a) 悬停选择只靠"呼出那次触摸"驱动（onStripPan 收不到、边缘识别器只盖边缘区），
+//        展开容器自己**没有**任何手势驱动悬停 —— 中屏触摸只走按钮"直接点击"，
+//        滑动手势完全无效 ⇒ 离右缘远的图标全都没反应；
+//     b) 选中要靠呼出拖动的残留 + 再补一次真实点按 = 用户说的"需要二次点击"。
+//     修法：**给展开容器挂一个悬停平移手势**（cancelsTouchesInView=YES）：
+//     · 点按图标 → 手势保持 Possible，按钮照常 TouchUpInside =「直接点击」打开；
+//     · 拖动（无论起点在圆盘哪里）→ 手势 Began → 按钮触摸被取消（不会误开），
+//       驱动 跟随/停靠/悬停选中/松手打开 —— 与呼出路径完全无关，
+//       **触摸能落到圆盘哪里，哪里就能交互**（桌面/全屏同一套）。
+//     这同时恢复了"呼出后用新触摸长距离拖动圆盘"的能力。
+//
 //  ============================ 0.2.8 核心改动 ============================
 //  ① **边缘手势呼出后圆盘"卡死"修复（log13 实证）**：
 //     0.2.7 边缘手势**注册与呼出全部成功**（6 次呼出全中），但呼出后圆盘既不能跟随
@@ -1042,6 +1056,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (CGRect)triggerFrameForBounds:(CGRect)bounds;
 - (BOOL)pointBelongsToPullOverHandle:(CGPoint)point;
 - (void)onStripPan:(UIPanGestureRecognizer *)gesture;
+- (void)onRingHoverPan:(UIPanGestureRecognizer *)gesture;
 - (void)onStripLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)showAtPoint:(CGPoint)point;
 - (void)moveRingToPoint:(CGPoint)point;
@@ -1271,7 +1286,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.8 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.9 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1561,6 +1576,57 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
+#pragma mark - 展开态悬停手势（0.2.9）
+
+/// 挂在展开容器上的平移手势：**任何**落到圆盘/容器上的触摸都从这里驱动交互。
+/// 与呼出路径（onStripPan: / mfEdgeSlid:）完全无关 —— log14 实证全屏 App 里
+/// 呼出触摸结束后就再没有任何东西能驱动悬停 ⇒ 离右缘远的图标全部没法选。
+///   · 点按：手势不动（Possible），按钮 TouchUpInside 照常「直接点击」打开；
+///   · 拖动：Began 起取消按钮触摸（不误开），驱动 跟随→停靠→悬停→松手打开/收起。
+- (void)onRingHoverPan:(UIPanGestureRecognizer *)gesture {
+    @try {
+        UIWindow *window = self.hostWindow;
+        if (window == nil || !self.expanded) {
+            return;
+        }
+        CGPoint finger = [gesture locationInView:window];
+        if (!isfinite(finger.x) || !isfinite(finger.y)) {
+            return;
+        }
+        self.lastFingerPoint = finger;
+
+        if (gesture.state == UIGestureRecognizerStateChanged) {
+            if (!self.ringLatched) {
+                [self moveRingToPoint:finger];
+                CGFloat tolerance = MAX(12.0, MFRingNumber(@"mfRingLatchTolerance", 72.0));
+                if (hypot(finger.x - self.parkCenter.x, finger.y - self.parkCenter.y) <= tolerance) {
+                    [self latchToParkAnimated:YES];
+                } else {
+                    [self scheduleSettle];
+                }
+            }
+            [self updateSelectionForPoint:finger];
+            return;
+        }
+        if (gesture.state == UIGestureRecognizerStateEnded) {
+            [self updateSelectionForPoint:finger];
+            UIButton *selected = self.selectedButton;
+            NSString *bundleId = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
+            if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
+                MFLog(@"[ring] 悬停松手 -> 打开 %@ 浮窗", bundleId);
+                [self hide];
+                [self openFloatWithBundleId:bundleId];
+            }
+            // 未选中：不在这里收起 —— 点空白（容器 touchesEnded）已负责收起，
+            // 拖空松手保持圆盘开着，用户可继续点按。
+            return;
+        }
+        // Began / Cancelled / Failed：不做事
+    } @catch (NSException *hoverException) {
+        MFLog(@"[ring] !! 悬停手势异常：%@", hoverException);
+    }
+}
+
 #pragma mark - 应用编辑器入口（长按触发条）
 
 /// 长按贴边触发条 → 打开「选择圆盘应用」编辑器。
@@ -1642,11 +1708,22 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         container.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];   // 轻遮罩
         container.opaque = NO;
         container.userInteractionEnabled = YES;
+        // 【0.2.9】悬停平移手势：展开后**任何**落在容器上的触摸都能驱动交互 ——
+        //   点按 = 手势保持 Possible，按钮照常「直接点击」打开；
+        //   拖动 = 手势 Began（默认 cancelsTouchesInView=YES 会取消按钮触摸，不误开），
+        //          驱动 跟随/停靠/悬停/松手打开。log14 实证：全屏 App 里没有它，
+        //          只有呼出那次触摸能驱动悬停 ⇒ 离右缘远的图标全部没反应。
+        UIPanGestureRecognizer *hoverPan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onRingHoverPan:)];
+        hoverPan.cancelsTouchesInView = YES;
+        hoverPan.delaysTouchesBegan = NO;
+        hoverPan.delaysTouchesEnded = NO;
+        [container addGestureRecognizer:hoverPan];
         // 【0.2.3】挂到"宿主容器"（状态栏窗口时是覆盖层）—— 这样才能在全屏 App 之上显示
         UIView *hostContainer = self.hostContainerView ?: self.hostWindow;
         [hostContainer addSubview:container];
         self.container = container;
-        MFLog(@"[ring] <<< 建容器 ok");
+        MFLog(@"[ring] <<< 建容器 ok（0.2.9 悬停手势已挂）");
 
         MFLog(@"[ring] >>> 建圆盘");
         [self buildRingInContainer:container];
@@ -2857,27 +2934,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.2.8 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.2.9 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.2.8 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.9 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.2.8 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.2.9 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.2.8 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.9 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.2.8 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.9 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -2913,7 +2990,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.2.8 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.2.9 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
