@@ -42,13 +42,17 @@
 #import <objc/message.h>
 #include <stdlib.h>
 #define HANDLE_EDGE_GAP 5
-// 【0.3.13】浮窗手势区：底部整条边=自由移动 / 左右侧=点击停靠；【0.3.19】缩放改 Stheno 式双指捏合
+// 【0.3.13】浮窗手势区：底部整条边=自由移动 / 左右侧=点击停靠；【0.3.21】底带右端=滑动缩放
 #define MF_CARD_EDGE_HOTZONE_WIDTH 20.0     // 【0.3.19】卡外热区带宽度（pt，用户指定 20）
-#define MF_CARD_EDGE_DOCK_SCALE 0.75        // 【0.3.19】侧边停靠档位（无用户档位时）
+#define MF_CARD_EDGE_DOCK_SCALE 0.50        // 【0.3.21】侧边停靠=**固定小窗档位**（用户 log30：吸附固定一个小窗尺寸）
 #define MF_CARD_EDGE_SCALE_MIN 0.5          // 手动缩放下限
-#define MF_CARD_EDGE_SCALE_MAX 1.0          // 【0.3.19】手动缩放上限（Stheno 式捏合）
+#define MF_CARD_EDGE_SCALE_MAX 1.0          // 手动缩放上限
+#define MF_CARD_EDGE_SCALE_SNAP_A 0.5       // 【0.3.21】滑动缩放松手吸附档（用户档位不变）
+#define MF_CARD_EDGE_SCALE_SNAP_B 0.75
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
+#define MF_CARD_EDGE_CORNER_SCALE_WIDTH 84.0     // 【0.3.21】底带右端"滑动缩放"区宽度（pt）
+#define MF_CARD_EDGE_SCALE_DRAG_SPAN 220.0       // 【0.3.21】对角位移 220pt ≈ 缩放一整个档位
 #define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部移动热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12    // 左侧点击热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13   // 右侧点击热区带
@@ -287,17 +291,20 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfEdgeBandHost;             // 热区带宿主（frame=卡rect外扩20，hitTest 只认带子、空隙透传）
     UIView *mfEdgeBandLeft;             // 左带：点击=停靠左
     UIView *mfEdgeBandRight;            // 右带：点击=停靠右
-    UIView *mfEdgeBandBottom;           // 底带：pan=自由移动
+    UIView *mfEdgeBandBottom;           // 底带：pan=自由移动（左段）
+    UIView *mfEdgeBandBottomRight;      // 【0.3.21】底带右端：pan=滑动缩放（替代双指捏合）
     UIView *mfEdgeBandTop;              // 顶带：点击=关闭
-    UIPinchGestureRecognizer *mfCardPinchRecognizer;  // 【0.3.19】捏合挂宿主（双指落在任意带上均可触发）
-    NSInteger mfEdgeDragMode;           // 0=无 1=自由移动 2=捏合缩放
+    UIView *mfDockedTapView;            // 【0.3.21】停靠态盖在小窗上的透明层：单击=还原停靠前尺寸，拖动=移动小窗
+    NSInteger mfEdgeDragMode;           // 0=无 1=自由移动 2=滑动缩放
     NSInteger mfDockedSide;             // 【0.3.20】停靠边：0=未停靠 −1=停靠左 1=停靠右（"再点同侧=还原"只认它）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
     CGFloat mfEdgeDragStartX;           // 【0.3.13】自由移动起点（卡片 origin.x）
-    CGFloat mfEdgeDragStartScale;       // 捏合缩放起点
+    CGFloat mfEdgeDragStartScale;       // 滑动缩放/捏合缩放起点
     CGFloat mfUserCardScaleOverride;    // >0 = 用户手动缩放档位（键盘弹出/面板关闭时清除）
+    CGFloat mfPreDockScale;             // 【0.3.21】停靠前缩放档位（点小窗还原用；1.0=满尺寸）
+    CGRect mfPreDockFrame;              // 【0.3.21】停靠前内容坐标 frame（点小窗还原用）
     BOOL mfManualScaleAnchorRight;      // 【0.3.19】手动缩放锚点：NO=左上角（默认，用户指定） YES=右上角（右侧停靠）
     UIView *handleVisualHandoffSnapshotView;
     NSUInteger handleVisualHandoffGeneration;
@@ -2575,12 +2582,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return NO;
 }
 
-// 【0.3.19】捏合缩放的动态失败依赖：其他识别器（App 内容的滚动 pan 等）必须等捏合先判负。
-// 单指滚动：捏合双指才可能 Began → 立即 Failed → 滚动照常；双指捏合：捏合 Began → 滚动被挡。
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
-    shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    return gestureRecognizer == mfCardPinchRecognizer;
-}
+// 【0.3.21】双指捏合已废弃（用户 log30：改成右下角滑动缩放），不再需要"捏合先判负"的动态失败依赖。
 
 -(BOOL)canUseDirectScaledProgrammaticCloseAnimation{
     return panelState == POPanelStateOpen &&
@@ -2747,8 +2749,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 #pragma mark - 【0.3.19】浮窗卡外热区带（移动/停靠/缩放/关闭全在卡外 20pt 环带）
 
 /// 【0.3.19 重做（log28 用户指令）】所有手势操作都在悬浮窗外紧贴边缘的 20pt 环带上：
-///   左带 = 点击停靠左；右带 = 点击停靠右；底带 = pan 自由移动；顶带 = 点击关闭；
-///   缩放 = 双指捏合（识别器挂宿主，双指落在任意带上都能凑成一次捏合）。
+///   左带 = 点击停靠左；右带 = 点击停靠右；底带左段 = pan 自由移动；底带右端 = pan 滑动缩放；
+///   顶带 = 点击关闭；停靠态 = 小窗上盖一层透明层（单击还原 / 拖动移动）。
 /// 【0.3.19 血泪 log28】0.3.13~0.3.19 把热区塞在 keyboardZoomContainer 里（卡片内侧），
 /// 被 App 内容视图整层压死：`移动热区按下` 全程只触发过 1 次、捏合 0 次，
 /// 所有"生效"的功能（左右停靠/上方关闭）全是 backdrop 点击——卡内触摸根本到不了热区。
@@ -2762,10 +2764,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     mfEdgeBandHost = [[MFEdgeBandHostView alloc] initWithFrame:CGRectZero];
     mfEdgeBandHost.backgroundColor = [UIColor clearColor];
     mfEdgeBandHost.userInteractionEnabled = YES;
-    mfEdgeBandLeft   = [[UIView alloc] initWithFrame:CGRectZero];
-    mfEdgeBandRight  = [[UIView alloc] initWithFrame:CGRectZero];
-    mfEdgeBandBottom = [[UIView alloc] initWithFrame:CGRectZero];
-    mfEdgeBandTop    = [[UIView alloc] initWithFrame:CGRectZero];
+    mfEdgeBandLeft        = [[UIView alloc] initWithFrame:CGRectZero];
+    mfEdgeBandRight       = [[UIView alloc] initWithFrame:CGRectZero];
+    mfEdgeBandBottom      = [[UIView alloc] initWithFrame:CGRectZero];
+    mfEdgeBandBottomRight = [[UIView alloc] initWithFrame:CGRectZero];   // 【0.3.21】滑动缩放区（在底带之上）
+    mfEdgeBandTop         = [[UIView alloc] initWithFrame:CGRectZero];
+    mfDockedTapView       = [[UIView alloc] initWithFrame:CGRectZero];   // 【0.3.21】停靠态小窗盖层
     NSDictionary<NSString *, UIView *> *bands =
         @{ @"left"  : mfEdgeBandLeft,  @"right" : mfEdgeBandRight,
            @"bottom": mfEdgeBandBottom, @"top"   : mfEdgeBandTop };
@@ -2789,14 +2793,27 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         [mfEdgeBandHost addSubview:band];
     }];
-    // 捏合挂宿主：带子都是宿主子视图，双指落在任意带（甚至一指左带一指右带）都能凑成捏合
-    mfCardPinchRecognizer = [[UIPinchGestureRecognizer alloc]
-        initWithTarget:self action:@selector(mfCardPinch:)];
-    mfCardPinchRecognizer.delegate = self;
-    [mfEdgeBandHost addGestureRecognizer:mfCardPinchRecognizer];
+    // 【0.3.21】底带右端 = 滑动缩放区（用户 log30：双指捏合太麻烦，改成右下角滑动缩放）。
+    // 独立子视图 + 独立 pan（与底带移动 pan 不会互抢）；mfUpdateEdgeBands 里被 bringSubviewToFront 压在最上层。
+    mfEdgeBandBottomRight.translatesAutoresizingMaskIntoConstraints = YES;
+    mfEdgeBandBottomRight.userInteractionEnabled = YES;
+    mfEdgeBandBottomRight.backgroundColor = [UIColor clearColor];
+    [mfEdgeBandBottomRight addGestureRecognizer:[[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(mfCardCornerScalePan:)]];
+    [mfEdgeBandHost addSubview:mfEdgeBandBottomRight];
+    // 【0.3.21】停靠态盖层：小窗本体收不到我们的触摸（内容层是 App 的场景层），
+    // 只有在本窗口顶层再盖一层才接得住"点小窗还原"；显示期间（仅停靠态）才 hidden=NO。
+    mfDockedTapView.translatesAutoresizingMaskIntoConstraints = YES;
+    mfDockedTapView.userInteractionEnabled = YES;
+    mfDockedTapView.backgroundColor = [UIColor clearColor];
+    [mfDockedTapView addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(mfDockedCardTap:)]];
+    [mfDockedTapView addGestureRecognizer:[[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(mfCardMovePan:)]];
+    [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.3.20 卡外热区带已安装（20pt 环带：左右=停靠 底=移动 顶=关闭 捏合=宿主）");
+    MFLog(@"[card] 0.3.21 卡外热区带已安装（20pt 环带：左右=停靠 底左=移动 底右=缩放 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -2835,9 +2852,23 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     };
     leftBand = clip(leftBand); rightBand = clip(rightBand);
     bottomBand = clip(bottomBand); topBand = clip(topBand);
+    // 【0.3.21】底带右端 = 滑动缩放区（贴卡片右下角外侧）。小窗（停靠）态宽度不足时
+    // 至少给移动留一半，避免小窗整条底带都变成缩放。
+    CGFloat scaleZoneWidth = MF_CARD_EDGE_CORNER_SCALE_WIDTH;
+    CGFloat cardW = CGRectGetWidth(cardRect);
+    if (cardW < scaleZoneWidth * 2.0) {
+        scaleZoneWidth = MAX(52.0, cardW * 0.5);
+    }
+    CGRect scaleZone = clip(CGRectMake(CGRectGetMaxX(cardRect) - scaleZoneWidth,
+                                       CGRectGetMaxY(cardRect), scaleZoneWidth, w20));
+    // 【0.3.21】停靠态盖层：正好盖住小窗本体（点击=还原停靠前尺寸，拖动=移动小窗）
+    CGRect dockedOverlay = CGRectIntersection(cardRect, viewBounds);
+    BOOL dockedOverlayVisible = mfDockedSide != 0 && !CGRectIsNull(dockedOverlay) &&
+        dockedOverlay.size.width > 1.0 && dockedOverlay.size.height > 1.0;
     CGRect hostRect = cardRect;
     for (NSValue *bandValue in @[ [NSValue valueWithCGRect:leftBand], [NSValue valueWithCGRect:rightBand],
-                                  [NSValue valueWithCGRect:bottomBand], [NSValue valueWithCGRect:topBand] ]) {
+                                  [NSValue valueWithCGRect:bottomBand], [NSValue valueWithCGRect:topBand],
+                                  [NSValue valueWithCGRect:scaleZone] ]) {
         CGRect r = [bandValue CGRectValue];
         if (CGRectIsNull(r)) {
             continue;
@@ -2853,12 +2884,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         : [self.view convertRect:bottomBand toView:mfEdgeBandHost];
     mfEdgeBandTop.frame    = CGRectIsNull(topBand)    ? CGRectZero
         : [self.view convertRect:topBand toView:mfEdgeBandHost];
+    mfEdgeBandBottomRight.frame = CGRectIsNull(scaleZone) ? CGRectZero
+        : [self.view convertRect:scaleZone toView:mfEdgeBandHost];
+    mfDockedTapView.frame = dockedOverlayVisible
+        ? [self.view convertRect:dockedOverlay toView:mfEdgeBandHost] : CGRectZero;
     mfEdgeBandLeft.hidden   = CGRectIsNull(leftBand);
     mfEdgeBandRight.hidden  = CGRectIsNull(rightBand);
     mfEdgeBandBottom.hidden = CGRectIsNull(bottomBand);
     mfEdgeBandTop.hidden    = CGRectIsNull(topBand);
+    mfEdgeBandBottomRight.hidden = CGRectIsNull(scaleZone);
+    mfDockedTapView.hidden  = !dockedOverlayVisible;
     mfEdgeBandHost.hidden = NO;
     [self.view bringSubviewToFront:mfEdgeBandHost];
+    // 缩放区压住底带、停靠盖层压住全部（盖层只在小窗内部，不与带子重叠）
+    [mfEdgeBandHost bringSubviewToFront:mfEdgeBandBottomRight];
+    [mfEdgeBandHost bringSubviewToFront:mfDockedTapView];
 }
 
 /// 【0.3.19】顶带点击 = 关闭浮窗（原生"点空白关闭"已被分区逻辑接管，这里是贴卡顶的专用关闭带）
@@ -2975,19 +3015,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 /// 【0.3.13】底部热区：pan 自由移动（X+Y 跟手，松手停在哪就是哪，不吸附）。
+/// 【0.3.21 血泪 log30】底带 pan 的 `按下/开始/结束` 三行落在**同一毫秒**、且全程没有
+/// `跟手首帧` ⇒ Changed 一次都没进来（begin 后立刻 end，位移(0,0)），用户感知"底部手势失效"。
+/// 本版：① 删掉 Changed 里的 `numberOfTouches>=2` 早退（捏合已移除，这是最可能的元凶）；
+///        ② 加触点数诊断；③ 松手时若从未进过 Changed 但总位移非零 → 按总位移补一次移动。
 -(void)mfCardMovePan:(UIPanGestureRecognizer *)pan{
     if (pan.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[card] 移动热区按下 canDrag=%d", [self mfCanDragCardEdgeNow]);
+        MFLog(@"[card] 移动热区按下 canDrag=%d 触点数=%lu mode=%ld",
+              [self mfCanDragCardEdgeNow], (unsigned long)pan.numberOfTouches, (long)mfEdgeDragMode);
         if (![self mfCanDragCardEdgeNow]) {
             pan.enabled = NO;
             pan.enabled = YES;
             return;
         }
-        // 【0.3.20】双指落在底带 = 用户要捏合缩放，不是移动 → 让位（否则拖拽与缩放同抢 baseFrame）
-        if (pan.numberOfTouches >= 2) {
-            MFLog(@"[card] 底带按下但双指在场 → 让位给捏合缩放");
-            pan.enabled = NO;
-            pan.enabled = YES;
+        if (mfEdgeDragMode != 0) {   // 已有手势在跑（例如同时在缩放）→ 让位
+            MFLog(@"[card] 移动热区按下 → 让位（mode=%ld 已占用）", (long)mfEdgeDragMode);
             return;
         }
         [self cancelAutoNubTimer];
@@ -3007,15 +3049,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         if (mfEdgeDragMode != 1) {
             return;
         }
-        if (pan.numberOfTouches >= 2) {   // 中途落下第二指 → 交给捏合
-            return;
-        }
         CGPoint t = [pan translationInView:self.view];
         // 【0.3.20 诊断】每次拖动的第一帧打一行，用来区分"Changed 到底有没有到"
         // 与"到了但被钳制压回原处"（log29 只有首尾两行、位移恒为 0，无法区分这两种真因）
         if (!mfEdgeDragLoggedChanged) {
             mfEdgeDragLoggedChanged = YES;
-            MFLog(@"[card] 自由移动跟手首帧 位移(%.0f,%.0f)", t.x, t.y);
+            MFLog(@"[card] 自由移动跟手首帧 位移(%.1f,%.1f) 触点数=%lu",
+                  t.x, t.y, (unsigned long)pan.numberOfTouches);
         }
         [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + t.y
                                  originX:mfEdgeDragStartX + t.x];
@@ -3031,6 +3071,15 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         CGPoint endTranslation = [pan translationInView:self.view];
         if (pan.state == UIGestureRecognizerStateEnded) {
+            // 【0.3.21】从未进过 Changed 但总位移非零（log30 的"Began 后同毫秒 End"）→ 补一次移动，
+            // 让"拖动只报首尾两帧"的手势也能生效。
+            if (!mfEdgeDragLoggedChanged &&
+                (fabs(endTranslation.x) > 0.5 || fabs(endTranslation.y) > 0.5)) {
+                MFLog(@"[card] 自由移动：全程无 Changed，按总位移补一次(%.1f,%.1f)", 
+                      endTranslation.x, endTranslation.y);
+                [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + endTranslation.y
+                                         originX:mfEdgeDragStartX + endTranslation.x];
+            }
             CGFloat endScreenX = CGRectGetMinX(keyboardZoomBaseFrame) - [self mfCardScrollOffsetX];
             CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
             CGFloat cardRight = endScreenX + cardWidth;
@@ -3046,7 +3095,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 [self close];
                 return;
             }
-            MFLog(@"[card] 自由移动结束（位移(%.0f,%.0f) 屏x=%.0f 底边 %.0f，不吸附）",
+            MFLog(@"[card] 自由移动结束（位移(%.1f,%.1f) 屏x=%.0f 底边 %.0f，不吸附）",
                   endTranslation.x, endTranslation.y,
                   endScreenX, CGRectGetMaxY(keyboardZoomBaseFrame));
         }
@@ -3055,50 +3104,114 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
 }
 
-/// 【0.3.13】右下角热区：pan 对角线缩放（用户指定：向左上滑 = 缩小，向右下滑 = 放大）。
+/// 【0.3.21 重做（用户 log30 指令）】缩放 = **右下角滑动缩放**（双指捏合太麻烦，废弃）。
+/// 区域 = 底带右端 84pt（mfEdgeBandBottomRight，独立子视图 + 独立 pan）。
+/// 映射沿用 0.3.13 用户指定：向左/上（对角）滑 = 缩小，向右/下 = 放大；对角位移 220pt ≈ 一整个档位。
+/// 缩放锚点：右侧停靠时保持右上锚（右缘贴着屏缘不动），其余保持左上锚（用户指定：左上角不动）。
 /// 松手吸附 0.5 / 0.75 / 1.0 最近档。
-/// 【0.3.19】Stheno 式双指捏合缩放（替代 0.3.13 角拖缩放，用户指令）：
-/// 双指捏合实时跟手（start × pinch.scale），钳制 [0.5, 1.0]，松手吸 0.5/0.75/1.0 最近档。
-/// 识别器挂在**卡外热区带宿主**（mfEdgeBandHost）上：双指落在卡片四周任意一条 20pt 带上都能凑成一次捏合。
--(void)mfCardPinch:(UIPinchGestureRecognizer *)pinch{
-    if (pinch.state == UIGestureRecognizerStateBegan) {
-        MFLog(@"[card] 捏合缩放按下 canDrag=%d", [self mfCanDragCardEdgeNow]);
+-(void)mfCardCornerScalePan:(UIPanGestureRecognizer *)pan{
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        MFLog(@"[card] 右下角缩放按下 canDrag=%d 触点数=%lu mode=%ld",
+              [self mfCanDragCardEdgeNow], (unsigned long)pan.numberOfTouches, (long)mfEdgeDragMode);
         if (![self mfCanDragCardEdgeNow]) {
-            pinch.enabled = NO;
-            pinch.enabled = YES;
+            pan.enabled = NO;
+            pan.enabled = YES;
+            return;
+        }
+        if (mfEdgeDragMode != 0) {   // 已有手势在跑 → 让位
+            MFLog(@"[card] 右下角缩放按下 → 让位（mode=%ld 已占用）", (long)mfEdgeDragMode);
             return;
         }
         [self cancelAutoNubTimer];
         mfEdgeDragMode = 2;
+        mfEdgeDragLoggedChanged = NO;
         mfEdgeDragStartScale = (appliedCardScale > 0 && isfinite(appliedCardScale))
             ? appliedCardScale : 1.0;
-        MFLog(@"[card] 捏合缩放开始（起点 %.2f）", mfEdgeDragStartScale);
+        MFLog(@"[card] 右下角缩放开始（起点 %.2f，锚=%@）",
+              mfEdgeDragStartScale, mfDockedSide == 1 ? @"右上" : @"左上");
         return;
     }
-    if (pinch.state == UIGestureRecognizerStateChanged) {
-        if (mfEdgeDragMode != 2 || pinch.numberOfTouches < 2) {
-            return;
-        }
-        CGFloat target = mfEdgeDragStartScale * pinch.scale;
-        target = MIN(MAX(target, MF_CARD_EDGE_SCALE_MIN), MF_CARD_EDGE_SCALE_MAX);
-        if (fabs(target - appliedCardScale) > PO_CARD_SCALE_EPSILON) {
-            [self applyCardScaleTarget:target animated:NO source:POCardScaleTransitionSourceHandle];
-        }
-        return;
-    }
-    if (pinch.state == UIGestureRecognizerStateEnded ||
-        pinch.state == UIGestureRecognizerStateCancelled ||
-        pinch.state == UIGestureRecognizerStateFailed) {
-        // 【0.3.20】只清自己那一档（mode==2），别踩到自由移动
+    if (pan.state == UIGestureRecognizerStateChanged) {
         if (mfEdgeDragMode != 2) {
             return;
         }
-        if (pinch.state == UIGestureRecognizerStateEnded) {
+        CGPoint t = [pan translationInView:self.view];
+        if (!mfEdgeDragLoggedChanged) {
+            mfEdgeDragLoggedChanged = YES;
+            MFLog(@"[card] 右下角缩放跟手首帧 位移(%.1f,%.1f)", t.x, t.y);
+        }
+        [self mfApplyCornerScaleDragTranslation:t];
+        return;
+    }
+    if (pan.state == UIGestureRecognizerStateEnded ||
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+        if (mfEdgeDragMode != 2) {
+            return;
+        }
+        if (pan.state == UIGestureRecognizerStateEnded) {
+            // 补最后一帧（log30 实证：短促手势可能只有 Began→Ended，没有 Changed）
+            [self mfApplyCornerScaleDragTranslation:[pan translationInView:self.view]];
             [self mfSnapCardScaleAnimated:YES];
         }
         mfEdgeDragMode = 0;
         [self resetAutoNubTimer];
     }
+}
+
+/// 【0.3.21】右下角缩放跟手：对角位移 → 档位（向右下=放大 / 向左上=缩小），实时钳制 [0.5, 1.0]。
+-(void)mfApplyCornerScaleDragTranslation:(CGPoint)translation{
+    CGFloat delta = (translation.x + translation.y) / 2.0;   // 对角
+    CGFloat target = mfEdgeDragStartScale + delta / MF_CARD_EDGE_SCALE_DRAG_SPAN;
+    target = MIN(MAX(target, MF_CARD_EDGE_SCALE_MIN), MF_CARD_EDGE_SCALE_MAX);
+    if (fabs(target - appliedCardScale) <= PO_CARD_SCALE_EPSILON) {
+        return;
+    }
+    mfManualScaleAnchorRight = (mfDockedSide == 1);   // 右停靠 → 右缘不动；其余 → 左上角不动
+    [self applyCardScaleTarget:target animated:NO source:POCardScaleTransitionSourceHandle];
+}
+
+/// 【0.3.21】停靠态：点小窗 → 还原停靠前的尺寸与位置（用户 log30 指令）。
+-(void)mfDockedCardTap:(UITapGestureRecognizer *)tap{
+    if (![self mfCanDragCardEdgeNow] || mfDockedSide == 0) {
+        return;
+    }
+    MFLog(@"[card] 点小窗（盖层）→ 还原停靠前尺寸（停靠边=%ld）", (long)mfDockedSide);
+    [self mfRestoreFromDock];
+}
+
+/// 【0.3.21】从停靠态还原：把停靠前记录的 frame/档位写回去（缺记录时退回"满尺寸 + 标准打开位"）。
+-(void)mfRestoreFromDock{
+    if (mfDockedSide == 0) {
+        return;   // 未停靠 → 不处理
+    }
+    NSInteger fromSide = mfDockedSide;
+    CGFloat restoreScale = (mfPreDockScale > PO_CARD_SCALE_EPSILON) ? mfPreDockScale : 1.0;
+    if (fabs(restoreScale - 1.0) <= PO_CARD_SCALE_EPSILON) {
+        restoreScale = 1.0;
+    }
+    CGRect restoreFrame = mfPreDockFrame;
+    CGFloat currentScreenX = CGRectGetMinX(keyboardZoomBaseFrame) - [self mfCardScrollOffsetX];
+    mfDockedSide = 0;
+    mfEdgeDragMode = 0;
+    mfUserCardScaleOverride = (restoreScale >= 1.0 - PO_CARD_SCALE_EPSILON) ? 0.0 : restoreScale;
+    mfManualScaleAnchorRight = NO;
+    if (CGRectIsEmpty(restoreFrame)) {
+        restoreFrame = keyboardZoomBaseFrame;
+        restoreFrame.origin.x = CGRectGetWidth(self.view.bounds);   // normalCardFrame 同款（内容坐标）
+    }
+    keyboardZoomBaseFrame = restoreFrame;
+    portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(restoreFrame) + HANDLE_EDGE_GAP;
+    mfUserCardPositionPinned = YES;
+    [self cancelAutoNubTimer];
+    [self applyCardScaleTarget:restoreScale animated:YES source:POCardScaleTransitionSourceHandle];
+    [self updatePortraitHostedLandscapeHandleForCurrentOffset];
+    [self syncHorizontalQuickSwitchPresentationAnchor];
+    [self mfUpdateVerticalHandleRailPosition];
+    [self mfUpdateEdgeBands];
+    MFLog(@"[card] 停靠还原：%@侧 → 尺寸 %.2f（屏x %.0f -> %.0f，底边 %.0f）",
+          fromSide == 1 ? @"右" : @"左", restoreScale, currentScreenX,
+          CGRectGetMinX(restoreFrame) - [self mfCardScrollOffsetX], CGRectGetMaxY(restoreFrame));
 }
 
 /// 【0.3.19】左/右侧热区：点击停靠到该侧（已停靠该侧再点=还原满尺寸）。
@@ -3110,8 +3223,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 
 /// 【0.3.19 重做（log25）】侧边停靠——幂等、可预测：
-///   点/停靠某侧 = 卡片缩到停靠档位并贴向该侧（右=右上锚、左=左上锚），仅此而已。
-///   已停靠在该侧再点一次 = 还原满尺寸并回到上游标准打开位（取消停靠的唯一入口）。
+///   点/停靠某侧 = 卡片缩到**固定小窗档位**（0.5）并贴向该侧（右=右上锚、左=左上锚），仅此而已。
+///   已停靠在该侧再点一次 = 还原**停靠前的尺寸与位置**（或直接点小窗，见 mfRestoreFromDock）。
 ///   【0.3.19 血泪 log25】0.3.14 的"锚翻转"与 0.3.13 遗留的"<8pt 目标翻转"两套逻辑叠加，
 ///   每次点击方向随机横跳（日志实锤：`屏x 90 -> 5，右侧`、`屏x 5 -> 90，左侧` 标签与目标脱节），
 ///   用户连点手柄 → 卡片左右乱跳"像被手柄回收"。本版删除全部翻转逻辑。
@@ -3122,34 +3235,27 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     mfUserCardPositionPinned = YES;   // 【0.3.20】停靠过 → 布局 passe 不得把卡片拉回标准打开位
     [self cancelAutoNubTimer];
-    BOOL dockedNow = fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON;
-    // 已停靠在**同一侧**再点 → 还原满尺寸 + 回上游标准打开位（内容 x = 屏宽，屏 x≈47 居中）
-    // 【0.3.20】"是否已停靠"只认 mfDockedSide（0.3.19 借用 mfManualScaleAnchorRight，
-    // 于是"手动捏合缩到 0.5 但没停靠"的卡片点左带会被当成"取消停靠左"直接还原，语义串味）。
+    // "是否已停靠该侧"只认 mfDockedSide（0.3.19 借用 mfManualScaleAnchorRight，
+    // 于是"手动缩到 0.5 但没停靠"的卡片点左带会被当成"取消停靠左"直接还原，语义串味）。
     NSInteger sideFlag = toRight ? 1 : -1;
-    if (dockedNow && mfDockedSide == sideFlag) {
-        CGFloat restoreX = CGRectGetWidth(self.view.bounds);   // normalCardFrame 同款（内容坐标）
-        CGFloat currentContentX = CGRectGetMinX(keyboardZoomBaseFrame);
-        CGRect targetFrame = keyboardZoomBaseFrame;
-        targetFrame.origin.x = restoreX;
-        keyboardZoomBaseFrame = targetFrame;
-        mfUserCardScaleOverride = 0;
-        mfDockedSide = 0;
-        MFLog(@"[card] 取消停靠（%@侧再点）→ 还原满尺寸（内容x %.0f -> %.0f）",
-              toRight ? @"右" : @"左", currentContentX, restoreX);
-        [self applyCardScaleTarget:1.0 animated:YES source:POCardScaleTransitionSourceHandle];
-        [self updatePortraitHostedLandscapeHandleForCurrentOffset];
-        [self syncHorizontalQuickSwitchPresentationAnchor];
-        [self mfUpdateVerticalHandleRailPosition];
+    if (mfDockedSide == sideFlag) {
+        // 【0.3.21】同侧再点 = 还原**停靠前的尺寸与位置**（0.3.20 是还原满尺寸 + 标准打开位，
+        // 与"点小窗还原"语义不一致；现在统一走 mfRestoreFromDock）
+        MFLog(@"[card] 取消停靠（%@侧再点）→ 还原停靠前尺寸", toRight ? @"右" : @"左");
+        [self mfRestoreFromDock];
         return;
     }
-    CGFloat dockScale = (mfUserCardScaleOverride > PO_CARD_SCALE_EPSILON &&
-                         fabs(mfUserCardScaleOverride - 1.0) > PO_CARD_SCALE_EPSILON)
-        ? mfUserCardScaleOverride            // 用户已手动缩放过 → 沿用其档位
-        : MF_CARD_EDGE_DOCK_SCALE;           // 默认 0.75
+    // 【0.3.21】停靠 = **固定小窗尺寸**（用户 log30：吸附时固定一个小窗尺寸，0.75 太大）。
+    // 不再沿用 mfUserCardScaleOverride：停靠档位与手动缩放档位互不干扰。
+    CGFloat dockScale = MF_CARD_EDGE_DOCK_SCALE;
     CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
     if (cardWidth <= 0) {
         return;
+    }
+    // 【0.3.21】记录停靠前的尺寸/位置（点小窗还原用）。已在停靠态换边时不覆盖。
+    if (mfDockedSide == 0) {
+        mfPreDockScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+        mfPreDockFrame = keyboardZoomBaseFrame;
     }
     CGFloat offsetX = [self mfCardScrollOffsetX];
     CGFloat minX = [self mfCardScreenMinX];
@@ -3179,12 +3285,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     // 不动的竖边（屏幕 x）：右停靠 = 整宽 frame 右缘；左停靠 = 整宽 frame 左缘
     CGFloat fixedEdgeX = toRight ? (targetScreenX + cardWidth) : targetScreenX;
     MFLog(@"[card] 侧边停靠：屏x %.0f -> %.0f，%@侧（scale %.2f，锚=%@，内容x=%.0f，offset=%.0f，"
-          @"固定边x=%.0f，缩放后可见 x=%.0f..%.0f）",
+          @"固定边x=%.0f，缩放后可见 x=%.0f..%.0f，停靠前尺寸 %.2f）",
           currentScreenX, targetScreenX, toRight ? @"右" : @"左",
           dockScale, toRight ? @"右上" : @"左上",
           targetFrame.origin.x, offsetX, fixedEdgeX,
           toRight ? fixedEdgeX - cardWidth * dockScale : fixedEdgeX,
-          toRight ? fixedEdgeX : fixedEdgeX + cardWidth * dockScale);
+          toRight ? fixedEdgeX : fixedEdgeX + cardWidth * dockScale,
+          mfPreDockScale);
     // 【0.3.19 自愈】log28 实证：停靠指令执行后卡片实际位置与期望不符（截图=大部分在屏外），
     // 且期间有别的代码动了容器。0.35s 后（动画已完成）核对"实际屏幕矩形 vs 期望矩形"，
     // 不符 → 打两条日志并强制重施一次停靠（无动画）。
@@ -3219,9 +3326,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 /// 松手吸附（缩放）：弹到 0.5 / 0.75 / 1.0 中最近的一档（弹簧动画）。
 /// 非 1.0 档记入 mfUserCardScaleOverride，键盘弹出/面板关闭时自动清除。
+/// 【0.3.21】吸附回满尺寸（1.0）时清掉停靠标记（已经不是"小窗"了，盖层要撤）。
 -(void)mfSnapCardScaleAnimated:(BOOL)animated{
     CGFloat current = appliedCardScale > 0 && isfinite(appliedCardScale) ? appliedCardScale : 1.0;
-    const CGFloat steps[3] = { MF_CARD_EDGE_SCALE_MIN, 0.75, 1.0 };
+    const CGFloat steps[3] = { MF_CARD_EDGE_SCALE_SNAP_A, MF_CARD_EDGE_SCALE_SNAP_B, 1.0 };
     CGFloat best = 1.0;
     CGFloat bestDistance = CGFLOAT_MAX;
     for (int i = 0; i < 3; i++) {
@@ -3232,8 +3340,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
     }
     mfUserCardScaleOverride = best >= 1.0 - PO_CARD_SCALE_EPSILON ? 0.0 : best;
+    if (best >= 1.0 - PO_CARD_SCALE_EPSILON) {
+        mfDockedSide = 0;   // 回到满尺寸 = 不再是小窗
+    } else if (mfDockedSide != 0) {
+        mfManualScaleAnchorRight = (mfDockedSide == 1);   // 停靠态缩放保持贴边锚
+    }
     [self applyCardScaleTarget:best animated:animated source:POCardScaleTransitionSourceHandle];
-    MFLog(@"[card] 缩放吸附：%.2f -> %.2f（override=%g）", current, best, mfUserCardScaleOverride);
+    MFLog(@"[card] 缩放吸附：%.2f -> %.2f（override=%g，停靠边=%ld）",
+          current, best, mfUserCardScaleOverride, (long)mfDockedSide);
 }
 
 #pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧
