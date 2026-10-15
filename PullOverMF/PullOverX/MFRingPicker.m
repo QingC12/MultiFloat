@@ -2,7 +2,7 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
-//  ============================ 0.4.10 核心改动（用户 log38）============================
+//  ============================ 0.4.11 核心改动（用户 log38）============================
 //  用户原话："关于添加arc功能，按照方案A推进，可以只添加截屏和翻译"（另有一条 bug：
 //  "我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小" ——
 //  那条在 PullOverViewController.m 的 applyLayoutPreservingHandlePosition: 里修）。
@@ -448,7 +448,7 @@
 #import "PullOverViewController.h"
 #import "POHandle.h"
 #import "POApplicationHelper.h"
-#import "MFSystemActions.h"   // 【0.4.10】圆盘系统动作（截屏 / 翻译）
+#import "MFSystemActions.h"   // 【0.4.11】圆盘系统动作（截屏 / 翻译）
 
 #define MF_RING_GUARD_PATH   "/var/mobile/PullOverMF.ringguard"
 
@@ -828,7 +828,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEd
     [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"name"] localizedStandardCompare:b[@"name"]];
     }];
-    // 【0.4.10 用户 log38】系统动作（截屏 / 翻译）**置顶**展示 —— 它们不是"已安装 App"，
+    // 【0.4.11 用户 log38】系统动作（截屏 / 翻译）**置顶**展示 —— 它们不是"已安装 App"，
     //   不参与上面的中文名排序；伪 bundleID（mfsys.*）与真 App 不冲突，可以直接混着勾选。
     NSArray<NSDictionary<NSString *, NSString *> *> *systemActions = MFSystemActionEditorEntries();
     if (systemActions.count > 0) {
@@ -871,7 +871,7 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (!MFRingIsUsableBundleId(bundleId)) {
         return nil;
     }
-    // 【0.4.10】系统动作（mfsys.*）：图标是 SF Symbol 自绘的，**不查任何 SB / 图标缓存**。
+    // 【0.4.11】系统动作（mfsys.*）：图标是 SF Symbol 自绘的，**不查任何 SB / 图标缓存**。
     //   与真 App 图标共用同一个缓存字典（key 是伪 bundleID，天然不冲突）。
     if (MFSystemActionIsActionId(bundleId)) {
         UIImage *cachedAction = MFRingIconCache()[bundleId];
@@ -3616,7 +3616,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 #pragma mark 打开浮窗
 
 - (void)openFloatWithBundleId:(NSString *)bundleId {
-    // 【0.4.10 用户 log38】系统动作（mfsys.screenshot / mfsys.translate）：
+    // 【0.4.11 用户 log38】系统动作（mfsys.screenshot / mfsys.translate）：
     //   所有"打开"入口（点图标 / 悬停松手 / 贴边松手）最终都汇聚到本方法，所以只在这里
     //   拦一次就全覆盖了。动作交给 MFSystemActions 执行 —— **不 pin App、不开浮窗**；
     //   延后 0.35s 是因为调用方都已经先 `hide` 了（收起动画 0.22s），不能把圆盘截进图里。
