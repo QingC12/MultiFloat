@@ -288,6 +288,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UITapGestureRecognizer *panelBackdropTapGestureRecognizer;
     UIPanGestureRecognizer *panelBackdropPanGestureRecognizer;
     UIView *shadowView;
+    UIView *mfCardGlowView;             // 【0.4.15】边框光圈：暗色背景下一圈淡白柔光（Stheno/TrollOpen 同款）
     UIView *keyboardZoomContainer;
     UIView *cantHostCanvas;
     UIImageView *cantHostIconView;
@@ -556,6 +557,18 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     shadowView.layer.shadowOpacity = 0;
     shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds cornerRadius:MFPanelCornerRadius()].CGPath;
     [keyboardZoomContainer addSubview:shadowView];
+    // 【0.4.15 用户】暗黑模式/黑色背景下边框看不清 → 一圈很淡的白色柔光勾边（不要太明显）。
+    //   独立于 shadowView（那是拖动"抬起"的黑色投影，颜色/语义都不同）；白色光在浅背景上
+    //   自然隐没，深背景上刚好把边框衬出来。
+    UIView *glow = [[UIView alloc] initWithFrame:keyboardZoomContainer.bounds];
+    glow.backgroundColor = [UIColor clearColor];
+    glow.userInteractionEnabled = NO;
+    glow.layer.shadowColor = [UIColor whiteColor].CGColor;
+    glow.layer.shadowOffset = CGSizeZero;
+    glow.layer.shadowRadius = 10.0;
+    glow.layer.shadowOpacity = 0.20;
+    mfCardGlowView = glow;
+    [keyboardZoomContainer addSubview:glow];
 
     [keyboardZoomContainer addSubview:self.contentView];
 
@@ -693,6 +706,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
                                                           cornerRadius:radius].CGPath;
+    // 【0.4.15】光圈与卡片同框同圆角（frame/path 一起随几何刷）
+    if (mfCardGlowView != nil) {
+        mfCardGlowView.frame = keyboardZoomContainer.bounds;
+        mfCardGlowView.layer.shadowPath =
+            [UIBezierPath bezierPathWithRoundedRect:mfCardGlowView.bounds
+                                       cornerRadius:radius].CGPath;
+    }
 }
 
 /// 卡片当前"视觉"矩形（屏幕坐标）：把缩放变换算进去。
@@ -2038,7 +2058,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         CGFloat manualScale = [self mfLatchedManualCardScale];
         if (manualScale > 0.0) {
-            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.14 缩放保持·收口）",
+            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.15 缩放保持·收口）",
                   (long)source, manualScale);
             targetScale = manualScale;
             targetIsBase = NO;
@@ -2211,7 +2231,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (manualScale > 0.0) {
         // 【0.4.12】同上：这是 log39"缩放被弹回默认"的收口点
         [self applyCardScaleTarget:manualScale animated:NO source:POCardScaleTransitionSourceReconcile];
-        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.14 缩放保持）", manualScale);
+        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.15 缩放保持）", manualScale);
         return;
     }
     [self applyCardScaleTarget:1.0 animated:NO source:POCardScaleTransitionSourceReconcile];
@@ -3551,16 +3571,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         if (mfEdgeDragMode == 2) {
             // 【0.3.23】缩放收尾：补最后一帧再吸附（短促手势可能只有 Began→Ended，没有 Changed）
             if (pan.state == UIGestureRecognizerStateEnded) {
-                // 【0.4.14】点击判定（Stheno RightCornerTrim 实证：「右角::点击切换基础窗口比例」）：
-                //   全程 <0.5s 且累计位移 <10pt = 点击 → 瘦/胖两档切换；否则照旧滑动缩放收尾。
+                // 【0.4.15 用户 log40】点击判定放宽：0.4.14 的「<0.5s 且 <10pt」全被拒——
+                //   log40 实证用户的"点击"实际带 10~36pt 漂移、按 0.3~1.0s（角把手在卡缘，指腹必蹭）。
+                //   改为「<1.2s 且 <24pt」；命中时先把点击期间的微缩放漂移撤回（位移归零=回到起点档位）
+                //   再切胖屏，避免"点一下顺手改了大小"。
                 NSTimeInterval held = CACurrentMediaTime() - mfEdgeDragBeganAt;
                 CGFloat travel = hypot(endTranslation.x, endTranslation.y);
-                if (held < 0.5 && travel < 10.0) {
+                if (held < 1.2 && travel < 24.0) {
                     mfEdgeDragMode = 0;
                     [self resetAutoNubTimer];
+                    [self mfApplyCornerScaleDragTranslation:CGPointZero];   // 撤回漂移 → 起点档位
                     [self mfToggleCardFatModeAnimated:YES];
+                    MFLog(@"[card] 右下角点击判定命中（%.2fs / %.1fpt）→ 切胖屏", held, travel);
                     return;
                 }
+                MFLog(@"[card] 右下角按拖动收尾（%.2fs / %.1fpt）", held, travel);
                 [self mfApplyCornerScaleDragTranslation:endTranslation];
                 [self mfSnapCardScaleAnimated:YES];
             }
