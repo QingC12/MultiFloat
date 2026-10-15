@@ -2,6 +2,18 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.11 核心改动 ============================
+//  ① **全屏"松手即打开"攻坚（log16 + 用户硬性要求：全屏操作逻辑必须和桌面一样）**：
+//     log16 实证桌面已完美（20+ 条悬停流、松手即开），但全屏悬停事件稀疏、
+//     松手常无选中。用户观察到决定性线索：**拖着圆盘时全屏 App 页面也跟着滚动** ——
+//     0.2.8 给边缘识别器设的 `cancelsTouchesInView=NO` 让系统把触摸**同时**喂给
+//     前台 App（App 滚动 = 触摸被分流），我们这边的识别器事件流被饿死。
+//     修法：改回 **cancelsTouchesInView=YES**（识别器 Began 即独占触摸：
+//     App 不再滚动、事件流完整 —— triggr 默认值，iOS 15~18 实证无此问题）。
+//     桌面不受影响：长按编辑器靠"静止按下识别器 Possible 不拦截"；
+//     触发条 pan 与边缘识别器双驱动本就幂等。
+//  ② mfEdgeSlid: 增加 Began / Cancelled / Failed 诊断日志（下轮若仍有问题直接点名）。
+//
 //  ============================ 0.2.10 核心改动 ============================
 //  ① **"松手即打开"可靠性修复（log15 实证 + 用户：全屏要和桌面一个逻辑，松手自动打开）**：
 //     全屏下"悬停选中 → 几十毫秒后悬停离开 → 松手未选中收起"的元凶是
@@ -1297,7 +1309,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.10 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.11 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -2911,12 +2923,22 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
                 [picker hide];
                 [picker openFloatWithBundleId:bundleId];
             } else {
-                MFLog(@"[ring] 手指离开屏幕 -> 未选中，收起圆盘");
+                MFLog(@"[ring] 手指离开屏幕 -> 未选中，收起圆盘（松手点 %.0f,%.0f）", location.x, location.y);
                 [picker hide];
             }
             return;
         }
-        // Began / Cancelled：不做事（点空白收起由容器自己兜底）
+        // 【0.2.11】诊断：Began / Cancelled / Failed 各记一行 —— 全屏事件流若再出问题，
+        // 日志直接点名是"没开始"还是"被系统半路取消"
+        if (state == UIGestureRecognizerStateBegan) {
+            MFLog(@"[ring][edge] 手势开始（%.0f,%.0f）", location.x, location.y);
+        } else if (state == UIGestureRecognizerStateCancelled ||
+                   state == UIGestureRecognizerStateFailed) {
+            MFLog(@"[ring][edge] !! 手势被%@（%.0f,%.0f）",
+                  (state == UIGestureRecognizerStateCancelled ? @"系统取消" : @"识别失败"),
+                  location.x, location.y);
+        }
+        // Began / Cancelled / Failed：不改变圆盘状态（点空白收起由容器自己兜底）
     } @catch (NSException *edgeException) {
         (void)edgeException;   // 失败放行
     }
@@ -2952,27 +2974,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.2.10 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.2.11 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.2.10 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.11 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.2.10 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.2.11 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.2.10 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.11 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.2.10 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.11 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -2997,9 +3019,12 @@ void MFRingInstallEdgePanGesture(void) {
         recognizer.edges = edge;
         recognizer.minimumNumberOfTouches = 1;
         recognizer.maximumNumberOfTouches = 1;
-        // 【0.2.8】尽量不干扰别的触摸接收者：不取消视图的触摸、不延迟触摸起点
-        // （桌面旧触发条的长按编辑器入口靠静止按下 —— 识别器 Possible 时不拦截）
-        recognizer.cancelsTouchesInView = NO;
+        // 【0.2.11】cancelsTouchesInView 必须为 YES（UIGestureRecognizer 默认值）：
+        //   0.2.8 设 NO 的代价（log16 实证）= 系统把触摸同时喂给前台 App —— 用户拖着
+        //   圆盘、App 页面跟着滚，我们的识别器事件流被饿死 ⇒ 全屏悬停稀疏、松手无选中。
+        //   YES = 识别器 Began 即独占触摸：App 不滚、事件流完整（triggr 默认同款）。
+        //   delaysTouchesBegan 保持 NO：桌面长按编辑器入口靠静止按下（Possible 不拦截）。
+        recognizer.cancelsTouchesInView = YES;
         recognizer.delaysTouchesBegan = NO;
         recognizer.delaysTouchesEnded = NO;
         if ([recognizer respondsToSelector:@selector(_setEdgeRegionSize:)]) {
@@ -3008,7 +3033,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.2.10 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.2.11 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
