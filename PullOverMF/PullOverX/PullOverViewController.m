@@ -4,6 +4,19 @@
 //
 //  Created by Will Smillie on 4/8/19.
 //
+//  ============================ 0.4.9 修复（用户 log38）============================
+//  用户原话："我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小"。
+//  【根因】`applyLayoutPreservingHandlePosition:` 干了两件互相打架的事：
+//    ① 方法**开头**无条件 `appliedCardScale = 1.0`（抹掉当前缩放倍率）；
+//    ② 方法**末尾**想"把缩放重施回去"，判断条件却正是 `fabs(appliedCardScale - 1.0) > eps`
+//       ⇒ 因为①刚把它置成 1.0，条件**恒不成立** ⇒ 那段从来没执行过（死代码）。
+//        （与铁律 5 里 0.3.20 停靠那条同款陷阱：写守卫前先确认它依赖的变量真会被置成非默认值。）
+//  【触发路径】App 内点二级菜单 ⇒ 页面/分栏变化改变 safe area ⇒
+//    `viewSafeAreaInsetsDidChange`（**没有尺寸守卫**，每次 safe area 变化都会全量重排）⇒
+//    布局 passe ⇒ 缩放被抹掉 ⇒ 卡片弹回默认大小（位置因为有 `mfUserCardPositionPinned` 才没丢）。
+//  【修法】开头先把重排前的倍率存进局部量 `preservedCardScale`，末尾按"用户手动档位
+//    (`mfUserCardScaleOverride`) > 重排前倍率"的优先级重施；停靠态/关闭态不重施。
+//
 //  ============================ 0.3.13 核心改动（log22 + 用户指定新手势方案）============================
 //  【log22 实证】0.3.12 四边热区全通（top/bottom/left/right 热区 frame 正常、edge=1/3 均按下），
 //  但体验差：①移动只能直上直下（卡片 727 高占屏 932，Y 钳制区间仅 ~48pt）；②左右 22pt 窄条
@@ -2989,7 +3002,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.4.8 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.4.9 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3926,6 +3939,16 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         scrollView.dragging || scrollView.decelerating || scrollSnapAnimationInProgress ||
         handlePanIntent != POHandlePanIntentNone;
 
+    // 【0.4.9 用户 log38】布局重排**绝不能丢用户手动缩放的倍率**。
+    //   用户实测："调好窗口大小后，点 App 内某个二级菜单 ⇒ 浮窗弹回默认大小"。
+    //   根因：下面那句无条件 `appliedCardScale = 1.0` 把倍率抹掉，而方法末尾那句"重施缩放"的
+    //   判断条件恰好就是 `appliedCardScale != 1.0` ⇒ **永远为假（死代码）**（与铁律 5 里
+    //   0.3.20 停靠那条是同款陷阱）。触发路径：App 内 push 页面/切换分栏会改变 safe area
+    //   或容器尺寸 ⇒ `viewSafeAreaInsetsDidChange`（无尺寸守卫）→ 全量重排 → 缩放丢失。
+    //   这里先把"重排前实际生效的倍率"存下来，末尾按它（或用户档位）重施。
+    CGFloat preservedCardScale = (isfinite(appliedCardScale) && appliedCardScale > 0)
+        ? appliedCardScale
+        : 1.0;
     keyboardZoomGeneration += 1;
     [keyboardZoomContainer.layer removeAllAnimations];
     [handleScrollView.layer removeAllAnimations];
@@ -4131,10 +4154,28 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self.contentView.frame = keyboardZoomContainer.bounds;
         [self mfApplyCardCornerChrome];   // 【0.3.24】圆角随卡宽自适应
     }];
-    // 【0.3.20】上面把 transform 打回 Identity 了：若当前是缩放/停靠态，按新 baseFrame 重算缩放锚，
-    // 否则布局 passe 一来，停靠态卡片会"视觉上弹回满尺寸"。
-    if (fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON) {
-        [self applyCardScaleTarget:appliedCardScale animated:NO source:POCardScaleTransitionSourceReconcile];
+    // 【0.3.20 / 0.4.9】上面把 transform 打回 Identity 了：若是缩放态，按新 baseFrame 重算缩放锚**重施**，
+    // 否则布局 passe 一来卡片就"视觉上弹回满尺寸"。
+    //   ★ 0.3.20 写的判断是 `fabs(appliedCardScale - 1.0) > eps`，但 appliedCardScale 在本方法开头
+    //     刚被置成 1.0 ⇒ 恒不成立、从来没执行过（死代码）—— 这正是"点二级菜单弹回默认大小"的根因。
+    //   倍率来源（按优先级）：
+    //     ① `mfUserCardScaleOverride` = 用户手动缩放档位（权威；停靠/关面板/键盘弹出时会被清零）；
+    //     ② `preservedCardScale` = 本次重排前实际生效的倍率（键盘自动缩放等其它来源）。
+    CGFloat restoreCardScale = 0.0;
+    if (mfUserCardScaleOverride > 0.0) {
+        restoreCardScale = mfUserCardScaleOverride;
+    } else if (preservedCardScale > 1.0 + PO_CARD_SCALE_EPSILON) {
+        restoreCardScale = preservedCardScale;
+    }
+    if (mfDockedSide == 0 &&                       // 停靠态不是缩放档位（小窗真身由上面分支重建）
+        panelState != POPanelStateClosed &&
+        panelState != POPanelStateClosing &&
+        !keyboardZoomContainer.hidden &&
+        isfinite(restoreCardScale) && restoreCardScale > 0.0 &&
+        fabs(restoreCardScale - 1.0) > PO_CARD_SCALE_EPSILON) {
+        [self applyCardScaleTarget:restoreCardScale animated:NO source:POCardScaleTransitionSourceReconcile];
+        MFLog(@"[card] 布局重排后恢复缩放 %.2f（用户档位 %.2f / 重排前 %.2f）",
+              restoreCardScale, mfUserCardScaleOverride, preservedCardScale);
     }
     CGFloat shadowProgress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * shadowProgress;

@@ -2,6 +2,25 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.4.9 核心改动（用户 log38）============================
+//  用户原话："关于添加arc功能，按照方案A推进，可以只添加截屏和翻译"（另有一条 bug：
+//  "我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小" ——
+//  那条在 PullOverViewController.m 的 applyLayoutPreservingHandlePosition: 里修）。
+//  ① **圆盘支持"系统动作"**（用户选定方案 A = 进程内直调系统私有接口，**零新增 hook**）：
+//     动作的"主人"本来就都在 SpringBoard 里，而本插件也住在 SpringBoard ⇒ 点一下直接调，
+//     延迟为零、开机不受影响（符合"不要在 SpringBoard 里堆 hook"的项目明令）。
+//  ② **动作用伪 bundleID 表示**（前缀 `mfsys.`）：`mfsys.screenshot`（截屏）、
+//     `mfsys.translate`（翻译）。伪 ID 与真 App 的 bundleID 天然不冲突 ⇒ **整套现成机制
+//     原样复用**：编辑器勾选、长按移出、「已添加」排序条调位置、图标贴图缓存、
+//     呼出后悬停选中 —— 一行 UI 都不用另写。实现见 MFSystemActions.m。
+//  ③ 三处接入点（改完就全覆盖）：
+//     · `MFRingIconForBundleId()`：动作图标 = SF Symbol 自绘（带底圆的位图），不查 SB/图标缓存；
+//     · `MFRingInstalledAppsForEditor()`：两个动作**置顶**列在编辑器最前面；
+//     · `openFloatWithBundleId:`：所有"打开"入口（点图标 / 悬停松手 / 贴边松手）都汇聚到这里，
+//       是动作就转 `MFSystemActionPerform`（不 pin App、不开浮窗），否则走原来的浮窗打开。
+//  ④ 动作为什么延后 0.35s：调用方都已先 `hide`（收起动画 0.22s），截图类动作若立即执行
+//     会把正在收起的圆盘截进图里。
+//
 //  ============================ 0.4.2 核心改动（用户 log37）============================
 //  用户原话："为什么这一版不在像之前一样从圆盘触发条那里出现圆盘，然后跟随手指到屏幕中下
 //  中心后固定呢？而是中固定点出现圆盘，我只是说取消跟随手指移动，没有说改变圆盘出现的位置，
@@ -429,6 +448,7 @@
 #import "PullOverViewController.h"
 #import "POHandle.h"
 #import "POApplicationHelper.h"
+#import "MFSystemActions.h"   // 【0.4.9】圆盘系统动作（截屏 / 翻译）
 
 #define MF_RING_GUARD_PATH   "/var/mobile/PullOverMF.ringguard"
 
@@ -808,6 +828,14 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEd
     [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"name"] localizedStandardCompare:b[@"name"]];
     }];
+    // 【0.4.9 用户 log38】系统动作（截屏 / 翻译）**置顶**展示 —— 它们不是"已安装 App"，
+    //   不参与上面的中文名排序；伪 bundleID（mfsys.*）与真 App 不冲突，可以直接混着勾选。
+    NSArray<NSDictionary<NSString *, NSString *> *> *systemActions = MFSystemActionEditorEntries();
+    if (systemActions.count > 0) {
+        [apps insertObjects:systemActions
+                  atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, systemActions.count)]];
+        MFLog(@"[ring] 编辑器已置顶 %lu 个系统动作（截屏 / 翻译）", (unsigned long)systemActions.count);
+    }
     return apps;
 }
 
@@ -842,6 +870,19 @@ static NSMutableDictionary<NSString *, UIImage *> *MFRingIconCache(void) {
 static UIImage *MFRingIconForBundleId(NSString *bundleId) {
     if (!MFRingIsUsableBundleId(bundleId)) {
         return nil;
+    }
+    // 【0.4.9】系统动作（mfsys.*）：图标是 SF Symbol 自绘的，**不查任何 SB / 图标缓存**。
+    //   与真 App 图标共用同一个缓存字典（key 是伪 bundleID，天然不冲突）。
+    if (MFSystemActionIsActionId(bundleId)) {
+        UIImage *cachedAction = MFRingIconCache()[bundleId];
+        if (cachedAction != nil) {
+            return cachedAction;
+        }
+        UIImage *actionIcon = MFSystemActionIcon(bundleId, 72.0);
+        if (actionIcon != nil) {
+            MFRingIconCache()[bundleId] = actionIcon;
+        }
+        return actionIcon;
     }
     UIImage *cached = MFRingIconCache()[bundleId];
     if (cached != nil) {
@@ -3575,6 +3616,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 #pragma mark 打开浮窗
 
 - (void)openFloatWithBundleId:(NSString *)bundleId {
+    // 【0.4.9 用户 log38】系统动作（mfsys.screenshot / mfsys.translate）：
+    //   所有"打开"入口（点图标 / 悬停松手 / 贴边松手）最终都汇聚到本方法，所以只在这里
+    //   拦一次就全覆盖了。动作交给 MFSystemActions 执行 —— **不 pin App、不开浮窗**；
+    //   延后 0.35s 是因为调用方都已经先 `hide` 了（收起动画 0.22s），不能把圆盘截进图里。
+    if (MFSystemActionIsActionId(bundleId)) {
+        MFLog(@"[ring] 系统动作 %@ → 交给系统动作模块执行（圆盘收起后 0.35s 生效）", bundleId);
+        MFSystemActionPerform(bundleId, 0.35);
+        return;
+    }
     @try {
         id sharedWindow = [POXWindow sharedWindow];
         if (![sharedWindow isKindOfClass:[UIWindow class]]) {
