@@ -1154,6 +1154,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (UIView *)hitTestViewForPoint:(CGPoint)point inWindow:(UIWindow *)window;
 - (void)refreshHostGeometryIfNeeded;
 - (CGRect)triggerFrameForBounds:(CGRect)bounds;
+/// 【0.3.23】触发条"外侧边到屏幕边"的距离（应恒为 0 = 贴边），日志核对用
+- (CGFloat)triggerOuterEdgeGapForBounds:(CGRect)bounds;
 - (BOOL)pointBelongsToPullOverHandle:(CGPoint)point;
 - (void)onStripPan:(UIPanGestureRecognizer *)gesture;
 - (void)onRingHoverPan:(UIPanGestureRecognizer *)gesture;
@@ -1411,6 +1413,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                   @"mfTriggerThickness / mfTriggerEdge，或设 mfRingHostWindow=0 退回 PullOver 窗口）",
                   NSStringFromCGRect(self.triggerFrame), NSStringFromCGRect(bounds));
         }
+        // 【0.3.23】贴边核对：外侧边到屏幕边的距离（应恒为 0）
+        MFLog(@"[ring] 触发条贴边核对：外侧边距屏幕边 %.1fpt（0=完全贴合）| 触发条=%@ 宿主=%@ 厚度=%.0fpt",
+              [self triggerOuterEdgeGapForBounds:bounds], NSStringFromCGRect(self.triggerFrame),
+              NSStringFromCGRect(bounds), CGRectGetWidth(self.triggerFrame) > 0 &&
+              CGRectGetWidth(self.triggerFrame) <= 64.0 ? CGRectGetWidth(self.triggerFrame)
+                                                        : CGRectGetHeight(self.triggerFrame));
         // 先算一次内容数量（几何缩放要用它），再打几何 —— 数量少时圆盘会自动变小
         NSUInteger ringCount = MFRingBundleIds().count;
         {
@@ -1530,10 +1538,36 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGFloat originY = MIN(MAX(height * centerRatio - length / 2.0, 0.0), MAX(height - length, 0.0));
     // 只对贴底的那一段做上移（左/右边缘条同样受这条约束）
     originY = MIN(originY, MAX(height - length - bottomInset, 0.0));
+    // 【0.3.23 用户 log32】"触发条没有紧贴屏幕边缘" ⇒ 这里**显式钉死**：厚度只向屏内延伸，
+    //   外侧边恒等于屏幕边（右条：x = width - thickness ⇒ maxX ≡ width；左条：x ≡ 0）。
+    //   用 `MIN/MAX` 兜住极端配置（thickness 比屏宽还大 / 负值），保证结果永远贴边且不越界。
+    CGFloat thicknessClamped = MIN(MAX(thickness, 8.0), ([edge isEqualToString:@"left"] ||
+                                                         [edge isEqualToString:@"right"]
+                                                         ? MAX(width, 8.0) : MAX(height, 8.0)));
     if ([edge isEqualToString:@"left"]) {
-        return CGRectMake(0.0, originY, thickness, length);
+        return CGRectMake(0.0, originY, thicknessClamped, length);            // maxX = thickness，minX ≡ 0（贴左边）
     }
-    return CGRectMake(width - thickness, originY, thickness, length);   // right（默认）
+    return CGRectMake(width - thicknessClamped, originY, thicknessClamped, length);   // minX+厚度 ≡ width（贴右边）
+}
+
+/// 【0.3.23】触发条贴边核对：把"外侧边到屏幕边"的距离算出来（应当恒为 0），
+/// 供日志验证"触发条贴死屏幕边缘"这件事真的成立（用户 log32 提的第 4 条）。
+- (CGFloat)triggerOuterEdgeGapForBounds:(CGRect)bounds {
+    CGRect band = [self triggerFrameForBounds:bounds];
+    if (CGRectIsEmpty(band)) {
+        return 0.0;
+    }
+    NSString *edge = MFRingEdge();
+    if ([edge isEqualToString:@"left"]) {
+        return CGRectGetMinX(band);
+    }
+    if ([edge isEqualToString:@"right"]) {
+        return CGRectGetWidth(bounds) - CGRectGetMaxX(band);
+    }
+    if ([edge isEqualToString:@"top"]) {
+        return CGRectGetMinY(band);
+    }
+    return CGRectGetHeight(bounds) - CGRectGetMaxY(band);
 }
 
 #pragma mark 命中判定（由托管窗口的 hitTest 调用）
@@ -1819,7 +1853,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         MFLog(@"[ring] >>> 建容器");
         MFRingContainerView *container = [[MFRingContainerView alloc] initWithFrame:bounds];
-        container.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];   // 轻遮罩
+        // 【0.3.23 用户 log32】原来这里是 `colorWithWhite:0.0 alpha:0.18` 的"轻遮罩" ——
+        //   那就是用户看到的"呼出圆盘时整个屏幕有一层浅黑色透明层"。圆盘的底盘已经由 dialLayer
+        //   自己画（0.12 白 55% 填充），不需要整屏再压一层黑；而且透明背景**不影响命中判定**
+        //   （UIView 的 hitTest 只看 pointInside/hidden/alpha，与 backgroundColor 无关），
+        //   所以"点空白收起"照旧有效。
+        container.backgroundColor = [UIColor clearColor];
         container.opaque = NO;
         container.userInteractionEnabled = YES;
         // 【0.2.9】悬停平移手势：展开后**任何**落在容器上的触摸都能驱动交互 ——
@@ -1845,22 +1884,33 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.ringRoot.center = [self clampRingCenter:point];
 
-        // 【0.3.0】呼出动画借鉴 Stheno（逆向实证：SwiftUI AnyTransition.scale + opacity +
-        //   spring 弹性，`CustomSpringAnimation`/阻尼系数是其标志）：圆盘从 55% 缩放 + 全透明
-        //   弹性放大到原尺寸 + 淡入。AllowUserInteraction 保证弹出过程中就能跟手/点按。
-        container.alpha = 0.0;
-        container.transform = CGAffineTransformMakeScale(0.55, 0.55);
-        [UIView animateWithDuration:0.45
+        // 【0.3.23 用户 log32】呼出动画重做 —— "从屏幕边缘由小到大"，与 Stheno 一致。
+        //   逆向实证（analysis/stheno-ring-gesture-study.md）：Stheno 用的是 SwiftUI `AnyTransition.scale`
+        //   + opacity + spring 弹性（`CustomSpringAnimation` / `DampingFraction` 就是它的标志），
+        //   而且**只缩放圆盘本体**，整屏不做任何遮罩。
+        //   ★ 0.3.22 及以前是"整屏容器 0.55 缩放 + 整屏 18% 黑遮罩淡入"⇒ 用户看到的是两层不对的东西：
+        //     ① 呼出瞬间**整个屏幕泛起一层浅黑**（那就是 container 的 0.18 黑底）；
+        //     ② 缩放中心在**屏幕正中**，不是从边缘长出来。
+        //   现在：容器保持全透明 + 恒等变换；只把 ringRoot 从 16% 弹性放大到 100%，起点就在呼出点
+        //   （手指/屏幕边缘）⇒ 视觉上就是"从边缘由小到大弹出来"。AllowUserInteraction 保证弹出中即可跟手。
+        container.alpha = 1.0;                       // 【0.3.23】容器不再淡入（它现在全透明）
+        container.transform = CGAffineTransformIdentity;
+        UIView *popRoot = self.ringRoot;
+        popRoot.alpha = 0.0;
+        popRoot.transform = CGAffineTransformMakeScale(0.16, 0.16);
+        [UIView animateWithDuration:0.42
                               delay:0.0
-             usingSpringWithDamping:0.68
-              initialSpringVelocity:0.4
+             usingSpringWithDamping:0.72
+              initialSpringVelocity:0.35
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
                          animations:^{
-            container.alpha = 1.0;
-            container.transform = CGAffineTransformIdentity;
+            popRoot.alpha = 1.0;
+            popRoot.transform = CGAffineTransformIdentity;
         } completion:nil];
+        MFLog(@"[ring] 呼出动画：从边缘(%.0f,%.0f) 由小到大弹出（16%% → 100%%，弹性 0.72，无整屏遮罩）",
+              point.x, point.y);
 
         MFLog(@"[ring] <<< 呼出完成：跟随手指(%.0f,%.0f) -> 停靠点(%.0f,%.0f)",
               point.x, point.y, self.parkCenter.x, self.parkCenter.y);
@@ -1886,6 +1936,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         return;
     }
     UIView *container = self.container;
+    UIView *collapseRoot = self.ringRoot;   // 【0.3.23】收起动画要缩的是圆盘本体（容器现在无背景）
     self.container = nil;
     self.dialLayer = nil;
     self.ringRoot = nil;
@@ -1899,7 +1950,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (container == nil) {
         return;
     }
-    // 【0.3.0】收起 = 缩小 + 淡出（Stheno scale+opacity 反向过渡），干脆利落不拖泥带水
+    // 【0.3.23】收起 = 圆盘本体缩回 + 淡出（与呼出动画对称：也是"从边缘收回"的观感），
+    //   容器本身全透明，只负责在动画结束后把自己摘掉。
     [UIView animateWithDuration:0.18
                           delay:0.0
          usingSpringWithDamping:0.85
@@ -1908,7 +1960,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                                  UIViewAnimationOptionBeginFromCurrentState)
                      animations:^{
         container.alpha = 0.0;
-        container.transform = CGAffineTransformMakeScale(0.7, 0.7);
+        collapseRoot.alpha = 0.0;
+        collapseRoot.transform = CGAffineTransformMakeScale(0.45, 0.45);
     } completion:^(__unused BOOL finished) {
         [container removeFromSuperview];
     }];
@@ -2502,11 +2555,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGFloat margin = MIN(MAX(MFRingNumber(@"mfTriggerTouchMargin", 60.0), 0.0), 90.0);
 
     // 触发条高亮预览（在 App 之上、面板之下；只做显示，不接触摸）
+    // 【0.3.23】用户 log32："触发条没有紧贴右边屏幕边缘"。原来预览是 0.16 白 + 6pt 圆角 + 1pt 边框，
+    //   压在 0.87 黑的面板上几乎看不清，圆角也让人以为"条和屏边之间有缝"⇒ 改成：
+    //   填充加亮、**圆角 0**、边框 2pt，并且**向外多铺 3pt**（越界部分被屏幕自然裁掉）——
+    //   视觉上就明确是"被屏幕边缘切掉的一块"，一眼能看出它贴死在边缘。
     UIView *preview = [[UIView alloc] initWithFrame:CGRectZero];
-    preview.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
-    preview.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
-    preview.layer.borderWidth = 1.0;
-    preview.layer.cornerRadius = 6.0;
+    preview.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.30];
+    preview.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.9].CGColor;
+    preview.layer.borderWidth = 2.0;
+    preview.layer.cornerRadius = 0.0;
     preview.userInteractionEnabled = NO;
     [panel insertSubview:preview atIndex:0];
     self.triggerPreviewView = preview;
@@ -2584,15 +2641,30 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.stripView.frame = bounds;
     }
     if (self.triggerPreviewView != nil) {
+        // 【0.3.23】预览向外多铺 3pt：越界部分被屏幕裁掉 → 视觉上"贴死在边缘、没有缝"
+        CGRect previewRect = self.triggerFrame;
+        NSString *edge = MFRingEdge();
+        if ([edge isEqualToString:@"right"]) {
+            previewRect.size.width += 3.0;
+        } else if ([edge isEqualToString:@"left"]) {
+            previewRect.origin.x -= 3.0;
+            previewRect.size.width += 3.0;
+        } else if ([edge isEqualToString:@"top"]) {
+            previewRect.origin.y -= 3.0;
+            previewRect.size.height += 3.0;
+        } else {
+            previewRect.size.height += 3.0;
+        }
         self.triggerPreviewView.frame =
-            [self.triggerPreviewView.superview convertRect:self.triggerFrame fromView:window];
+            [self.triggerPreviewView.superview convertRect:previewRect fromView:window];
     }
     [self syncTriggerValueLabels];
-    MFLog(@"[ring] 触发条已更新：%@（长度 %.0fpt / 位置比例 %.2f / 灵敏度外扩 %.0fpt）",
+    MFLog(@"[ring] 触发条已更新：%@（长度 %.0fpt / 位置比例 %.2f / 灵敏度外扩 %.0fpt / 外侧边距屏边 %.1fpt）",
           NSStringFromCGRect(self.triggerFrame),
           CGRectGetHeight(self.triggerFrame) > 0 ? CGRectGetHeight(self.triggerFrame) : CGRectGetWidth(self.triggerFrame),
           MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95),
-          MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0)));
+          MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0)),
+          [self triggerOuterEdgeGapForBounds:bounds]);
 }
 
 - (void)syncTriggerValueLabels {
