@@ -69,9 +69,12 @@
 #define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
-#define MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY 1600.0 // 【0.4.17】底带快速上滑关闭的最小速度（pt/s，Stheno「边中快速上滑关闭」）
+#define MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY 1200.0 // 【0.4.18】底带快速上滑关闭的最小速度（pt/s；0.4.17 的 1600 太迟钝，log43 用户点名；移动改"按住后"不再抢手势，可放宽）
 #define MF_CARD_EDGE_FULLSCREEN_DRAG 150.0       // 【0.4.17】底带下拉展开全屏的位移阈值（pt，Stheno「下拉展开」）
 #define MF_CARD_EDGE_FULLSCREEN_VELOCITY 500.0   // 【0.4.17】底带下拉展开全屏的最小下滑速度（pt/s，区分"慢慢挪下去"）
+#define MF_CARD_FAT_TAP_DWELL 1.5                // 【0.4.18 用户 log43】角把手"点击/长按"判定时长：按住 1.5s 内（或按住满 1.5s 不动）即切胖屏
+#define MF_CARD_BOTTOM_ARM_DELAY 0.18            // 【0.4.18 用户 log43】底带"按住后移动"的判定时长：按住 0.18s 且手没在快滑 → 进入移动模式
+#define MF_CARD_BOTTOM_ARM_MAX_VELOCITY 900.0    // 【0.4.18】arm 时刻的速度上限：超过 = 快速滑动（留给上滑关闭/下拉全屏判定，不进移动模式）
 // 【0.4.12 用户 log39】"移动不灵敏 / 缩放太灵敏" —— 两条都对上实证：
 //   · 移动：用户三次按在**卡片底边内侧 1~5pt**（宿主坐标 y=682/685/686，底带起点 687）⇒ 差一点点，
 //     带子没接住（`MFEdgeBandHostView.hitTest` 只认带子子视图，空隙一律透传给 App）。
@@ -390,6 +393,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGRect mfPreFullScreenFrame;        // 【0.4.17】进全屏前的基准 frame（还原用）
     CGRect mfCardFatSavedBaseFrame;     // 【0.4.14】进胖屏前的基准 frame（再点右下角切回时还原）
     CFTimeInterval mfEdgeDragBeganAt;   // 【0.4.14】右下角手势 Began 时刻（区分"点击=切胖屏"与"拖动=缩放"）
+    BOOL mfFatTapDwellFired;            // 【0.4.18】角把手"按住 1.5s 不动自动切胖屏"已触发（不等抬手）
+    CGFloat mfFatTapTravel;             // 【0.4.18】角把手本次手势累计位移（dwell 判定用）
+    BOOL mfBottomMoveArmed;             // 【0.4.18】底带"按住后移动"：armed 后才跟手（快速滑动留给关闭/全屏）
+    CGPoint mfBottomMoveArmTranslation; // 【0.4.18】armed 瞬间的累计位移（移动重定锚基准）
+    NSUInteger mfEdgeGestureToken;      // 【0.4.18】边缘手势代次（dispatch_after 回调防串扰）
     UIView *handleVisualHandoffSnapshotView;
     NSUInteger handleVisualHandoffGeneration;
     BOOL runtimeHostedCategoryTransitionAnimating;
@@ -2759,6 +2767,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         mfManualCardScaleLatched = NO;  // 【0.4.12】同时撤掉"缩放保持"latch（下次打开是新会话）
         mfCardFatMode = NO;             // 【0.4.14】面板关闭 = 胖屏态一并复位（下次打开从默认瘦卡开始）
         mfCardFullScreen = NO;          // 【0.4.17】全屏态同理复位
+        [self mfSyncHostedSceneCanvasForFatMode];   // 【0.4.18】复位后立刻把 scene 画布还原成全屏
         [self restoreKeyboardZoomImmediately];
         // 【0.3.19 血泪 log25】缩放态关闭（performDirectScaledProgrammaticCloseAnimation）
         // 会把手柄 rail center 挪到 handleEndCenter，完成后果链上没人复位——
@@ -3115,7 +3124,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.4.17 卡外热区带已安装（左右=停靠 底=移动·快速上滑关闭·下拉展开全屏 右下角+左下角=缩放/点击切胖屏 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.4.18 卡外热区带已安装（左右=停靠 底=快速上滑关闭·下拉原生打开App·按住0.18s后拖动 右下角+左下角=缩放/按住1.5s切胖屏 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3538,38 +3547,90 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         [self cancelAutoNubTimer];
         mfEdgeDragLoggedChanged = NO;
+        mfEdgeGestureToken += 1;   // 【0.4.18】每段新手势换代次，防 dispatch_after 旧回调串扰
         [self mfSetCardDragLift:YES];   // 【0.3.24】拖动即"抬起"（阴影加深），松手收回
         if (inScaleZone) {
             // ---- 角把手滑动缩放（右下 + 【0.4.16】左下；向内/上 = 缩小，向外/下 = 放大）----
             mfEdgeDragMode = 2;
             mfEdgeDragFromDocked = NO;
             mfEdgeDragBeganAt = CACurrentMediaTime();   // 【0.4.14】点击（短+位移小）= 切胖屏，拖动 = 缩放
+            mfFatTapDwellFired = NO;                    // 【0.4.18】按住 1.5s 不动 → 自动切胖屏（不等抬手）
+            mfFatTapTravel = 0;
             mfEdgeDragStartScale = (appliedCardScale > 0 && isfinite(appliedCardScale))
                 ? appliedCardScale : 1.0;
+            NSUInteger fatToken = mfEdgeGestureToken;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(MF_CARD_FAT_TAP_DWELL * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (fatToken != self->mfEdgeGestureToken || self->mfEdgeDragMode != 2 ||
+                    self->mfFatTapDwellFired) {
+                    return;
+                }
+                if (self->mfFatTapTravel >= 24.0) {
+                    MFLog(@"[card] 角把手按住 %.1fs 但已拖动 %.1fpt → 不判点击（留给缩放）",
+                          MF_CARD_FAT_TAP_DWELL, self->mfFatTapTravel);
+                    return;
+                }
+                self->mfFatTapDwellFired = YES;
+                self->mfEdgeDragMode = 0;
+                [self mfSetCardDragLift:NO];
+                [self resetAutoNubTimer];
+                [self mfApplyCornerScaleDragTranslation:CGPointZero];   // 撤回微漂移 → 起点档位
+                [self mfToggleCardFatModeAnimated:YES];
+                MFLog(@"[card] 角把手按住 %.1fs 未移动 → 直接切胖屏（不用等抬手）",
+                      MF_CARD_FAT_TAP_DWELL);
+            });
             MFLog(@"[card] 角把手缩放开始（起点 %.2f，锚=%@，右区 %@ 左区 %@）",
                   mfEdgeDragStartScale, mfDockedSide == 1 ? @"右上" : @"左上",
                   NSStringFromCGRect(mfEdgeBandBottomRight.frame),
                   NSStringFromCGRect(mfEdgeBandBottomLeft.frame));
             return;
         }
-        // ---- 自由移动 ----
+        // ---- 自由移动（【0.4.18 用户 log43】改"按住后移动"：按住 0.18s 且手没在快滑才跟手；
+        //      快速上滑/下拉不再被移动抢走 —— 这就是上滑"灵敏度不够"的根因）----
         mfEdgeDragMode = 1;
         // 【0.3.22】起手自"停靠小窗盖层"：小位移（< MF_CARD_EDGE_TAP_SLOP）= 用户其实是在点小窗 → 松手时还原。
         mfEdgeDragFromDocked = (mfDockedTapView != nil && !mfDockedTapView.hidden &&
                                 CGRectContainsPoint(mfDockedTapView.frame, p));
+        // 停靠盖层没有上滑/下拉语义 → 立即 armed，移动照旧跟手、点小窗还原不受影响
+        mfBottomMoveArmed = mfEdgeDragFromDocked;
+        mfBottomMoveArmTranslation = CGPointZero;
         mfEdgeDragStartBottomY = CGRectGetMaxY(keyboardZoomBaseFrame);
         mfEdgeDragStartX = CGRectGetMinX(keyboardZoomBaseFrame);
+        NSUInteger moveToken = mfEdgeGestureToken;
+        if (!mfBottomMoveArmed) {
+            UIPanGestureRecognizer *capturedPan = pan;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(MF_CARD_BOTTOM_ARM_DELAY * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (moveToken != self->mfEdgeGestureToken || self->mfEdgeDragMode != 1 ||
+                    self->mfBottomMoveArmed) {
+                    return;
+                }
+                CGPoint v = [capturedPan velocityInView:self.view];
+                if (hypot(v.x, v.y) > MF_CARD_BOTTOM_ARM_MAX_VELOCITY) {
+                    MFLog(@"[card] 底带快速滑动（v %.0f,%.0f）→ 不进入移动模式（留给上滑关闭/下拉全屏）",
+                          v.x, v.y);
+                    return;
+                }
+                self->mfBottomMoveArmed = YES;
+                self->mfBottomMoveArmTranslation = [capturedPan translationInView:self.view];
+                MFLog(@"[card] 底带按住 %.0fms 生效 → 进入移动模式（从当前位置跟手）",
+                      MF_CARD_BOTTOM_ARM_DELAY * 1000.0);
+            });
+        }
         CGFloat rangeMin = 0, rangeMax = 0;
         [self mfCardBottomYRangeMin:&rangeMin max:&rangeMax];
         // 【0.3.19】不再强制 restoreKeyboardZoomImmediately：停靠/缩放态拖动保持当前大小移动
-        MFLog(@"[card] 自由移动开始（起点 屏x=%.0f 内容x=%.0f 底边 %.0f，scale %.2f，Y 可用区间 %.0f..%.0f）",
+        MFLog(@"[card] 自由移动开始（起点 屏x=%.0f 内容x=%.0f 底边 %.0f，scale %.2f，Y 可用区间 %.0f..%.0f，armed=%d）",
               mfEdgeDragStartX - [self mfCardScrollOffsetX], mfEdgeDragStartX,
-              mfEdgeDragStartBottomY, appliedCardScale, rangeMin, rangeMax);
+              mfEdgeDragStartBottomY, appliedCardScale, rangeMin, rangeMax, mfBottomMoveArmed);
         return;
     }
     if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [pan translationInView:self.view];
         if (mfEdgeDragMode == 2) {
+            mfFatTapTravel = hypot(t.x, t.y);   // 【0.4.18】dwell 判定用累计位移
             if (!mfEdgeDragLoggedChanged) {
                 mfEdgeDragLoggedChanged = YES;
                 MFLog(@"[card] 右下角缩放跟手首帧 位移(%.1f,%.1f)", t.x, t.y);
@@ -3580,6 +3641,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         if (mfEdgeDragMode != 1) {
             return;
         }
+        // 【0.4.18 用户 log43】"按住后移动"：未 armed（按住未生效/快速滑动）→ 不跟手
+        if (!mfBottomMoveArmed) {
+            return;
+        }
         // 【0.3.20 诊断】每次拖动的第一帧打一行，用来区分"Changed 到底有没有到"
         // 与"到了但被钳制压回原处"（log29 只有首尾两行、位移恒为 0，无法区分这两种真因）
         if (!mfEdgeDragLoggedChanged) {
@@ -3587,8 +3652,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             MFLog(@"[card] 自由移动跟手首帧 位移(%.1f,%.1f) 触点数=%lu",
                   t.x, t.y, (unsigned long)pan.numberOfTouches);
         }
-        [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + t.y
-                                 originX:mfEdgeDragStartX + t.x];
+        // armed 后从 armed 瞬间的位置起算（重定锚：手指按住期间卡片不动，动的是之后的增量）
+        CGFloat moveX = t.x - mfBottomMoveArmTranslation.x;
+        CGFloat moveY = t.y - mfBottomMoveArmTranslation.y;
+        [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + moveY
+                                 originX:mfEdgeDragStartX + moveX];
         return;
     }
     if (pan.state == UIGestureRecognizerStateEnded ||
@@ -3599,16 +3667,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         if (mfEdgeDragMode == 2) {
             // 【0.3.23】缩放收尾：补最后一帧再吸附（短促手势可能只有 Began→Ended，没有 Changed）
             if (pan.state == UIGestureRecognizerStateEnded) {
-                // 【0.4.15 用户 log40】点击判定放宽：0.4.14 的「<0.5s 且 <10pt」全被拒——
-                //   log40 实证用户的"点击"实际带 10~36pt 漂移、按 0.3~1.0s（角把手在卡缘，指腹必蹭）。
-                //   改为「<1.2s 且 <24pt」；命中时先把点击期间的微缩放漂移撤回（位移归零=回到起点档位）
-                //   再切胖屏，避免"点一下顺手改了大小"。
+                // 【0.4.18 用户 log43】点击/长按判定时长定为 1.5s（用户点名）：dwell 已覆盖
+                //   "按住满 1.5s 不动"，这里只收"按住 <1.5s + 位移 <24pt"的快速点击；
+                //   dwell 触发后 mode 已清零，走不到这。
                 NSTimeInterval held = CACurrentMediaTime() - mfEdgeDragBeganAt;
                 CGFloat travel = hypot(endTranslation.x, endTranslation.y);
-                // 【0.4.17 log42】时长上限 1.2s 仍拒掉了用户的"点击"（实证 2.34s / 8.7pt —— 用户
-                //   实际是"按住一小会"再松手）⇒ 放宽到 3s；主判据 = 位移（<24pt 的"缩放"本身无感，
-                //   归类为点击无副作用；真想微调大小会拖出 24pt 以上）。
-                if (held < 3.0 && travel < 24.0) {
+                if (!mfFatTapDwellFired && held < MF_CARD_FAT_TAP_DWELL && travel < 24.0) {
                     mfEdgeDragMode = 0;
                     [self resetAutoNubTimer];
                     [self mfApplyCornerScaleDragTranslation:CGPointZero];   // 撤回漂移 → 起点档位
@@ -3629,6 +3693,36 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             return;
         }
         if (pan.state == UIGestureRecognizerStateEnded) {
+            CGPoint velocity = [pan velocityInView:self.view];
+            // 【0.4.18 用户 log43】底带改"按住后移动"后的两条路：
+            //   ① 未 armed（快速滑动，按住未满 0.18s / 或 arm 时刻手速超限）→ 只判 flick：
+            //      快速上滑关闭（速度阈值已从 1600 放宽到 1200 —— 移动不再抢手势）；
+            //      下拉 = 原生打开宿主 App（= 从桌面点图标的全屏，不是把卡片撑满）。
+            if (!mfBottomMoveArmed) {
+                if (velocity.y < -MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY && endTranslation.y < 0 &&
+                    fabs(velocity.y) > fabs(velocity.x)) {
+                    MFLog(@"[card] 底带快速上滑 → 关闭浮窗（vy=%.0f 位移(%.1f,%.1f)）",
+                          velocity.y, endTranslation.x, endTranslation.y);
+                    mfEdgeDragMode = 0;
+                    [self resetAutoNubTimer];
+                    [self close];
+                    return;
+                }
+                if (endTranslation.y > MF_CARD_EDGE_FULLSCREEN_DRAG &&
+                    velocity.y > MF_CARD_EDGE_FULLSCREEN_VELOCITY) {
+                    MFLog(@"[card] 底带下拉 → 原生打开宿主 App（位移 y=%.1f vy=%.0f）",
+                          endTranslation.y, velocity.y);
+                    mfEdgeDragMode = 0;
+                    [self resetAutoNubTimer];
+                    [self mfOpenHostedAppNatively];
+                    return;
+                }
+                MFLog(@"[card] 底带快速滑动未命中手势（vy=%.0f 位移y=%.1f）→ 忽略（按住后再拖才会移动）",
+                      velocity.y, endTranslation.y);
+                mfEdgeDragMode = 0;
+                [self resetAutoNubTimer];
+                return;
+            }
             // 【0.3.22】停靠小窗上"手抖式拖动"（位移 < MF_CARD_EDGE_TAP_SLOP）= 用户想点小窗还原 → 还原，不移动
             if (mfEdgeDragFromDocked &&
                 hypot(endTranslation.x, endTranslation.y) < MF_CARD_EDGE_TAP_SLOP) {
@@ -3640,37 +3734,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 [self mfRestoreFromDock];
                 return;
             }
-            CGPoint velocity = [pan velocityInView:self.view];
-            // 【0.4.17 用户 log42】Stheno 同款底带手势（逆向实证：GestureIntroduction「边中区域快速上滑关闭」
-            //   + FullScreenBackGesture/下拉展开）—— 单手不用够屏幕顶部也能关，且能一键全屏：
-            //   ① 快速上滑（速度主判据，向上净位移）→ 关闭浮窗；
-            //   ② 下拉超过阈值且有一定速度（区分"慢慢挪下去"）→ 展开/还原全屏。
-            if (velocity.y < -MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY && endTranslation.y < 0 &&
-                fabs(velocity.y) > fabs(velocity.x)) {
-                MFLog(@"[card] 底带快速上滑 → 关闭浮窗（vy=%.0f 位移(%.1f,%.1f)）",
-                      velocity.y, endTranslation.x, endTranslation.y);
-                mfEdgeDragMode = 0;
-                [self resetAutoNubTimer];
-                [self close];
-                return;
-            }
-            if (endTranslation.y > MF_CARD_EDGE_FULLSCREEN_DRAG &&
-                velocity.y > MF_CARD_EDGE_FULLSCREEN_VELOCITY) {
-                MFLog(@"[card] 底带下拉 → %s全屏（位移 y=%.1f vy=%.0f）",
-                      mfCardFullScreen ? "还原" : "展开", endTranslation.y, velocity.y);
-                mfEdgeDragMode = 0;
-                [self resetAutoNubTimer];
-                [self mfToggleCardFullScreenAnimated:YES];
-                return;
-            }
-            // 【0.3.21】从未进过 Changed 但总位移非零（log30 的"Began 后同毫秒 End"）→ 补一次移动，
-            // 让"拖动只报首尾两帧"的手势也能生效。
+            // armed（按住生效后拖动）→ 正常移动收尾：无 Changed 补一次、甩边关、越界回弹
             if (!mfEdgeDragLoggedChanged &&
-                (fabs(endTranslation.x) > 0.5 || fabs(endTranslation.y) > 0.5)) {
-                MFLog(@"[card] 自由移动：全程无 Changed，按总位移补一次(%.1f,%.1f)", 
-                      endTranslation.x, endTranslation.y);
-                [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + endTranslation.y
-                                         originX:mfEdgeDragStartX + endTranslation.x];
+                (fabs(endTranslation.x - mfBottomMoveArmTranslation.x) > 0.5 ||
+                 fabs(endTranslation.y - mfBottomMoveArmTranslation.y) > 0.5)) {
+                MFLog(@"[card] 自由移动：全程无 Changed，按总位移补一次(%.1f,%.1f)",
+                      endTranslation.x - mfBottomMoveArmTranslation.x,
+                      endTranslation.y - mfBottomMoveArmTranslation.y);
+                [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY +
+                                                 (endTranslation.y - mfBottomMoveArmTranslation.y)
+                                         originX:mfEdgeDragStartX +
+                                                 (endTranslation.x - mfBottomMoveArmTranslation.x)];
             }
             CGFloat endScreenX = CGRectGetMinX(keyboardZoomBaseFrame) - [self mfCardScrollOffsetX];
             CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
@@ -4098,6 +4172,7 @@ static CGFloat MFCardFatAspect(void) {
     mfDockedSide = 0;
     keyboardZoomBaseFrame = toFrame;
     [self applyLayoutPreservingHandlePosition:animated];
+    [self mfSyncHostedSceneCanvasForFatMode];   // 【0.4.18】胖/瘦切换 = scene 画布真实重排/还原
     MFLog(@"[card] 胖屏切换 → %@：%.0fx%.0f -> %.0fx%.0f（高宽比 %.2f，中心X %.0f / 底边 %.0f 保持）",
           mfCardFatMode ? @"胖屏" : @"瘦卡还原",
           CGRectGetWidth(fromFrame), CGRectGetHeight(fromFrame),
@@ -4140,6 +4215,54 @@ static CGFloat MFCardFatAspect(void) {
           mfCardFullScreen ? @"全屏" : @"还原窗口",
           CGRectGetWidth(fromFrame), CGRectGetHeight(fromFrame),
           CGRectGetWidth(toFrame), CGRectGetHeight(toFrame));
+}
+
+/// 【0.4.18 用户 log43】底带下拉 = **原生打开**宿主 App（= 从桌面点图标的全屏样式），不再是把
+/// 卡片 frame 撑满的"浮窗全屏"。Stheno 逆向实证 selector `launchApplicationWithIdentifier:
+/// suspended:`；复用快切"外部打开"成熟链路：prepareForNativeApplicationTakeover（释放托管、
+/// 还原画布）+ launch，面板随之释放。
+-(void)mfOpenHostedAppNatively{
+    NSString *bid = hostSession.activeBundleId ?: hostSession.requestedBundleId;
+    if (bid.length == 0) {
+        MFLog(@"[card] 原生打开失败（无宿主 App）→ 退回卡片全屏");
+        [self mfToggleCardFullScreenAnimated:YES];
+        return;
+    }
+    MFLog(@"[card] 底带下拉 → 原生打开 %@（桌面点图标同款全屏）", bid);
+    [self restoreExternallyActivatedApplicationNatively:bid];
+}
+
+/// 【0.4.18 用户 log43】胖屏内容自适应：App 内容是真实 hosted scene，之前胖屏沿用"填满裁切"
+/// （画布固定 430x932 按 MAX 缩放 → 上下被裁掉，log43 实证 667 高窗口裁掉 ~73pt×2）。
+/// 现在学 Stheno（Width × HeightFraction 模型）：胖屏时把 scene frame 真实改成卡片窗口尺寸 →
+/// App 按新比例重新布局，零裁切零黑边；瘦卡/关闭时还原全屏画布（释放租约前 ContextHostManager
+/// 也会兜底还原）。
+-(void)mfSyncHostedSceneCanvasForFatMode{
+    ContextHostManager *manager = [ContextHostManager sharedInstance];
+    NSString *bid = hostSession.activeBundleId ?: hostSession.requestedBundleId;
+    if (bid.length == 0) {
+        return;
+    }
+    CGSize target = CGSizeZero;   // 零 = 还原全屏画布
+    if (mfCardFatMode && mfDockedSide == 0 && !CGRectIsEmpty(keyboardZoomBaseFrame)) {
+        UIInterfaceOrientation hostedOri = [self contextManagerPreferredHostedInterfaceOrientation:nil];
+        if (UIInterfaceOrientationIsLandscape(hostedOri)) {
+            MFLog(@"[card] 胖屏画布跳过（横屏宿主，暂不重排，沿用填满裁切）");
+            return;
+        }
+        target = keyboardZoomBaseFrame.size;   // 竖屏宿主：内容点 = 屏幕点，画布 = 卡片窗口尺寸
+    }
+    BOOL ok = [manager applyHostedSceneFrameSize:target forBundleId:bid];
+    if (ok) {
+        // 立即按新画布算内容 scale（胖屏 = 1.0 恰好铺满；还原 = 回到完整装入），不等场景回调
+        presentationSourceCanvasSize = (target.width > 0 && target.height > 0)
+            ? target
+            : [self contextManagerPreferredSceneStackSize:nil];
+        [self layoutContextView];
+    }
+    MFLog(@"[card] 胖屏画布同步 → %@（%@，目标 %.0fx%.0f）",
+          mfCardFatMode ? @"胖屏重排" : @"还原全屏画布",
+          ok ? @"已下发" : @"未下发", target.width, target.height);
 }
 
 #pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧

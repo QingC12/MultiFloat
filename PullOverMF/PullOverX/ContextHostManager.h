@@ -87,6 +87,9 @@ hostedPresentationContentDidBecomeUnavailableForBundleId:(NSString *)bundleId
 -(void)releaseForegroundLeaseForTargetSwitch;
 -(void)invalidateIOS26PresentationContainersInSceneStack:(UIView *)sceneStack;
 -(void)refreshPresentationForCurrentOrientation;
+/// 【0.4.18】胖屏画布：把宿主 scene frame 真实改成 size（App 按新比例重排，Stheno 同款）；
+/// size 为零 = 还原为全屏画布。返回是否成功下发。
+-(BOOL)applyHostedSceneFrameSize:(CGSize)size forBundleId:(NSString *)bundleId;
 -(void)recoverIOS26HostedContentAfterOrientationChange;
 -(BOOL)isForegroundLeaseActiveForScene:(FBScene *)scene
                               bundleId:(NSString *)bundleId
