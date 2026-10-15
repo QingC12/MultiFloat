@@ -1281,6 +1281,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 //   抵达中下中心（进度 100%）或手指停住 1.0s ⇒ 自动固定（0.4.1 的"原地冒出来"作废）。
 #define MF_RING_INTRO_MIN_SCALE 0.10          // 呼出瞬间的圆盘缩放（用户指定 10%）
 #define MF_RING_INTRO_MIN_SPAN 100.0          // 进度基准（触发点到中下中心的距离）下限，pt
+#define MF_RING_INTRO_EASE 1.6                // 【0.4.13】进度→观感缓动指数（1=线性旧行为；>1 前期长得快、临终点自然减速）
 #define MF_RING_PARK_RATIO_Y 0.78             // 位移终点/固定圆心纵向 = 屏高 × 该值（屏幕中下中心）
 #define MF_RING_LATCH_DWELL 1.0               // 手指停留多久就自动固定（秒，用户指定 1s）
 @property (nonatomic, assign) CGFloat ringIntroProgress;               // 呼出进度 0~1（累计距离 / 基准）
@@ -1320,6 +1321,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (CGPoint)ringIntroStartCenterForBounds:(CGRect)bounds target:(CGPoint)target;
 /// 【0.4.2】滑动距离驱动的长大（+ 起点→中下中心位移）+ 停留自动固定
 - (CGFloat)mfRingIntroCurrentScale;
+/// 【0.4.13】进度→观感缓动（easeOut 幂曲线，`mfRingIntroEase` 可调）
+- (CGFloat)mfRingIntroEasedT;
 /// 【0.4.2】当前进度对应的圆心：起点（触发条）→ 终点（屏幕中下中心）线性插值，再按缩放夹取
 - (CGPoint)ringIntroCenterForProgress:(CGFloat)progress;
 - (void)mfApplyRingIntroFrame;
@@ -2103,8 +2106,23 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.ringIntroSpan = MAX(span, MF_RING_INTRO_MIN_SPAN);
         self.ringIntroParkCenter = targetCenter;
         CGFloat introMin = self.ringIntroMinScale;
-        self.ringRoot.alpha = 1.0;   // 不再淡入：图标已同步贴好，直接可见（0.3.24 的淡入是"透明图标"帮凶）
-        self.ringRoot.transform = CGAffineTransformMakeScale(introMin, introMin);
+        // 【0.4.13】登场微动画：小圆盘不再是硬切冒出 —— alpha 淡入 + 从 82% 起始档微弹到位。
+        //   图标已同步贴好（0.3.25 起），淡入不会再出现"透明占位"；BeginFromCurrentState
+        //   保证手指立刻开划时，第一帧跟手映射无缝接管，不打架。
+        self.ringRoot.alpha = 0.0;
+        CGFloat popFrom = introMin * 0.82;
+        self.ringRoot.transform = CGAffineTransformMakeScale(popFrom, popFrom);
+        [UIView animateWithDuration:0.16
+                              delay:0.0
+             usingSpringWithDamping:0.85
+              initialSpringVelocity:0.4
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:^{
+            self.ringRoot.alpha = 1.0;
+            self.ringRoot.transform = CGAffineTransformMakeScale(introMin, introMin);
+        } completion:nil];
         // 【0.4.2】起点圆心 = **触发点**（按 10% 缩放夹取：整圆不出屏，同时仍是"贴着触发条出现"）
         CGPoint startCenter = [self mfClampRingCenter:point scale:introMin];
         self.ringIntroStartCenter = startCenter;
@@ -2113,9 +2131,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         //   后续事件完全不来），1.0s 后照样会就地补满并固定，圆盘不会卡成"永远选不了图标"。
         self.ringDwellAnchorPoint = point;
         [self mfScheduleLatchDwell];
-        MFLog(@"[ring] 呼出动画（0.4.2）：%@ 起点=触发条(%.0f,%.0f) 小圆盘 %.0f%% → 跟手位移到屏幕中下中心(%.0f,%.0f) 并长到 100%%（无时间限制：滑得快就都快），停留 %.1f 秒自动固定",
+        MFLog(@"[ring] 呼出动画（0.4.13）：%@ 起点=触发条(%.0f,%.0f) 小圆盘 %.0f%% → 跟手位移到屏幕中下中心(%.0f,%.0f) 并长到 100%%（easeOut%.1f·滑得快就都快），停留 %.1f 秒自动固定",
               MFRingEdge(), startCenter.x, startCenter.y, introMin * 100.0,
               targetCenter.x, targetCenter.y,
+              MAX(1.0, MFRingNumber(@"mfRingIntroEase", MF_RING_INTRO_EASE)),
               MAX(0.4, MFRingNumber(@"mfRingLatchDwell", MF_RING_LATCH_DWELL)));
 
         MFLog(@"[ring] <<< 呼出完成：圆心从触发条(%.0f,%.0f) 出发，跟手指位移，终点(%.0f,%.0f)",
@@ -2226,17 +2245,28 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
-/// 【0.4.2】当前缩放 = 起始缩放 + (1 - 起始缩放) × 手指滑动进度（无时间上限）
+/// 【0.4.13】进度→观感缓动：easeOut 幂曲线 `t = 1-(1-p)^e`（e=1.6）。
+///   线性映射的毛病：刚起步时手指动了圆盘几乎没反应，观感"机械、别扭"；easeOut 让
+///   前期一点点滑动就有明显的长大/位移反馈，临近中下中心自然减速——符合"划出来"的直觉。
+///   仍是**纯距离驱动映射**（不加任何时间驱动）；`mfRingIntroEase` 可调，设 1.0 = 旧行为。
+- (CGFloat)mfRingIntroEasedT {
+    CGFloat p = MIN(MAX(self.ringIntroProgress, 0.0), 1.0);
+    CGFloat e = MAX(MFRingNumber(@"mfRingIntroEase", MF_RING_INTRO_EASE), 1.0);
+    return 1.0 - pow(1.0 - p, e);
+}
+
+/// 【0.4.2】当前缩放 = 起始缩放 + (1 - 起始缩放) × 观感进度（0.4.13 起走 easeOut，无时间上限）
 - (CGFloat)mfRingIntroCurrentScale {
-    CGFloat progress = MIN(MAX(self.ringIntroProgress, 0.0), 1.0);
-    return self.ringIntroMinScale + (1.0 - self.ringIntroMinScale) * progress;
+    CGFloat t = [self mfRingIntroEasedT];
+    return self.ringIntroMinScale + (1.0 - self.ringIntroMinScale) * t;
 }
 
 /// 【0.4.2 用户 log37】当前进度对应的圆心 = **起点（触发条）→ 终点（屏幕中下中心）线性插值**，
 /// 再按**当前缩放**夹一次（10% 的小圆盘能贴边，长大过程中始终整圆不出屏）。
 /// 这就是"圆盘被手指从触发条一路带到屏幕中下中心"那一段。
 - (CGPoint)ringIntroCenterForProgress:(CGFloat)progress {
-    CGFloat t = MIN(MAX(progress, 0.0), 1.0);
+    // 【0.4.13】位移与缩放共用同一**观感进度**（easeOut）——两者同步走到终点，不打架
+    CGFloat t = [self mfRingIntroEasedT];
     CGPoint start = self.ringIntroStartCenter;
     CGPoint end = self.ringIntroParkCenter;
     CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
@@ -2297,11 +2327,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.ringRoot.transform = CGAffineTransformIdentity;
     };
     if (animated) {
-        // 【0.3.0】弹簧收尾（Stheno spring 惯例）：带一点柔性回稳，不再生硬
-        [UIView animateWithDuration:0.42
+        // 【0.4.13】弹簧收尾调稳：0.72 阻尼会明显晃两下才停（用户"别扭"来源之一），
+        //   0.82 + 更小初速 = 一次轻微回稳就落定；BeginFromCurrentState 保留（跟手途中补满不跳帧）。
+        [UIView animateWithDuration:0.46
                               delay:0.0
-             usingSpringWithDamping:0.72
-              initialSpringVelocity:0.3
+             usingSpringWithDamping:0.82
+              initialSpringVelocity:0.18
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)

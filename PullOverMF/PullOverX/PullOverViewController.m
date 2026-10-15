@@ -2035,7 +2035,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         CGFloat manualScale = [self mfLatchedManualCardScale];
         if (manualScale > 0.0) {
-            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.12 缩放保持·收口）",
+            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.13 缩放保持·收口）",
                   (long)source, manualScale);
             targetScale = manualScale;
             targetIsBase = NO;
@@ -2208,7 +2208,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (manualScale > 0.0) {
         // 【0.4.12】同上：这是 log39"缩放被弹回默认"的收口点
         [self applyCardScaleTarget:manualScale animated:NO source:POCardScaleTransitionSourceReconcile];
-        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.12 缩放保持）", manualScale);
+        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.13 缩放保持）", manualScale);
         return;
     }
     [self applyCardScaleTarget:1.0 animated:NO source:POCardScaleTransitionSourceReconcile];
