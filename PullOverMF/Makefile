@@ -82,3 +82,24 @@ PullOverMF_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 POCaptureCompat_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+# ===== 【0.4.5】优化级别：在**所有变量都就位之后**再覆盖一次 =====
+# 0.4.3（`xxx_CFLAGS += -Os`）与 0.4.4（覆盖 OPTFLAGS / TARGET_CFLAGS）实测都没生效：
+#   两次产物的 __TEXT 段**大小逐字节一致**（835584 B，__text 662760 B），
+#   只是内容有微小差异（版本字符串长度变化引起的地址常量位移）⇒ 优化级别没变。
+# ⇒ 说明真正喂给 clang 的是 `_THEOS_TARGET_CFLAGS`（Theos 在编译规则里用的变量），
+#   而它在 tweak.mk 里才最终成形。所以**必须在 include tweak.mk 之后**再覆盖。
+#   ★ 先判空再覆盖：万一变量名在某个 Theos 版本里不存在，绝不能把它的内容清空
+#     （那会连同 -isysroot 之类的关键选项一起丢掉 → 编译直接失败）。
+ifneq ($(_THEOS_TARGET_CFLAGS),)
+_THEOS_TARGET_CFLAGS := $(filter-out -O0 -O1 -O2 -O3 -Ofast,$(_THEOS_TARGET_CFLAGS)) -Os
+endif
+PullOverMF_CFLAGS += -Os
+POCaptureCompat_CFLAGS += -Os
+ADDITIONAL_CFLAGS += -Os
+
+# 体积取证：把 Theos 实际使用的变量打印进 CI 日志（一次性诊断，确认后可留作核对）
+$(info === MFDBG _THEOS_TARGET_CFLAGS: $(_THEOS_TARGET_CFLAGS))
+$(info === MFDBG TARGET_CFLAGS: $(TARGET_CFLAGS))
+$(info === MFDBG OPTFLAGS: $(OPTFLAGS))
+$(info === MFDBG CFG_VARS: $(filter %CFLAGS%,$(.VARIABLES)))
