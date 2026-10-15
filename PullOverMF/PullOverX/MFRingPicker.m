@@ -2,6 +2,22 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.4.2 核心改动（用户 log37）============================
+//  用户原话："为什么这一版不在像之前一样从圆盘触发条那里出现圆盘，然后跟随手指到屏幕中下
+//  中心后固定呢？而是中固定点出现圆盘，我只是说取消跟随手指移动，没有说改变圆盘出现的位置，
+//  继续修改"
+//  ① **呼出起点回归「触发条位置」**：0.4.1 让 10% 小圆盘直接在屏幕中下中心原地冒出来 ——
+//     用户明确说这不叫"取消跟随手指移动"，而是"改掉了圆盘出现的位置"。本版起点 =
+//     **手指在触发条上按下的那个点**（`self.ringIntroStartCenter` = 触发点按 10% 缩放夹取，
+//     贴边），圆盘**从触发条那里出现**。
+//  ② **中段跟手位移 = 从触发点插值到屏幕中下中心**：手指滑动推进进度，圆心沿「起点 → 中下
+//     中心」直线插值（`ringIntroCenterForProgress:`）—— 观感就是"圆盘被手指从触发条一路带到
+//     屏幕中下中心"，而不是 0.3.27 那种"手指到哪圆盘到哪、满屏幕漫游"。
+//  ③ **抵达中下中心即固定**：进度 100%（圆心已到 `mfRingParkCenterForBounds:`）⇒ 固定；
+//     手指停住 1.0s 也自动补满并固定在同一处（`mfRingLatchDwell`）。
+//  ④ 缩放仍由**手指累计滑动距离**驱动（0.4.1 已改对，保持）：滑得快 ⇒ 到 100% 快。
+//     **位移与缩放共用同一个进度** ⇒ "走到中下中心"与"长到 100%"是同一个时刻。
+//
 //  ============================ 0.4.1 核心改动（用户 log36）============================
 //  用户原话："现在有一个圆盘的问题，圆盘放大动画非常慢，应该是 2 秒时间限制，取消时间限制；
 //  然后还是将圆盘固定在屏幕中下中心点，划到哪里停留 1 秒自动固定，圆盘不再随手指满屏幕移动了；
@@ -341,10 +357,11 @@
 //    · 圆盘内容：Stheno 走**应用搜索器**（遍历已安装 App），**不是**翻多任务切换器模型
 //    · 呼出方式：Stheno 走"系统手势 hook + 既有宿主窗口"，所以全屏 App 之上也能呼出
 //
-//  交互（0.4.1 定案）：
-//    ① 贴边手势呼出后圆盘出现在**屏幕中下中心**（10% 小圆盘），圆心不再随手指移动；
-//    ② 手指滑动 → 圆盘按**累计滑动距离**从 10% 长大到 100%（滑得快长得快）；手指停住 1.0s
-//       或滑满 100% → 圆盘**自动固定**（屏幕中下中心，100%）；
+//  交互（0.4.2 定案）：
+//    ① 贴边手势呼出后圆盘从**触发条位置**出现（10% 小圆盘，贴手指按下的那道边）；
+//    ② 手指向屏幕内滑动 → 圆盘沿「触发点 → 屏幕中下中心」被**手指带着移动**，同时按
+//       **累计滑动距离**从 10% 长大到 100%（滑得快长得快）；抵达中下中心即固定，
+//       手指停住 1.0s 也自动补满并固定在同一处；
 //    ③ 固定后手指滑动 → 高亮离手指最近的图标（悬停选择）；
 //    ④ **手指离开屏幕** → 收起圆盘；已选中 App → 立即以浮窗打开。
 //
@@ -368,9 +385,9 @@
 //    mfRingEdgeMargin   number 圆盘外沿距屏幕边的间距（默认 12）
 //    mfRingRotation     number 图标整体旋转角，度（默认 0）
 //    mfRingStartAngle   number 第一个图标的角度，度（默认 -90 = 正上方）
-//    mfRingLatchDwell   number 【0.4.1】手指停留多久就自动固定，秒（默认 1.0）
-//    mfRingIntroMinScale number 【0.4.1】刚划出时的圆盘缩放（默认 0.10 = 10%）
-//    mfRingParkRatioY   number 【0.4.1】固定圆心纵向 = 屏高 × 该值（默认 0.78 = 屏幕中下中心）
+//    mfRingLatchDwell   number 【0.4.2】手指停留多久就自动固定，秒（默认 1.0）
+//    mfRingIntroMinScale number 【0.4.2】刚划出（在触发条处）时的圆盘缩放（默认 0.10 = 10%）
+//    mfRingParkRatioY   number 【0.4.2】固定/位移终点圆心纵向 = 屏高 × 该值（默认 0.78 = 屏幕中下中心）
 //    mfRingRings        number 圆盘圈数 1~3（默认 2；装得下时自动收敛为 1 圈）
 //    mfRingInnerRatio   number 内圈半径比例上限 0.35~0.95（默认 0.62，仅多圈时生效）
 //    mfRingIconGap      number 图标间距估算值，pt（默认 6；越大每圈能放越少）
@@ -1217,18 +1234,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
 @property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
-// 【0.4.1 用户 log36】呼出 = **圆心固定 + 滑动距离驱动长大**（0.3.27 的"时间驱动 + 跟手漫游"作废）：
-//   圆心钉在「屏幕中下中心」（`mfRingParkCenterForBounds:`），圆盘只长大不移动；
-//   触发瞬间 **10%** 小圆盘，随手指**累计滑动距离**长大到 100%（无时间上限，滑得快就长得快）；
-//   手指停住 **1.0s** ⇒ 自动固定（`mfRingLatchDwell`），弹簧补满 100% 并进入可选中状态。
+// 【0.4.2 用户 log37】呼出 = **从触发条出现 → 跟手位移到中下中心 → 固定**：
+//   起点圆心 = 手指按下的触发点（含 10% 缩放夹取，贴边）；
+//   手指滑动推进进度，圆心沿「起点 → 中下中心」插值、缩放 10% → 100%；
+//   抵达中下中心（进度 100%）或手指停住 1.0s ⇒ 自动固定（0.4.1 的"原地冒出来"作废）。
 #define MF_RING_INTRO_MIN_SCALE 0.10          // 呼出瞬间的圆盘缩放（用户指定 10%）
-#define MF_RING_INTRO_MIN_SPAN 100.0          // 进度基准（触点到固定点的距离）下限，pt
-#define MF_RING_PARK_RATIO_Y 0.78             // 固定圆心纵向 = 屏高 × 该值（0.3.27 以前的老值，用户认可）
+#define MF_RING_INTRO_MIN_SPAN 100.0          // 进度基准（触发点到中下中心的距离）下限，pt
+#define MF_RING_PARK_RATIO_Y 0.78             // 位移终点/固定圆心纵向 = 屏高 × 该值（屏幕中下中心）
 #define MF_RING_LATCH_DWELL 1.0               // 手指停留多久就自动固定（秒，用户指定 1s）
 @property (nonatomic, assign) CGFloat ringIntroProgress;               // 呼出进度 0~1（累计距离 / 基准）
 @property (nonatomic, assign) CGFloat ringIntroTravel;                 // 本次呼出累计滑动距离（pt，单调递增）
 @property (nonatomic, assign) CGFloat ringIntroSpan;                   // 本次呼出的进度基准（pt）
 @property (nonatomic, assign) CGPoint ringIntroLastPoint;              // 上次累计距离用的触点
+@property (nonatomic, assign) CGPoint ringIntroStartCenter;            // 【0.4.2】呼出起点圆心（触发点，按 10% 夹取）
+@property (nonatomic, assign) CGPoint ringIntroParkCenter;             // 【0.4.2】本次呼出的终点圆心（屏幕中下中心）
 @property (nonatomic, assign) CGFloat ringIntroMinScale;               // 本次呼出的起始缩放（配置键读取一次）
 @property (nonatomic, assign) CGPoint ringDwellAnchorPoint;            // 上次重置"停留计时"时的触点（抖动阈值用）
 @property (nonatomic, assign) NSUInteger ringDwellGeneration;          // 停留计时器代次
@@ -1247,9 +1266,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)onStripLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)showAtPoint:(CGPoint)point;
 - (void)moveRingToPoint:(CGPoint)point;
-/// 【0.4.1】固定 = 圆心收在「屏幕中下中心」（圆盘本来就是钉在那里的）
+/// 【0.4.2】固定 = 圆心收在「屏幕中下中心」（进度 100% 时圆盘已走到那儿，这里弹簧补满收尾）
 - (void)latchToParkCenterAnimated:(BOOL)animated;
-/// 【0.4.1】固定圆心：屏幕中下中心（屏宽中线 × 屏高 × mfRingParkRatioY）
+/// 【0.4.2】呼出位移终点 / 固定圆心：屏幕中下中心（屏宽中线 × 屏高 × mfRingParkRatioY）
 - (CGPoint)mfRingParkCenterForBounds:(CGRect)bounds;
 - (void)buildRingInContainer:(UIView *)container;
 /// 【0.3.25】同步贴真图标（呼出时用，避免"先看 0.4s 首字母占位"）
@@ -1258,9 +1277,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)scheduleIconFillWithGeneration:(NSUInteger)generation;
 /// 【0.3.24】收起动画的起点圆心：贴着**触发条所在的那条屏幕边**，让圆盘"缩回边缘"
 - (CGPoint)ringIntroStartCenterForBounds:(CGRect)bounds target:(CGPoint)target;
-/// 【0.4.1】滑动距离驱动的长大 + 停留自动固定
+/// 【0.4.2】滑动距离驱动的长大（+ 起点→中下中心位移）+ 停留自动固定
 - (CGFloat)mfRingIntroCurrentScale;
-- (void)mfApplyRingIntroScale;
+/// 【0.4.2】当前进度对应的圆心：起点（触发条）→ 终点（屏幕中下中心）线性插值，再按缩放夹取
+- (CGPoint)ringIntroCenterForProgress:(CGFloat)progress;
+- (void)mfApplyRingIntroFrame;
 - (void)mfScheduleLatchDwell;
 - (CGPoint)mfClampRingCenter:(CGPoint)point scale:(CGFloat)scale;
 - (void)refreshRingContentsIfVisible;
@@ -1561,7 +1582,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.hostContainerView = nil;
     self.dialLayer = nil;
     self.ringRoot = nil;
-    // 【0.4.1】顺手作废"停留自动固定"计时器（宿主都没了，别让它继续跑）
+    // 【0.4.2】顺手作废"停留自动固定"计时器（宿主都没了，别让它继续跑）
     self.ringDwellGeneration += 1;
     self.expanded = NO;
 }
@@ -1796,8 +1817,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         if (!self.ringLatched) {
             [self moveRingToPoint:finger];
-            // 【0.4.1 用户 log36】圆心钉在屏幕中下中心，这里只是把**手指累计滑动距离**喂给长大进度；
-            //   手指停住 1.0s 就走"停留自动固定"（该计时器同样在 moveRingToPoint: 里重置）。
+            // 【0.4.2 用户 log37】这里把**手指累计滑动距离**喂给进度 ⇒ 圆盘沿「触发条 → 中下中心」
+            //   跟手位移 + 长大；手指停住 1.0s 就走"停留自动固定"（计时器同样在 moveRingToPoint: 里重置）。
         }
         [self updateSelectionForPoint:finger];
         return;
@@ -1847,7 +1868,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         if (gesture.state == UIGestureRecognizerStateChanged) {
             if (!self.ringLatched) {
                 [self moveRingToPoint:finger];
-                // 【0.4.1 用户 log36】同上：只累计滑动距离推进长大；固定靠"停留 1.0s 自动固定"
+                // 【0.4.2】同上：累计滑动距离 ⇒ 跟手位移到中下中心 + 长大；固定靠"抵达终点"或"停留 1.0s 自动固定"
             }
             [self updateSelectionForPoint:finger];
             return;
@@ -1885,11 +1906,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark 坐标辅助
 
-/// 【0.3.25】加了 scale 的版本：夹取用的"半边长" = 几何 extent × 当前缩放。
-/// 呼出跟手长大时圆盘只有 10%~100%，用满尺寸的 extent 夹会把小圆盘硬推到离边缘
-/// 129pt 的地方（看着就是从屏幕中间冒出来）—— 按缩放夹才"贴着手指一路滑进来"。
-/// 【0.4.1 用户 log36】圆心又**钉回**「屏幕中下中心」固定点（`mfRingParkCenterForBounds:`），
-/// 按缩放夹取只是为了让 10% 的小圆盘也从固定点原地长大（不再有"跟手漫游"）。
+/// 【0.4.2 用户 log37】按缩放夹取：呼出**起点**（10% 小圆盘，贴触发条那道边）与中途位移
+/// 都靠它保证整圆不出屏。圆心不再被钉死在中下中心 —— 中下中心只是**位移终点**
+/// （由 `ringIntroCenterForProgress:` 在「触发点 → 中下中心」之间插值）。
 - (CGPoint)mfClampRingCenter:(CGPoint)point scale:(CGFloat)scale {
     CGRect bounds = self.hostBounds;
     if (CGRectIsEmpty(bounds)) {
@@ -1912,9 +1931,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     return CGPointMake(x, y);
 }
 
-/// 【0.4.1 用户 log36】圆盘固定圆心 = **屏幕中下中心**：屏宽中线 × 屏高 × `mfRingParkRatioY`。
-/// 这是 0.3.27 之前在用的老停靠点（默认 0.78 ⇒ 本机 430×932 上 = (215, 727)，圆盘下沿 871，
-/// 离底边 61pt），用户 log36 明确要求"还是将圆盘固定在屏幕中下中心点" ⇒ 回归该点。
+/// 【0.4.2 用户 log37】呼出位移**终点** / 固定圆心 = **屏幕中下中心**：屏宽中线 × 屏高 ×
+/// `mfRingParkRatioY`（默认 0.78 ⇒ 本机 430×932 上是 (215,727)，圆盘下沿 871、离底边 61pt）。
+/// 圆盘从触发条出现后，圆心沿「触发点 → 此点」插值过来，到点即固定。
 - (CGPoint)mfRingParkCenterForBounds:(CGRect)bounds {
     if (CGRectIsEmpty(bounds)) {
         bounds = [UIScreen mainScreen].bounds;
@@ -1983,8 +2002,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.selectedButton = nil;
         self.hasLatchFinger = NO;
 
-        // 【0.4.1 用户 log36】固定停靠点**回归**：圆心 = 屏幕中下中心（`mfRingParkCenterForBounds:`，
-        //   `mfRingParkRatioY` 默认 0.78），圆盘只长大不移动；手指停住 1.0s 自动固定。
+        // 【0.4.2 用户 log37】呼出起点 = 触发条位置，终点 = 屏幕中下中心（`mfRingParkCenterForBounds:`，
+        //   `mfRingParkRatioY` 默认 0.78）；手指滑动驱动"位移 + 长大"，停住 1.0s 自动固定到终点。
         MFLog(@"[ring] 呼出前置 ok（0.2.0：setter 死递归已修）");
 
         MFLog(@"[ring] >>> 建容器");
@@ -2018,40 +2037,48 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         [self buildRingInContainer:container];
         MFLog(@"[ring] <<< 建圆盘 ok：%lu 个图标", (unsigned long)self.iconButtons.count);
 
-        // 【0.4.1 用户 log36】呼出动画第 5 版 = **圆心固定在屏幕中下中心 + 滑动距离驱动长大**。
-        //   前四版为什么都不对（写清楚免得再走回头路）：
-        //   ★ 0.3.23：只缩放 ringRoot（绕自身中心），圆心又被满半径顶到离屏边 129pt
-        //     ⇒ 看着"从屏幕中间往两边长"。
-        //   ★ 0.3.24：位移 + 自动弹大，但位移终点是**停靠点**、0.38s 自己跑完 ⇒ 与手指无关。
+        // 【0.4.2 用户 log37】呼出动画第 6 版 = **从触发条出现 → 跟手位移到中下中心 → 固定**。
+        //   0.4.1 的错在于"起点就是中下中心"（小圆盘原地冒出来），用户原话："我只是说取消跟随
+        //   手指移动，没有说改变圆盘出现的位置"。本版三要素：
+        //   ★ 起点 = **手指在触发条上按下的那个点**（按 10% 缩放夹取 ⇒ 小圆盘贴边出现）；
+        //   ★ 位移 = 起点 → 屏幕中下中心（`mfRingParkCenterForBounds:`）直线插值，进度 = 手指
+        //     累计滑动距离 / 基准（滑动驱动 ⇒ 滑得快就都到得快，中途停住就停在半路）；
+        //   ★ 缩放 = 10% → 100%，与位移**共用同一进度**（"走到中下中心"与"长到 100%"同一时刻）。
+        //   前几版为什么不对（免得再走回头路）：
+        //   ★ 0.3.23：只缩放 ringRoot，圆心被满半径顶到离屏边 129pt ⇒ 看着"从屏幕中间长出来"。
+        //   ★ 0.3.24：位移 + 自动弹大，位移终点是停靠点、0.38s 自己跑完 ⇒ 与手指无关。
         //   ★ 0.3.25/0.3.26：位移→缩放（手指滑多远就多大）⇒ 圆心被手指带着满屏跑。
-        //   ★ 0.3.27：时间驱动（触发起 2 秒线性到 100%）⇒ 用户反馈"太慢"、"取消时间限制"。
-        //   ★ 现在：圆心**钉死在屏幕中下中心**（`mfRingParkCenterForBounds:`，用户："还是将圆盘
-        //     固定在屏幕中下中心点，圆盘不再随手指满屏幕移动"），缩放由**手指累计滑动距离**推进
-        //     （滑得快 ⇒ 到 100% 快），手指停住 1.0s ⇒ 自动固定（`mfScheduleLatchDwell`）。
+        //   ★ 0.3.27：时间驱动（触发起 2s 线性到 100%）⇒ 用户反馈"太慢"、"取消时间限制"。
+        //   ★ 0.4.1：圆心钉死在中下中心、只长大不移动 ⇒ 用户反馈"改了出现的位置"。
         //   ★ 未固定期间**禁止选中**（见 updateSelectionForPoint:）——手指只是把圆盘划出来，不能误开 App。
-        CGPoint parkCenter = [self mfRingParkCenterForBounds:bounds];
+        CGPoint targetCenter = [self mfRingParkCenterForBounds:bounds];
         self.ringIntroMinScale = MIN(MAX(MFRingNumber(@"mfRingIntroMinScale", MF_RING_INTRO_MIN_SCALE), 0.05), 0.9);
         self.ringIntroProgress = 0.0;
         self.ringIntroTravel = 0.0;
         self.ringIntroLastPoint = point;
-        // 进度基准 = 触点到固定点的城市街区距离（下限 100pt）：
-        //   "手指从边缘滑到圆盘所在位置"正好 = 100%，中途松劲儿就停在当时大小（跟手）。
-        CGFloat span = hypot(point.x - parkCenter.x, point.y - parkCenter.y);
+        // 进度基准 = **触发点到中下中心的城市街区距离**（下限 100pt）：
+        //   "手指从触发条滑到圆盘该在的位置"正好 = 100%，中途松劲儿就停在当时的大小/位置（跟手）。
+        CGFloat span = hypot(point.x - targetCenter.x, point.y - targetCenter.y);
         self.ringIntroSpan = MAX(span, MF_RING_INTRO_MIN_SPAN);
+        self.ringIntroParkCenter = targetCenter;
         CGFloat introMin = self.ringIntroMinScale;
         self.ringRoot.alpha = 1.0;   // 不再淡入：图标已同步贴好，直接可见（0.3.24 的淡入是"透明图标"帮凶）
         self.ringRoot.transform = CGAffineTransformMakeScale(introMin, introMin);
-        self.ringRoot.center = [self mfClampRingCenter:parkCenter scale:introMin];
-        // 【0.4.1】"停留自动固定"计时器**在这里就先排一次**：手指若一动都不动（甚至系统手势
-        //   后续事件完全不来），1.0s 后照样会固定，圆盘不会卡成"永远选不了图标"。
+        // 【0.4.2】起点圆心 = **触发点**（按 10% 缩放夹取：整圆不出屏，同时仍是"贴着触发条出现"）
+        CGPoint startCenter = [self mfClampRingCenter:point scale:introMin];
+        self.ringIntroStartCenter = startCenter;
+        self.ringRoot.center = startCenter;
+        // 【0.4.2】"停留自动固定"计时器**在这里就先排一次**：手指若一动都不动（甚至系统手势
+        //   后续事件完全不来），1.0s 后照样会就地补满并固定，圆盘不会卡成"永远选不了图标"。
         self.ringDwellAnchorPoint = point;
         [self mfScheduleLatchDwell];
-        MFLog(@"[ring] 呼出动画：%@ 起点(%.0f,%.0f) → 固定在屏幕中下中心(%.0f,%.0f)；小圆盘 %.0f%% 随手指滑动长大到 100%%（无时间限制：滑得快就长得快），停留 %.1f 秒自动固定",
-              MFRingEdge(), point.x, point.y, parkCenter.x, parkCenter.y,
-              introMin * 100.0,
+        MFLog(@"[ring] 呼出动画（0.4.2）：%@ 起点=触发条(%.0f,%.0f) 小圆盘 %.0f%% → 跟手位移到屏幕中下中心(%.0f,%.0f) 并长到 100%%（无时间限制：滑得快就都快），停留 %.1f 秒自动固定",
+              MFRingEdge(), startCenter.x, startCenter.y, introMin * 100.0,
+              targetCenter.x, targetCenter.y,
               MAX(0.4, MFRingNumber(@"mfRingLatchDwell", MF_RING_LATCH_DWELL)));
 
-        MFLog(@"[ring] <<< 呼出完成：圆心钉在(%.0f,%.0f)（不再随手指移动）", parkCenter.x, parkCenter.y);
+        MFLog(@"[ring] <<< 呼出完成：圆心从触发条(%.0f,%.0f) 出发，跟手指位移，终点(%.0f,%.0f)",
+              startCenter.x, startCenter.y, targetCenter.x, targetCenter.y);
 
         if (self.iconButtons.count == 0) {
             [self scheduleAutoBundleIdEnumeration];
@@ -2075,7 +2102,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 - (void)hide {
     self.buildGeneration += 1;   // 作废尚未执行的图标填充
-    // 【0.4.1】作废"停留自动固定"计时器 —— 否则它可能在收起后去动已脱离视图的 ringRoot
+    // 【0.4.2】作废"停留自动固定"计时器 —— 否则它可能在收起后去动已脱离视图的 ringRoot
     self.ringDwellGeneration += 1;
     if (self.editorPanel != nil) {
         [self closeEditorSaving:NO];   // 【0.2.1】编辑器开着就一并收起（不保存）
@@ -2121,16 +2148,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark 长大 / 固定
 
-/// 【0.4.1 用户 log36】手指动了 ⇒ ① 累计滑动距离 → 推进长大进度（10% → 100%，**无时间上限**）；
-/// ② 重置"停留自动固定"计时（停住 1.0s 就补满并固定）。
-/// 圆盘圆心**不动** —— 钉在「屏幕中下中心」（`mfRingParkCenterForBounds:`），用户明确要求
-/// "圆盘不再随手指满屏幕移动"。
+/// 【0.4.2 用户 log37】手指动了 ⇒ ① 累计滑动距离 → 推进进度（10% → 100%，**无时间上限**）；
+/// ② 按进度把圆心沿「触发点 → 屏幕中下中心」插值（**跟手位移**，不是满屏漫游）+ 同步缩放；
+/// ③ 重置"停留自动固定"计时（停住 1.0s 就补满并固定在中下中心）。
 - (void)moveRingToPoint:(CGPoint)point {
     if (self.ringRoot == nil || self.ringLatched) {
         return;
     }
     // ① 累计滑动距离（单调递增：回滑不缩）—— 手指滑得快 ⇒ 单位时间走过的距离多 ⇒ 同一份进度
-    //    用时更短 ⇒ "到 100% 的速度由手指移动速度决定"（用户原话）。中途停住 = 停在当时大小。
+    //    用时更短 ⇒ "到 100% 的速度由手指移动速度决定"（用户原话）。中途停住 = 停在当时大小/位置。
     CGFloat step = hypot(point.x - self.ringIntroLastPoint.x, point.y - self.ringIntroLastPoint.y);
     self.ringIntroLastPoint = point;
     BOOL reachedFull = NO;
@@ -2140,7 +2166,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         CGFloat progress = MIN(self.ringIntroTravel / span, 1.0);
         if (progress > self.ringIntroProgress) {
             self.ringIntroProgress = progress;
-            [self mfApplyRingIntroScale];
+            [self mfApplyRingIntroFrame];   // 【0.4.2】缩放 + 圆心（插值）一起贴
             reachedFull = (progress >= 1.0);
         }
     }
@@ -2152,28 +2178,43 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         [self mfScheduleLatchDwell];
     }
     if (reachedFull) {
-        MFLog(@"[ring] 呼出长大完成：100%%（手指累计滑动 %.0fpt / 基准 %.0fpt）",
-              self.ringIntroTravel, self.ringIntroSpan);
-        [self latchToParkCenterAnimated:YES];   // 滑满也直接固定（与"停留自动固定"等价的两条路）
+        MFLog(@"[ring] 呼出长大完成：100%%（手指累计滑动 %.0fpt / 基准 %.0fpt，圆心已到 %@(%.0f,%.0f)）",
+              self.ringIntroTravel, self.ringIntroSpan, MFRingEdge(),
+              self.ringRoot.center.x, self.ringRoot.center.y);
+        [self latchToParkCenterAnimated:YES];   // 抵达中下中心也直接固定（与"停留自动固定"等价的两条路）
     }
 }
 
-/// 【0.4.1】当前缩放 = 起始缩放 + (1 - 起始缩放) × 手指滑动进度（无时间上限）
+/// 【0.4.2】当前缩放 = 起始缩放 + (1 - 起始缩放) × 手指滑动进度（无时间上限）
 - (CGFloat)mfRingIntroCurrentScale {
     CGFloat progress = MIN(MAX(self.ringIntroProgress, 0.0), 1.0);
     return self.ringIntroMinScale + (1.0 - self.ringIntroMinScale) * progress;
 }
 
-/// 【0.4.1】把当前进度对应的缩放贴到圆盘上（圆心不动）
-- (void)mfApplyRingIntroScale {
+/// 【0.4.2 用户 log37】当前进度对应的圆心 = **起点（触发条）→ 终点（屏幕中下中心）线性插值**，
+/// 再按**当前缩放**夹一次（10% 的小圆盘能贴边，长大过程中始终整圆不出屏）。
+/// 这就是"圆盘被手指从触发条一路带到屏幕中下中心"那一段。
+- (CGPoint)ringIntroCenterForProgress:(CGFloat)progress {
+    CGFloat t = MIN(MAX(progress, 0.0), 1.0);
+    CGPoint start = self.ringIntroStartCenter;
+    CGPoint end = self.ringIntroParkCenter;
+    CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
+                            start.y + (end.y - start.y) * t);
+    CGFloat scale = self.ringIntroMinScale + (1.0 - self.ringIntroMinScale) * t;
+    return [self mfClampRingCenter:p scale:scale];
+}
+
+/// 【0.4.2】把当前进度的**缩放 + 圆心**一起贴到圆盘上（位移与长大共用同一进度）
+- (void)mfApplyRingIntroFrame {
     if (self.ringRoot == nil) {
         return;
     }
     CGFloat scale = [self mfRingIntroCurrentScale];
     self.ringRoot.transform = CGAffineTransformMakeScale(scale, scale);
+    self.ringRoot.center = [self ringIntroCenterForProgress:self.ringIntroProgress];
 }
 
-/// 【0.4.1 用户 log36】"停留自动固定"计时器：手指停在一个地方 1.0s（`mfRingLatchDwell`）
+/// 【0.4.2】"停留自动固定"计时器：手指停在一个地方 1.0s（`mfRingLatchDwell`）
 /// ⇒ 圆盘自动补满到 100% 并固定（用户："划到哪里停留 1 秒自动固定"）。
 /// 每次手指移动都会重排（代次递增作废上一个），所以只有真正停住 1s 才会触发。
 - (void)mfScheduleLatchDwell {
@@ -2195,9 +2236,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     });
 }
 
-/// 【0.4.1 用户 log36】固定 = 圆心收在**屏幕中下中心**（圆盘本来就钉在那儿，这里按满尺寸再夹一次保险），
-/// 缩放弹簧收尾到 100%（手指只滑了一点点就停住 ⇒ 这一步把大小补满）。固定后手指滑动只改变
-/// "选中"，圆心不再动。
+/// 【0.4.2 用户 log37】固定 = 圆心收在**屏幕中下中心**（手指滑够时圆盘已经走到那儿了；只滑一点点
+/// 就停住时，这一步把"位移到中下中心 + 缩放到 100%"一起弹簧补上）。固定后手指滑动只改变"选中"，
+/// 圆心不再动。
 - (void)latchToParkCenterAnimated:(BOOL)animated {
     if (self.ringRoot == nil || self.ringLatched) {
         return;
@@ -2229,7 +2270,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         changes();
     }
     NSTimeInterval dwelled = CACurrentMediaTime() - self.ringDwellStartedAt;
-    MFLog(@"[ring] 圆盘已固定（屏幕中下中心，距上次手指移动 %.1fs）圆心(%.0f,%.0f) —— 滑动到图标上选择，松手即打开",
+    MFLog(@"[ring] 圆盘已固定（屏幕中下中心，距上次手指移动 %.1fs）圆心(%.0f,%.0f) 缩放100%% —— 滑动到图标上选择，松手即打开",
           dwelled, center.x, center.y);
 }
 
@@ -3514,8 +3555,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     MFRingWriteBundleIds(ids);
     MFLog(@"[ring] 长按移出 %@ -> 剩 %lu 项", bundleId, (unsigned long)ids.count);
 
-    // 【0.4.1】原地重建：圆盘固定在屏幕中下中心（本来就在那儿），重建后立刻固定
-    //   （不走"停留 1s"—— 用户是主动长按移出，不该再等一次计时）。
+    // 【0.4.2】原地重建：重建时把**当前圆盘所在位置**当作"触发点"起点（showAtPoint: 会从那儿
+    //   冒出来），随后立刻补满到屏幕中下中心并固定（不走"停留 1s"—— 用户是主动长按移出）。
     CGPoint center = self.ringRoot ? self.ringRoot.center
                                    : [self mfRingParkCenterForBounds:self.hostBounds];
     [self hide];
@@ -3673,7 +3714,7 @@ BOOL MFRingPointNearTriggerEdge(CGPoint point) {
 }
 
 /// hook 回调入口②：在触点处呼出圆盘。
-/// 【0.4.1】呼出后圆盘**圆心固定**在屏幕中下中心，手指累计滑动驱动长大，停住 1.0s 自动固定。
+/// 【0.4.2】呼出后圆盘从**触发条位置**出现，跟手指位移到屏幕中下中心，手指停住 1.0s 自动固定。
 void MFRingSummonFromSystemGestureAtPoint(CGPoint point) {
     @try {
         MFRingPicker *picker = [MFRingPicker shared];
@@ -3787,8 +3828,8 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
         if (state == UIGestureRecognizerStateChanged) {
             picker.lastFingerPoint = location;
             if (!picker.ringLatched) {
-                [picker moveRingToPoint:location];   // 【0.4.1】只喂"累计滑动距离"，圆心不动
-                // 【0.4.1 用户 log36】固定靠"停留 1.0s 自动固定"（计时器在 moveRingToPoint: 里重置）
+                [picker moveRingToPoint:location];   // 【0.4.2】累计滑动距离 ⇒ 跟手位移 + 长大
+                // 【0.4.2】固定靠"抵达中下中心"或"停留 1.0s 自动固定"（计时器在 moveRingToPoint: 里重置）
             }
             [picker updateSelectionForPoint:location];
             return;
