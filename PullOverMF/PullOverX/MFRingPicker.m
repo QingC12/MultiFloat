@@ -2,6 +2,17 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.6 核心改动 ============================
+//  ① **编辑器过滤改用「桌面图标模型」判据（用户：又出现很多白图标/系统组件，
+//     "只显示桌面图标，或设置中显示的 APP"）**：
+//     0.2.5 按"取不到图标"过滤**实际一个都没滤掉**（日志实证：跳过无图标 0 个）—— 根因：
+//     兜底路径 `UIImage _applicationIconImageForBundleIdentifier:format:scale:` 对**任何**
+//     bundleID 都生成占位图标，系统组件也被判成"有图标"。
+//     新判据 `MFRingHasHomeScreenIcon()` = `SBIconModel applicationIconForBundleIdentifier:`
+//     非 nil —— **桌面上真的有它的图标**（与 PullOver 真图标同一条路，本机已验证）；
+//     系统组件/插件不在这张表里 ⇒ 白图标从源头滤掉；设置/电话/信息等桌面系统 App 保留。
+//     模型不可用时放行（宁多勿杀，只损失过滤），模型查询带进程内缓存。
+//
 //  ============================ 0.2.5 核心改动 ============================
 //  ① **等距双圈求解（用户：内圈少、外圈多，两圈都不许出现巨大空隙）**：
 //     对每个候选内圈个数 n_in 求 r_out：等距（r_in=r_out×n_in/n_out）+ 内圈塞得下
@@ -523,17 +534,19 @@ static NSString *MFRingDisplayNameForBundleId(NSString *bundleId) {
 /// 只用扁平枚举（见 MFRingEnumerateInstalledBundleIds），按显示名排序。
 /// ⚠️ 会查 SB 私有数据 ⇒ 调用方必须自己 `MFRingGuardArm/Disarm`。
 ///
-/// 【0.2.5 修正】0.2.4 按 `applicationType` 过滤"System"是**误伤**——设置/电话/信息这些
-/// 系统自带 App 的类型也是 "System"，全被踢掉了（用户点名要回来）。改判据：
-///   · **只按"取不到图标"过滤**：桌面可见的 App（含系统应用）都有图标，组件/插件没有；
-///   · 用户已选的 `ringApps` **强制可见**；
-///   · 先过滤、后截断 limit。
-/// 前置声明（实现在下方"图标缓存"段）：编辑器过滤要用它判断"取不到图标的应用"
-static UIImage *MFRingIconForBundleId(NSString *bundleId);
+/// 【0.2.6 修正】0.2.5 按"取不到图标"过滤**实际一个都没滤掉**（日志实证：跳过无图标 0 个）。
+/// 根因：图标的兜底路径 `UIImage _applicationIconImageForBundleIdentifier:format:scale:`
+/// 对**任何** bundleID（含系统组件）都返回占位图标 ⇒ "有没有图标"这个判据永远为真。
+/// 新判据：**桌面图标模型**（用户："只显示桌面图标，或设置中显示的 APP"）——
+///   `MFRingHasHomeScreenIcon()` = `SBIconModel applicationIconForBundleIdentifier:` 非 nil；
+///   与 PullOver 真图标同一条路（本机验证可用）。设置/电话/信息在桌面上有图标，保留；
+///   系统组件/插件不在 ⇒ 白图标从源头滤掉。
+/// 前置声明（实现在下方"图标缓存"段）
+static BOOL MFRingHasHomeScreenIcon(NSString *bundleId);
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEditor(NSUInteger limit) {
     NSMutableArray<NSString *> *ids = [NSMutableArray array];
-    // ① 用户已选的优先入列（强制可见）
+    // ① 用户已选的优先入列（强制可见，不做桌面过滤 —— 用户亲手选的必须出现）
     for (NSString *bid in MFRingConfiguredBundleIds()) {
         if (MFRingIsUsableBundleId(bid) && ![ids containsObject:bid]) {
             [ids addObject:bid];
@@ -541,7 +554,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEd
     }
     // ② 枚举全部安装项（limit=0 不截断），过滤后再截断
     NSArray<NSString *> *enumerated = MFRingEnumerateInstalledBundleIds(0);
-    NSUInteger noIconSkipped = 0;
+    NSUInteger offDesktopSkipped = 0;
     for (NSString *bundleId in enumerated) {
         if (limit > 0 && ids.count >= limit) {
             break;
@@ -550,18 +563,17 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEd
             continue;
         }
         @try {
-            // 无图标过滤：桌面可见的 App（含设置/电话/信息等系统应用）都有图标；
-            // 取不到图标的组件/插件大多打不开也看不见，白图标就是这样来的
-            if (MFRingIconForBundleId(bundleId) == nil) {
-                noIconSkipped++;
+            // 【0.2.6】桌面图标模型过滤：桌面上没有它的图标 ⇒ 不显示（白图标/系统组件的根源）
+            if (!MFRingHasHomeScreenIcon(bundleId)) {
+                offDesktopSkipped++;
                 continue;
             }
             [ids addObject:bundleId];
         } @catch (__unused NSException *exception) {
         }
     }
-    MFLog(@"[ring] 编辑器过滤：跳过无图标 %lu 个，入列 %lu 个",
-          (unsigned long)noIconSkipped, (unsigned long)ids.count);
+    MFLog(@"[ring] 编辑器过滤：跳过非桌面应用 %lu 个，入列 %lu 个",
+          (unsigned long)offDesktopSkipped, (unsigned long)ids.count);
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *apps = [NSMutableArray array];
     for (NSString *bundleId in ids) {
         NSString *name = MFRingDisplayNameForBundleId(bundleId);
@@ -619,6 +631,57 @@ static UIImage *MFRingIconForBundleId(NSString *bundleId) {
         MFRingIconCache()[bundleId] = icon;
     }
     return icon;
+}
+
+/// 【0.2.6】该 bundleID 是否在**桌面图标模型**里（= 桌面上真的有它的图标）。
+/// 用户要求："编辑器只显示桌面图标，或设置中显示的 APP"。
+/// 判据 = `SBIconModel applicationIconForBundleIdentifier:` 非 nil —— 与 PullOver 真图标
+/// 走同一条路（SBIconController.sharedInstance -> iconModel/model，本机验证可用）。
+/// ⚠️ 不能用 `UIImage _applicationIconImageForBundleIdentifier:format:scale:` 当判据 ——
+///    它对**任何** bundleID 都生成占位图（0.2.5"跳过无图标 0 个"的根因）。
+/// 结果带进程内缓存（一次打开编辑器要判 200+ 个）；模型不可用时**放行**（宁多勿杀，
+/// 只损失过滤，不让整个列表消失）。⚠️ 会查 SB 私有数据，调用方必须在 guard 闸门内。
+static BOOL MFRingHasHomeScreenIcon(NSString *bundleId) {
+    if (!MFRingIsUsableBundleId(bundleId)) {
+        return NO;
+    }
+    static NSMutableSet<NSString *> *gMFRingHomeScreenCache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gMFRingHomeScreenCache = [NSMutableSet set];
+    });
+    if ([gMFRingHomeScreenCache containsObject:bundleId]) {
+        return YES;
+    }
+    @try {
+        Class controllerClass = NSClassFromString(@"SBIconController");
+        id controller = controllerClass
+            ? ((id (*)(id, SEL))objc_msgSend)(controllerClass, NSSelectorFromString(@"sharedInstance"))
+            : nil;
+        if (controller == nil) {
+            return YES;   // 模型不可用：放行（宁多勿杀）
+        }
+        SEL modelSelector = NSSelectorFromString(@"iconModel");
+        if (![controller respondsToSelector:modelSelector]) {
+            modelSelector = NSSelectorFromString(@"model");   // iOS 26 之前叫 model
+        }
+        if (![controller respondsToSelector:modelSelector]) {
+            return YES;
+        }
+        id model = ((id (*)(id, SEL))objc_msgSend)(controller, modelSelector);
+        SEL iconSelector = NSSelectorFromString(@"applicationIconForBundleIdentifier:");
+        if (model == nil || ![model respondsToSelector:iconSelector]) {
+            return YES;
+        }
+        id icon = ((id (*)(id, SEL, id))objc_msgSend)(model, iconSelector, bundleId);
+        if (icon != nil) {
+            [gMFRingHomeScreenCache addObject:bundleId];
+            return YES;
+        }
+        return NO;
+    } @catch (__unused NSException *exception) {
+        return YES;   // 查询本身出异常：放行，不做误杀
+    }
 }
 
 #pragma mark - 圆盘几何（0.2.3）
@@ -1176,7 +1239,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.5 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.6 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
