@@ -16,6 +16,17 @@ MF_SDK_VERSION ?= 16.5
 TARGET = iphone:clang:$(MF_SDK_VERSION):14.0
 include $(THEOS)/makefiles/common.mk
 
+# ===== 【0.4.4】体积优先优化级别（**正面覆盖** Theos 默认 -O2）=====
+# ★ 教训（0.4.3 实测）：只在 `xxx_CFLAGS += -Os` 里写是**没用的** ——
+#   Theos 的优化级别由它自己的 `OPTFLAGS` / `TARGET_CFLAGS` 提供，位置排在用户 CFLAGS 之后，
+#   clang 取**最后**一个 -O 选项 ⇒ 用户那个 -Os 被 -O2 吃掉。
+#   实证：0.4.3 与 0.4.2 的 `PullOverMF.dylib` 的 __TEXT 段及 13 个子节**逐字节完全相同**
+#   （835584 B / __text 662760 B ……），而链接期 strip 生效（__LINKEDIT 341088 → 32032 B）。
+# ⇒ 必须覆盖这两个变量：OPTFLAGS（common.mk 定义的优化级别）+ TARGET_CFLAGS（可能已内联 -O*）。
+#   用 `:=` 立即展开，把任何已存在的 -O* 过滤掉，只留末尾一个 -Os。
+OPTFLAGS = -Os
+TARGET_CFLAGS := $(filter-out -O0 -O1 -O2 -O3 -Ofast -Oz,$(TARGET_CFLAGS)) -Os
+
 # ===== 【0.4.0】两个 dylib =====
 # ① PullOverMF.dylib（主）：只注入 SpringBoard（plist: Filter → Bundles → com.apple.springboard）。
 # ② POCaptureCompat.dylib（相机兼容）：**独立极小 dylib**，只注入相机守护进程
@@ -58,14 +69,15 @@ INSTALL_TARGET_PROCESSES = SpringBoard
 #   **9478 个符号（151648 B）+ 字符串表（167648 B）= 319296 B 纯符号**，
 #   而 Theos 默认**不做 strip** ⇒ 这 319 KB 白白随包发行（tweak 是给 dyld 在宿主
 #   进程里解析的，`-undefined dynamic_lookup`，**一个符号都不需要导出**）。
-# 做法三件（全部是编译/链接期开关，不动一行业务代码）：
+# 做法（全部是编译/链接期开关，不动一行业务代码）：
 #   ① `-Wl,-x`：链接期不把**局部符号**写进符号表（ld 的 strip 局部符号）。
 #   ② `-Wl,-S`：不写**调试符号**。
-#   ③ `-Os`：体积优先优化（原为 Theos 默认优化级别）；`-Wl,-dead_strip` 删链上未被引用的函数/数据。
-#   ★ `DEBUG = 0` 显式声明：既保证不带 `-g`，也让 control 版本号不再被追加 `+debug` 后缀。
+#   ③ `-Wl,-dead_strip`：删链上未被引用的函数/数据。
+#   ④ `DEBUG = 0` 显式声明（不带 -g）。
+#   ⑤ 优化级别 -Os 见上方【0.4.4】段（0.4.3 时只写了 xxx_CFLAGS，被 Theos 的 -O2 覆盖，无效）。
+# 实测收益（0.4.2 → 0.4.3）：主 dylib 1258592 → 949536 B（-24.6%，__LINKEDIT 341088 → 32032 B，
+# 符号 9478 → 306）；相机 dylib 76672 → 71456 B；DEB 319754 → 275046 B（-14.0%）。
 DEBUG = 0
-PullOverMF_CFLAGS += -Os
-POCaptureCompat_CFLAGS += -Os
 PullOverMF_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 POCaptureCompat_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 
