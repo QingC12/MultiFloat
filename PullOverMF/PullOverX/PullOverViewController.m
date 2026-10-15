@@ -4,15 +4,21 @@
 //
 //  Created by Will Smillie on 4/8/19.
 //
-//  ============================ 0.3.11 核心改动（用户指定）============================
-//  本版只动浮窗（卡片），圆盘手势/动画（0.3.0 已终版冻结）零改动。
-//  ① **浮窗四周手势区**：卡片容器四边各加 22pt 透明热区（约束 pin 四边，跟 frame 走）——
-//     上/下边拖动 = 竖直移动小窗（复用手柄竖拖 applyPortraitHostedLandscapeVerticalHandleAnchorY:
-//     的同一套锚点/钳制，条件 canMovePortraitHostedLandscapeCardVertically 不满足即失效放行）；
-//     左/右边缘拖动 = 缩放小窗（复用 applyCardScaleTarget:，向内拖=缩小，范围 0.5~1.0）。
-//  ② **小窗吸附**：松手弹簧吸附——位置弹到上/下最近停靠端（现有钳制区间两端），
-//     缩放弹到 0.5/0.75/1.0 最近档（mfUserCardScaleOverride 记档，优先于键盘自动缩放；
-//     键盘弹出/面板关闭时自动清除，避让/关闭行为不受影响）。
+//  ============================ 0.3.12 核心改动（log21 修复）============================
+//  【log21 血泪】0.3.11 四周热区"无法触发"真凶 = 自己的门：
+//    Began 用 canMovePortraitHostedLandscapeCardVertically 当总开关，而它要求
+//    currentQuickSwitchLayoutMode == HorizontalBottom（横壳竖载场景），
+//    竖屏 iPhone 上返回 VerticalSide → 恒 NO → 四条热区 Began 全部静默失效（零日志）。
+//    且跟随走的 applyPortraitHostedLandscapeVerticalHandleAnchorY: 内部还有同一道门
+//    （handlePanIntent 未设时拒绝）——就算过了 Began 也动不了。
+//    教训：**复用别人的链路前先确认它的前置条件在目标场景下成立，静默失效必须打日志**。
+//  0.3.12 修复（圆盘/动画零改动）：
+//  ① 新增布局无关总开关 mfCanDragCardEdgeNow（面板打开 + baseFrame 有效 + 非滚动/过渡）；
+//  ② 跟随移动改走自管 mfApplyCardBottomY:（直接改 keyboardZoomBaseFrame.origin.y +
+//     同一套钳制 + 手柄横条锚同步），绕开 PortraitHostedLandscape 专属链路；
+//  ③ Began 无条件打 [card] 热区按下 日志 + 安装后回打热区 frame（下轮日志可判别
+//     "触摸没到热区"还是"门挡了"）。
+//  吸附（位置/缩放）0.3.11 实现本身无门，保持不动。
 //
 #import "PullOverViewController.h"
 #import "POHostSessionController.h"
@@ -253,7 +259,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfEdgeHotzoneLeft;
     UIView *mfEdgeHotzoneRight;
     NSInteger mfEdgeDragMode;           // 0=无 1=竖直移动 2=缩放
-    CGFloat mfEdgeDragStartAnchorY;     // 竖直拖动起点（手柄锚 Y）
+    CGFloat mfEdgeDragStartBottomY;     // 【0.3.12】竖直拖动起点（卡片底边 Y，自管钳制）
     CGFloat mfEdgeDragStartScale;       // 缩放拖动起点
     CGFloat mfUserCardScaleOverride;    // >0 = 用户手动缩放档位（键盘弹出/面板关闭时清除）
     UIView *handleVisualHandoffSnapshotView;
@@ -2640,6 +2646,61 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [mfEdgeHotzoneRight.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
         [mfEdgeHotzoneRight.widthAnchor constraintEqualToConstant:w],
     ]];
+    // 【0.3.12】下一轮 runloop 回打热区实际 frame——若全零 = 约束没生效，一眼定位
+    dispatch_async(dispatch_get_main_queue(), ^{
+        MFLog(@"[card] 热区就绪 top=%@ bottom=%@ left=%@ right=%@ 容器=%@",
+              NSStringFromCGRect(self->mfEdgeHotzoneTop.frame),
+              NSStringFromCGRect(self->mfEdgeHotzoneBottom.frame),
+              NSStringFromCGRect(self->mfEdgeHotzoneLeft.frame),
+              NSStringFromCGRect(self->mfEdgeHotzoneRight.frame),
+              NSStringFromCGRect(self->keyboardZoomContainer.frame));
+    });
+}
+
+/// 【0.3.12】四边热区手势的总开关——布局模式无关（竖屏 VerticalSide 也放行）。
+/// 0.3.11 误用 canMovePortraitHostedLandscapeCardVertically（要求 HorizontalBottom 布局，
+/// 竖屏 iPhone 恒 NO）当总开关 → 四条热区 Began 全部静默失效（log21 实证）。
+-(BOOL)mfCanDragCardEdgeNow{
+    return panelState == POPanelStateOpen &&
+        !CGRectIsEmpty(keyboardZoomBaseFrame) &&
+        ![self isPanelTransitioning] &&
+        !presentedQuickSwitchMenu &&
+        (quickSwitchInteractionOverlayView == nil || quickSwitchInteractionOverlayView.hidden) &&
+        !scrollSnapAnimationInProgress && !scrollView.dragging && !scrollView.decelerating;
+}
+
+/// 【0.3.12】四边手势跟随移动卡片（布局无关，绕开 PortraitHostedLandscape 专属链路——
+/// applyPortraitHostedLandscapeVerticalHandleAnchorY: 内部还有 handlePanIntent 门）。
+/// 直接改 keyboardZoomBaseFrame.origin.y + 同一套钳制（safeArea + 底栏预留 + 手柄间隙）。
+-(void)mfApplyCardBottomY:(CGFloat)cardBottomY{
+    CGFloat cardHeight = CGRectGetHeight(keyboardZoomBaseFrame);
+    if (cardHeight <= 0) {
+        return;
+    }
+    CGRect bounds = self.view.bounds;
+    UIEdgeInsets viewInsets = self.view.safeAreaInsets;
+    UIEdgeInsets windowInsets = self.view.window.safeAreaInsets;
+    CGFloat topInset = MAX(viewInsets.top, windowInsets.top) + CONTENT_EDGE_GAP;
+    CGFloat bottomInset = MAX(viewInsets.bottom, windowInsets.bottom) + CONTENT_EDGE_GAP;
+    CGFloat minimumCardBottomY = topInset + cardHeight;
+    CGFloat maximumCardBottomY = CGRectGetHeight(bounds) - bottomInset -
+        [self portraitHostedLandscapeReservedBottomChromeHeight] - HANDLE_EDGE_GAP;
+    if (maximumCardBottomY < minimumCardBottomY) {
+        cardBottomY = minimumCardBottomY;
+    } else {
+        cardBottomY = MIN(MAX(cardBottomY, minimumCardBottomY), maximumCardBottomY);
+    }
+    CGFloat screenScale = UIScreen.mainScreen.scale;
+    CGRect baseFrame = keyboardZoomBaseFrame;
+    baseFrame.origin.y = round((cardBottomY - cardHeight) * screenScale) / screenScale;
+    portraitHostedLandscapeHandleAnchorY = cardBottomY + HANDLE_EDGE_GAP;
+    keyboardZoomBaseFrame = baseFrame;
+    [UIView performWithoutAnimation:^{
+        self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
+        self->keyboardZoomContainer.frame = baseFrame;
+    }];
+    [self updatePortraitHostedLandscapeHandleForCurrentOffset];
+    [self syncHorizontalQuickSwitchPresentationAnchor];
 }
 
 -(NSInteger)mfCardEdgeKindForTag:(NSUInteger)tag{
@@ -2658,25 +2719,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (pan.state == UIGestureRecognizerStateBegan) {
-        // 条件与手柄竖拖完全一致；不满足就立刻失效放行（不抢内容触摸）
-        if (![self canMovePortraitHostedLandscapeCardVertically]) {
+        // 【0.3.12】无条件先打日志——下轮日志可区分"触摸没到热区"（无此行）和"门挡了"（canDrag=否）
+        MFLog(@"[card] 热区按下 edge=%ld canDrag=%d", (long)edge, [self mfCanDragCardEdgeNow]);
+        if (![self mfCanDragCardEdgeNow]) {
             pan.enabled = NO;
             pan.enabled = YES;
             return;
         }
         [self cancelAutoNubTimer];
         if (edge == 0 || edge == 1) {
-            // 竖直移动：与手柄竖拖同一套锚点/钳制
-            CGFloat anchor = [self currentHandleScreenY];
-            if (!isfinite(anchor)) {
-                pan.enabled = NO;
-                pan.enabled = YES;
-                return;
-            }
+            // 竖直移动：【0.3.12】自管钳制，起点 = 当前卡片底边 Y
             mfEdgeDragMode = 1;
-            mfEdgeDragStartAnchorY = anchor;
-            [self restoreKeyboardZoomImmediately];   // 与手柄竖拖一致：拖动前回到基准
-            MFLog(@"[card] 四边手势开始（上/下边拖动 = 移动，edge=%ld）", (long)edge);
+            mfEdgeDragStartBottomY = CGRectGetMaxY(keyboardZoomBaseFrame);
+            [self restoreKeyboardZoomImmediately];   // 拖动前回到基准（还原键盘缩放 transform）
+            MFLog(@"[card] 四边手势开始（上/下边拖动 = 移动，edge=%ld 起点底边 %.0f）",
+                  (long)edge, mfEdgeDragStartBottomY);
         } else {
             // 缩放：起点 = 当前真实缩放
             mfEdgeDragMode = 2;
@@ -2691,7 +2748,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (pan.state == UIGestureRecognizerStateChanged) {
         if (mfEdgeDragMode == 1) {
             CGFloat ty = [pan translationInView:self.view].y;
-            [self applyPortraitHostedLandscapeVerticalHandleAnchorY:mfEdgeDragStartAnchorY + ty];
+            // 【0.3.12】自管跟随（布局无关），不再走 PortraitHostedLandscape 专属链路
+            [self mfApplyCardBottomY:mfEdgeDragStartBottomY + ty];
         } else if (mfEdgeDragMode == 2) {
             CGFloat tx = [pan translationInView:self.view].x;
             // 向内拖 = 缩小：左边缘向右拖 / 右边缘向左拖；向外拖 = 回到 1.0 封顶
