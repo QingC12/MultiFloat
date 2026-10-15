@@ -2,6 +2,19 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.12 核心改动 ============================
+//  ① **"松手即打开"最终修（log17 实证：桌面/全屏都要二次点击）**：
+//     0.2.11 已修好 App 跟着滚，但松手仍常"未选中"。日志给出决定性规律：
+//     边缘手势驱动的会话（桌面呼出现在也走它——`贴边松手未达阈值` 后紧跟
+//     `>>> 系统手势呼出`），**松手点总是已经离开圆盘、回到边缘一带**
+//     （(406,720)/(420,744) 都在触发条区域内），此时当前选中早已被清空
+//     ⇒ "未选中，收起"。用户预期 = 松手时打开**刚才高亮过的**那个 App。
+//     修法：新增 `releaseOpenBundleIdForPoint:` —— 松手时①当前选中优先；
+//     ②无选中则回退开 `mfRingReleaseOpenWindow`（默认 2.0 秒）内最近悬停
+//     选中的 App（`lastSelectedBundleId`，在 applySelectionToButton 里记录，
+//     悬停离开不清除；每次呼出重置）。三条松手路径（onStripPan / mfEdgeSlid /
+//     onRingHoverPan）统一走它。超过时间窗 = 用户早已移开另做他事 → 照旧收起。
+//
 //  ============================ 0.2.11 核心改动 ============================
 //  ① **全屏"松手即打开"攻坚（log16 + 用户硬性要求：全屏操作逻辑必须和桌面一样）**：
 //     log16 实证桌面已完美（20+ 条悬停流、松手即开），但全屏悬停事件稀疏、
@@ -264,6 +277,8 @@
 //    mfRingGestureSummon BOOL  是否接管"便捷访问"手势呼出圆盘（默认 YES；hook 在 PullOverX.mm，
 //                              关掉则系统手势原样放行）
 //    mfRingEdgePanDistance number 0.2.8 系统边缘手势沿边滑出多少 pt 呼出圆盘（默认 40）
+//    mfRingReleaseOpenWindow number 0.2.12 松手回退窗口：松手时无选中则开"最近悬停选中"，
+//                              只在距上次选中不超过该秒数时生效（默认 2.0；0 = 关闭回退）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -1062,6 +1077,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, assign) CGPoint lastFingerPoint;         // 最近一次手指屏幕坐标
 @property (nonatomic, assign) CGPoint latchFingerPoint;        // 固定那一刻的手指坐标
 @property (nonatomic, assign) BOOL hasLatchFinger;             // 是否已记录固定时的手指位置
+// 【0.2.12】最近一次悬停选中的应用 + 时间戳（松手回退开它用；悬停离开不清除）
+@property (nonatomic, copy) NSString *lastSelectedBundleId;
+@property (nonatomic, assign) CFTimeInterval lastSelectionStamp;
 @property (nonatomic, assign) NSUInteger settleGeneration;     // 手指停住计时器代次
 // 【0.2.1】圆盘应用编辑器（长按边缘触发条打开）
 @property (nonatomic, strong) UIView *editorPanel;             // 全屏编辑面板
@@ -1090,6 +1108,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)refreshRingContentsIfVisible;
 - (void)scheduleAutoBundleIdEnumeration;
 - (void)updateSelectionForPoint:(CGPoint)point;
+/// 【0.2.12】松手时该打开哪个 App：当前选中优先；无则回退时间窗内最近悬停选中
+- (NSString *)releaseOpenBundleIdForPoint:(CGPoint)point;
 /// ⚠️ 注意：**绝不能**命名为 setSelectedButton:（详见实现处 0.2.0 血案注释）
 - (void)applySelectionToButton:(UIButton *)button;
 - (void)applySelectionVisual:(UIButton *)button selected:(BOOL)selected;
@@ -1309,7 +1329,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.11 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.12 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -1584,10 +1604,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             MFLog(@"[ring] 贴边松手（未达到呼出阈值，不呼出）");
             return;
         }
-        [self updateSelectionForPoint:finger];
-        UIButton *selected = self.selectedButton;
-        NSString *bundleId = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
-        if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
+        // 【0.2.12】当前选中优先，无则回退时间窗内最近悬停选中（松手点常已离开圆盘）
+        NSString *bundleId = [self releaseOpenBundleIdForPoint:finger];
+        if (bundleId.length > 0) {
             MFLog(@"[ring] 手指离开屏幕 -> 打开 %@ 浮窗", bundleId);
             [self hide];
             [self openFloatWithBundleId:bundleId];
@@ -1632,10 +1651,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             return;
         }
         if (gesture.state == UIGestureRecognizerStateEnded) {
-            [self updateSelectionForPoint:finger];
-            UIButton *selected = self.selectedButton;
-            NSString *bundleId = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
-            if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
+            // 【0.2.12】当前选中优先，无则回退时间窗内最近悬停选中
+            NSString *bundleId = [self releaseOpenBundleIdForPoint:finger];
+            if (bundleId.length > 0) {
                 MFLog(@"[ring] 悬停松手 -> 打开 %@ 浮窗", bundleId);
                 [self hide];
                 [self openFloatWithBundleId:bundleId];
@@ -1719,6 +1737,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.selectedButton = nil;
         self.hasLatchFinger = NO;
         self.settleGeneration += 1;
+        self.lastSelectedBundleId = nil;   // 【0.2.12】新呼出 = 新上下文，回退记录作废
 
         // 【0.2.2】停靠点下移：0.72 → 0.78（用户反馈"固定后还是有点靠上"）
         CGFloat ratio = MIN(MAX(MFRingNumber(@"mfRingParkRatioY", 0.78), 0.5), 0.92);
@@ -2602,10 +2621,42 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (button != nil) {
         [self applySelectionVisual:button selected:YES];
         NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
+        // 【0.2.12】记录"最近悬停选中"：松手时手指常已离开圆盘（log17 实证），
+        //   时间窗内回退开它。悬停离开（applySelectionToButton:nil）不清除这条记录。
+        if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
+            self.lastSelectedBundleId = bundleId;
+            self.lastSelectionStamp = CACurrentMediaTime();
+        }
         MFLog(@"[ring] 悬停选中 %@", bundleId ?: @"?");
     } else if (previous != nil) {
         MFLog(@"[ring] 悬停离开（当前无选中）");
     }
+}
+
+/// 【0.2.12】松手时该打开哪个 App：
+///   ① 松手点仍在图标上 → 当前选中；
+///   ② 无选中 → 时间窗（mfRingReleaseOpenWindow，默认 2.0 秒）内最近悬停选中的 App
+///      —— log17 实证：边缘手势驱动的会话松手点常已回到边缘一带，当前选中早已清空，
+///      用户预期是"松手打开刚才高亮过的那个"；
+///   ③ 都没有 → nil（= 收起，不误开）。
+- (NSString *)releaseOpenBundleIdForPoint:(CGPoint)point {
+    [self updateSelectionForPoint:point];
+    UIButton *selected = self.selectedButton;
+    NSString *current = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
+    if ([current isKindOfClass:[NSString class]] && current.length > 0) {
+        return current;
+    }
+    double window = MFRingNumber(@"mfRingReleaseOpenWindow", 2.0);
+    if (window <= 0.0) {
+        return nil;
+    }
+    if (self.lastSelectedBundleId.length > 0 &&
+        CACurrentMediaTime() - self.lastSelectionStamp <= window) {
+        MFLog(@"[ring] 松手点无选中 -> 回退打开 %.1f 秒前悬停的 %@",
+              CACurrentMediaTime() - self.lastSelectionStamp, self.lastSelectedBundleId);
+        return self.lastSelectedBundleId;
+    }
+    return nil;
 }
 
 - (void)applySelectionVisual:(UIButton *)button selected:(BOOL)selected {
@@ -2915,9 +2966,8 @@ BOOL MFRingIsEdgeGestureType(unsigned long long type) {
         }
         if (state == UIGestureRecognizerStateEnded) {
             picker.lastFingerPoint = location;
-            [picker updateSelectionForPoint:location];
-            UIButton *selected = picker.selectedButton;
-            NSString *bundleId = selected ? objc_getAssociatedObject(selected, &kMFRingBundleIdKey) : nil;
+            // 【0.2.12】当前选中优先，无则回退时间窗内最近悬停选中
+            NSString *bundleId = [picker releaseOpenBundleIdForPoint:location];
             if ([bundleId isKindOfClass:[NSString class]] && bundleId.length > 0) {
                 MFLog(@"[ring] 手指离开屏幕 -> 打开 %@ 浮窗", bundleId);
                 [picker hide];
@@ -2974,27 +3024,27 @@ void MFRingInstallEdgePanGesture(void) {
         }
         Class managerClass = objc_getClass("SBSystemGestureManager");
         if (managerClass == nil) {
-            MFLog(@"[ring] 0.2.11 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            MFLog(@"[ring] 0.2.12 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
             return;
         }
         if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
-            MFLog(@"[ring] 0.2.11 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.12 边缘手势：+mainDisplayManager 不存在 -> 放弃");
             return;
         }
         id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
         if (manager == nil) {
-            MFLog(@"[ring] 0.2.11 边缘手势：管理器还没就绪 -> 稍后重试");
+            MFLog(@"[ring] 0.2.12 边缘手势：管理器还没就绪 -> 稍后重试");
             return;
         }
         SEL addSelector = @selector(addGestureRecognizer:withType:);
         if (![manager respondsToSelector:addSelector]) {
-            MFLog(@"[ring] 0.2.11 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.12 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
             return;
         }
         Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
         SEL privateInit = @selector(initWithTarget:action:type:options:);
         if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
-            MFLog(@"[ring] 0.2.11 边缘手势：私有 init 不存在 -> 放弃");
+            MFLog(@"[ring] 0.2.12 边缘手势：私有 init 不存在 -> 放弃");
             return;
         }
         // 配置的触发边（与可见触发条同一边，默认 right）
@@ -3033,7 +3083,7 @@ void MFRingInstallEdgePanGesture(void) {
         ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
                                                                   recognizer, MFRingEdgeGestureType);
         installed = YES;
-        MFLog(@"[ring] 0.2.11 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+        MFLog(@"[ring] 0.2.12 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
               edgeName, (unsigned long long)MFRingEdgeGestureType);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
