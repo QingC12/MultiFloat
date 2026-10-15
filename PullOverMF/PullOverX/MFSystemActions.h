@@ -2,7 +2,7 @@
 //  MFSystemActions.h
 //  PullOverMF —— 圆盘「系统动作」（本 fork 新增）
 //
-//  【0.4.9 用户 log38】用户选定「方案 A」：进程内直调系统私有接口，**零新增 hook**。
+//  【0.4.10 用户 log38】用户选定「方案 A」：进程内直调系统私有接口，**零新增 hook**。
 //  这些动作的"主人"本来就全在 SpringBoard 里（截图 = SBScreenShotter、翻译 = TranslationUI），
 //  而本插件也住在 SpringBoard ⇒ 点一下直接调，延迟为零、开机不受任何影响
 //  （符合项目明令："不要在 SpringBoard 里堆 hook"）。

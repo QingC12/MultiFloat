@@ -186,70 +186,171 @@ static BOOL MFSystemActionAppIsInstalled(NSString *bundleId) {
 
 #pragma mark - 动作①：截屏
 
-/// 方案 A 多候选（按越狱圈实证覆盖度排序）：
-///   ① `SBScreenShotter` sharedInstance → saveScreenshot:withCompletion:（iOS 13~17 通用）
-///   ② 同类的 saveScreenshotWithCompletion: / takeScreenshot（签名随版本变）
-///   ③ `SBUIController` 的 _takeScreenshot / takeScreenshot（老路兜底）
-static BOOL MFSystemActionTakeScreenshot(void) {
-    // ① / ② SBScreenShotter
+/// 【0.4.10 用户 log37】0.4.10 的三条候选在用户设备上**静默全灭**（日志只有"所有候选都没成功"，
+/// 连一条候选日志都没有 —— 类不存在 / selector 不响应都被无声跳过）。这一版：
+///   ① 每条候选都打"类是否存在 / 是否响应 / 实际调用"诊断日志；
+///   ② 已知类列表扩到 SBScreenShotter / SBScreenshotManager，类方法和实例方法都试；
+///   ③ 全失败时**运行时扫描**：把本机所有名字含 Screenshot 的类、以及它们含 screenshot 字样的
+///      方法全部打到日志 —— 下一轮日志直接把可用 API 钉死，不再靠猜。
+/// 按"参数寄存器个数"自适应调用（0~2 个参数：对象参数一律给 nil / BOOL 给 NO），
+/// 参数更多的签名不敢乱调（怕把 0 当非空对象 → 绕不过 @try 的 BAD_ACCESS）。
+static BOOL MFSystemActionInvokeScreenshotSelector(id target, SEL selector, NSString *label) {
+    Method method = class_getInstanceMethod(object_getClass(target), selector);
+    if (method == NULL) {
+        return NO;
+    }
+    NSUInteger registers = method_getNumberOfArguments(method);   // 2 + 参数寄存器数
     @try {
-        Class shotterClass = objc_getClass("SBScreenShotter");
-        if (shotterClass != Nil && [shotterClass respondsToSelector:@selector(sharedInstance)]) {
-            id shotter = ((id (*)(id, SEL))objc_msgSend)(shotterClass, @selector(sharedInstance));
-            if (shotter != nil) {
-                // 2a) saveScreenshot:withCompletion:（BOOL + block：用 IMP 强转才安全）
-                SEL twoArgSelector = NSSelectorFromString(@"saveScreenshot:withCompletion:");
-                if ([shotter respondsToSelector:twoArgSelector]) {
-                    void (*imp)(id, SEL, BOOL, id) =
-                        (void (*)(id, SEL, BOOL, id))[shotter methodForSelector:twoArgSelector];
-                    if (imp != NULL) {
-                        imp(shotter, twoArgSelector, NO, nil);
-                        MFLog(@"[sysact] 截屏：命中 SBScreenShotter saveScreenshot:withCompletion:");
-                        return YES;
-                    }
-                }
-                // 2b) saveScreenshotWithCompletion:（只有 block）
-                SEL blockSelector = NSSelectorFromString(@"saveScreenshotWithCompletion:");
-                if ([shotter respondsToSelector:blockSelector]) {
-                    void (*imp)(id, SEL, id) =
-                        (void (*)(id, SEL, id))[shotter methodForSelector:blockSelector];
-                    if (imp != NULL) {
-                        imp(shotter, blockSelector, nil);
-                        MFLog(@"[sysact] 截屏：命中 SBScreenShotter saveScreenshotWithCompletion:");
-                        return YES;
-                    }
-                }
-                // 2c) takeScreenshot（无参）
-                SEL plainSelector = NSSelectorFromString(@"takeScreenshot");
-                if ([shotter respondsToSelector:plainSelector]) {
-                    ((void (*)(id, SEL))objc_msgSend)(shotter, plainSelector);
-                    MFLog(@"[sysact] 截屏：命中 SBScreenShotter takeScreenshot");
+        if (registers == 2) {
+            ((void (*)(id, SEL))objc_msgSend)(target, selector);
+        } else if (registers == 3) {
+            ((void (*)(id, SEL, id))objc_msgSend)(target, selector, nil);
+        } else if (registers == 4) {
+            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(target, selector, NO, nil);
+        } else {
+            MFLog(@"[sysact] 截屏 %@：参数寄存器 %lu 个，跳过（不敢乱调）", label, (unsigned long)(registers - 2));
+            return NO;
+        }
+        MFLog(@"[sysact] 截屏：命中 %@（参数 %lu 个）", label, (unsigned long)(registers - 2));
+        return YES;
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 截屏 %@ 调用异常：%@", label, exception);
+        return NO;
+    }
+}
+
+/// 对单个"疑似截图管理"类：打存在性日志 → sharedInstance（如有）→ 已知 selector 名逐个试。
+static BOOL MFSystemActionProbeScreenshotClass(NSString *className) {
+    Class cls = objc_getClass(className.UTF8String);
+    if (cls == Nil) {
+        MFLog(@"[sysact] 截屏候选 %@：类不存在", className);
+        return NO;
+    }
+    MFLog(@"[sysact] 截屏候选 %@：类存在", className);
+    id instance = nil;
+    if ([cls respondsToSelector:@selector(sharedInstance)]) {
+        @try {
+            instance = ((id (*)(id, SEL))objc_msgSend)(cls, @selector(sharedInstance));
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! %@ sharedInstance 异常：%@", className, exception);
+        }
+    }
+    if (instance == nil) {
+        MFLog(@"[sysact] 截屏候选 %@：无 sharedInstance，只试类方法", className);
+    }
+    NSArray<NSString *> *names = @[
+        @"saveScreenshot:withCompletion:",
+        @"saveScreenshotWithCompletion:",
+        @"saveScreenshotsWithCompletion:",
+        @"takeScreenshot",
+        @"saveScreenshot",
+        @"captureScreenshot",
+        @"captureScreenshotWithCompletion:",
+        @"requestScreenshot",
+        @"saveScreenshotForTrustedClient",
+    ];
+    for (NSString *selectorName in names) {
+        SEL selector = NSSelectorFromString(selectorName);
+        NSString *label = [NSString stringWithFormat:@"%@ %@", className, selectorName];
+        if (instance != nil && [instance respondsToSelector:selector]) {
+            if (MFSystemActionInvokeScreenshotSelector(instance, selector, label)) {
+                return YES;
+            }
+        } else if ([cls respondsToSelector:selector]) {
+            if (MFSystemActionInvokeScreenshotSelector(cls, selector,
+                                                       [label stringByAppendingString:@" (类方法)"])) {
+                return YES;
+            }
+        }
+    }
+    MFLog(@"[sysact] 截屏候选 %@：已知 selector 全部未响应", className);
+    return NO;
+}
+
+/// 把一个类的"含 screenshot 字样"方法全打出来（类方法 + 实例方法，封顶 40 行防爆日志）。
+static void MFSystemActionDumpScreenshotMethods(Class cls, NSString *label) {
+    for (Class probeClass = cls, metaClass = object_getClass(cls);
+         probeClass != nil;
+         probeClass = (probeClass == metaClass ? nil : metaClass)) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(probeClass, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *selectorName = NSStringFromSelector(method_getName(methods[i]));
+            if ([selectorName localizedCaseInsensitiveContainsString:@"screenshot"]) {
+                MFLog(@"[sysact]   %@ 方法：%@（参数 %u）", label, selectorName,
+                      method_getNumberOfArguments(methods[i]) - 2);
+            }
+        }
+        if (methods != NULL) {
+            free(methods);
+        }
+        if (probeClass == metaClass) {
+            break;
+        }
+    }
+}
+
+static BOOL MFSystemActionTakeScreenshot(void) {
+    // ① / ② 已知截图管理类（类 + 实例两条腿，每步都打日志）
+    for (NSString *className in @[ @"SBScreenShotter", @"SBScreenshotManager" ]) {
+        if (MFSystemActionProbeScreenshotClass(className)) {
+            return YES;
+        }
+    }
+
+    // ③ SBUIController 的 _takeScreenshot / takeScreenshot（老路兜底）
+    @try {
+        Class uiControllerClass = objc_getClass("SBUIController");
+        if (uiControllerClass == Nil) {
+            MFLog(@"[sysact] 截屏候选 SBUIController：类不存在");
+        } else if (![uiControllerClass respondsToSelector:@selector(sharedInstance)]) {
+            MFLog(@"[sysact] 截屏候选 SBUIController：无 sharedInstance");
+        } else {
+            id uiController = ((id (*)(id, SEL))objc_msgSend)(uiControllerClass, @selector(sharedInstance));
+            for (NSString *selectorName in @[ @"_takeScreenshot", @"takeScreenshot" ]) {
+                SEL selector = NSSelectorFromString(selectorName);
+                if ([uiController respondsToSelector:selector]) {
+                    ((void (*)(id, SEL))objc_msgSend)(uiController, selector);
+                    MFLog(@"[sysact] 截屏：命中 SBUIController %@", selectorName);
                     return YES;
                 }
             }
-        }
-    } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! 截屏 SBScreenShotter 异常：%@", exception);
-    }
-
-    // ③ SBUIController
-    @try {
-        Class uiControllerClass = objc_getClass("SBUIController");
-        if (uiControllerClass != Nil && [uiControllerClass respondsToSelector:@selector(sharedInstance)]) {
-            id uiController = ((id (*)(id, SEL))objc_msgSend)(uiControllerClass, @selector(sharedInstance));
-            if (uiController != nil) {
-                for (NSString *selectorName in @[ @"_takeScreenshot", @"takeScreenshot" ]) {
-                    SEL selector = NSSelectorFromString(selectorName);
-                    if ([uiController respondsToSelector:selector]) {
-                        ((void (*)(id, SEL))objc_msgSend)(uiController, selector);
-                        MFLog(@"[sysact] 截屏：命中 SBUIController %@", selectorName);
-                        return YES;
-                    }
-                }
-            }
+            MFLog(@"[sysact] 截屏候选 SBUIController：_takeScreenshot / takeScreenshot 均未响应");
         }
     } @catch (NSException *exception) {
         MFLog(@"[sysact] !! 截屏 SBUIController 异常：%@", exception);
+    }
+
+    // ④ 运行时扫描（全失败的定位手段）：把本机所有 Screenshot 相关类和方法打到日志。
+    //    下一轮把这段日志回传，就能按真实 API 精确补候选 —— 不再猜。
+    MFLog(@"[sysact] 截屏：已知候选全失败，开始运行时扫描（结果在下面，请回传日志）");
+    @try {
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        unsigned int loggedLines = 0;
+        for (unsigned int i = 0; i < classCount; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (![name localizedCaseInsensitiveContainsString:@"screenshot"]) {
+                continue;
+            }
+            if (loggedLines < 40) {
+                MFLog(@"[sysact] 扫描：发现类 %@", name);
+                loggedLines++;
+                MFSystemActionDumpScreenshotMethods(classes[i], name);
+            }
+            // 名字像截图管理的类顺手试一遍已知 selector（自适应参数 + @try 保护）
+            if (MFSystemActionProbeScreenshotClass(name)) {
+                if (classes != NULL) {
+                    free(classes);
+                }
+                return YES;
+            }
+        }
+        if (classes != NULL) {
+            free(classes);
+        }
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 截屏运行时扫描异常：%@", exception);
     }
     return NO;
 }
