@@ -1174,6 +1174,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UILabel *editorOrderTitle;           // 排序条标题（含"已添加 N 个"）
 @property (nonatomic, strong) UIScrollView *editorOrderScroll;     // 排序条滚动容器
 @property (nonatomic, strong) NSMutableArray<UIView *> *editorOrderCells;  // 排序条格子
+@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *editorAppNames;  // bundleID→显示名（枚举时一次性取好）
 // 【0.3.22】触发条自调（用户 log31：触发条要能自己控制大小；且右侧屏幕中段也会呼出 ⇒ 容易误触）
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
@@ -2593,11 +2594,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [panel addSubview:countLabel];
     self.editorCountLabel = countLabel;
 
-    // 【0.3.22】触发条自调区（用户 log31：触发条大小/位置要能自己控制）
+    // 【0.3.26】触发条自调区（用户 log31：触发条大小/位置要能自己控制）
     const CGFloat settingsTop = 96.0;
     const CGFloat rowHeight = 32.0;
     const CGFloat settingsRows = 3.0;
     [self buildTriggerSettingsInPanel:panel top:settingsTop];
+
+    // 【0.3.26】bundleID → 显示名（枚举时已取好，排序条 rebuild 时只查表，不再碰 SB 私有数据）
+    NSMutableDictionary<NSString *, NSString *> *nameTable = [NSMutableDictionary dictionary];
+    for (NSDictionary<NSString *, NSString *> *app in apps) {
+        if (app[@"id"].length > 0 && app[@"name"].length > 0) {
+            nameTable[app[@"id"]] = app[@"name"];
+        }
+    }
+    self.editorAppNames = nameTable;
 
     // 【0.3.26 用户 log35】「已添加」排序条（横滑）：按**圆盘真实顺序**列出已添加的 App，
     //   每格 ◀ / ▶ 各点一下 = 前移 / 后移一格 ⇒ 直接决定圆盘上图标的位置（顺序 = ringApps 顺序）。
@@ -2991,7 +3001,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
     for (NSUInteger index = 0; index < ordered.count; index++) {
         NSString *bundleId = ordered[index];
-        NSString *name = MFRingDisplayNameForBundleId(bundleId);
+        // 显示名用「枚举时一次性取好的表」（见 editorAppNames）—— 排序条每次增删/移动都会重建，
+        // 不能在这里查 LSApplicationProxy（那是 SB 私有数据，必须留在 openEditor 的 guard 闸门内）。
+        NSString *name = self.editorAppNames[bundleId];
+        if (name.length == 0) {
+            name = [bundleId lastPathComponent];
+        }
         UIView *cell = [[UIView alloc] initWithFrame:CGRectMake(inset + (CGFloat)index * (cellW + gap),
                                                                 0.0, cellW, cellH)];
         cell.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
@@ -3211,6 +3226,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorOrderTitle = nil;      // 【0.3.26】排序条随面板一起收
     self.editorOrderScroll = nil;
     self.editorOrderCells = nil;
+    self.editorAppNames = nil;
     self.triggerPreviewView = nil;    // 【0.3.22】触发条预览随面板一起收
     self.triggerValueLabels = nil;
     [panel removeFromSuperview];
