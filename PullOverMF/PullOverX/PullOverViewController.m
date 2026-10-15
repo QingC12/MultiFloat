@@ -4,7 +4,7 @@
 //
 //  Created by Will Smillie on 4/8/19.
 //
-//  ============================ 0.4.11 修复（用户 log38）============================
+//  ============================ 0.4.12 修复（用户 log38）============================
 //  用户原话："我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小"。
 //  【根因】`applyLayoutPreservingHandlePosition:` 干了两件互相打架的事：
 //    ① 方法**开头**无条件 `appliedCardScale = 1.0`（抹掉当前缩放倍率）；
@@ -69,15 +69,15 @@
 #define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
-// 【0.4.11 用户 log39】"移动不灵敏 / 缩放太灵敏" —— 两条都对上实证：
+// 【0.4.12 用户 log39】"移动不灵敏 / 缩放太灵敏" —— 两条都对上实证：
 //   · 移动：用户三次按在**卡片底边内侧 1~5pt**（宿主坐标 y=682/685/686，底带起点 687）⇒ 差一点点，
 //     带子没接住（`MFEdgeBandHostView.hitTest` 只认带子子视图，空隙一律透传给 App）。
 //     ⇒ 底带向**卡内**再压入 `MF_CARD_EDGE_MOVE_INSIDE`，移动热区从 20pt 变 40pt 高。
 //   · 缩放：热区 96×96（向卡内 76pt）太大，App 内容里随手一按就开始缩放 ⇒ 缩到 76×76（内侧 56）。
-#define MF_CARD_EDGE_MOVE_INSIDE 20.0            // 【0.4.11】底边"移动"热区向卡片内侧压入的高度（原 0）
-#define MF_CARD_EDGE_CORNER_SCALE_WIDTH 76.0     // 【0.4.11】右下角"滑动缩放"热区宽度（96 → 76，用户反馈太灵敏）
-#define MF_CARD_EDGE_CORNER_SCALE_INSIDE 56.0    // 【0.4.11】热区向卡片**内侧**压入的高度（76 → 56）
-#define MF_CARD_EDGE_SCALE_DRAG_SPAN 260.0       // 【0.4.11】对角位移 260pt ≈ 倍率变化 1.0（原 200，用户反馈缩放太灵敏 → 降 30%）
+#define MF_CARD_EDGE_MOVE_INSIDE 20.0            // 【0.4.12】底边"移动"热区向卡片内侧压入的高度（原 0）
+#define MF_CARD_EDGE_CORNER_SCALE_WIDTH 76.0     // 【0.4.12】右下角"滑动缩放"热区宽度（96 → 76，用户反馈太灵敏）
+#define MF_CARD_EDGE_CORNER_SCALE_INSIDE 56.0    // 【0.4.12】热区向卡片**内侧**压入的高度（76 → 56）
+#define MF_CARD_EDGE_SCALE_DRAG_SPAN 260.0       // 【0.4.12】对角位移 260pt ≈ 倍率变化 1.0（原 200，用户反馈缩放太灵敏 → 降 30%）
 #define MF_CARD_EDGE_TAP_SLOP 24.0               // 【0.3.23】停靠小窗上"点"的位移容差（小于它=还原；原 16 太苛刻）
 #define MF_CARD_DOCK_ASPECT (9.0 / 16.0)         // 【0.3.23】停靠小窗固定 **9:16**（宽:高 = 竖屏比例）
                                                  //   0.3.22 误做成 16:9（横屏比例）——用户 log32 明确更正。
@@ -367,8 +367,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat mfEdgeDragStartX;           // 【0.3.13】自由移动起点（卡片 origin.x）
     CGFloat mfEdgeDragStartScale;       // 滑动缩放/捏合缩放起点
     CGFloat mfUserCardScaleOverride;    // >0 = 用户手动缩放档位（键盘弹出/面板关闭时清除）
-    // 【0.4.11 用户 log39】"调好大小后点 App 二级菜单又弹回默认大小"的真正收口开关。
-    //   0.4.11 只在 `applyLayoutPreservingHandlePosition:` 里补了"重排后重施"，但全工程还有 8 处
+    // 【0.4.12 用户 log39】"调好大小后点 App 二级菜单又弹回默认大小"的真正收口开关。
+    //   0.4.12 只在 `applyLayoutPreservingHandlePosition:` 里补了"重排后重施"，但全工程还有 8 处
     //   `restoreKeyboardZoomImmediately` / `restoreKeyboardZoomAnimated` 会**直接**把倍率写成 1.0
     //   （它们不看 override）—— 只要其中任何一条被 App 内部事件踩到，缩放照样丢。
     //   log39 实证：`缩放收尾 1.10` 之后 0.4s 内卡片就回到 308x667，且**没有**打"布局重排后恢复缩放"
@@ -2024,7 +2024,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         targetScale = 1.0;
     }
-    // 【0.4.11 用户 log38 收口】任何"回基准"请求都先过用户档位这一关：
+    // 【0.4.12 用户 log38 收口】任何"回基准"请求都先过用户档位这一关：
     //   log38 实证第三条路：reevaluateKeyboardZoomAnimated → applyResolvedCardScale →
     //   resolvedCardScale 在 canApplyCardScale=NO（安全区过渡/滚动 suspension/容器 hidden 等）
     //   时**提前 return 1.0**，连 override 优先级分支都走不到 ⇒ 日志里 `记住=1` 仍被写回
@@ -2035,7 +2035,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         CGFloat manualScale = [self mfLatchedManualCardScale];
         if (manualScale > 0.0) {
-            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.11 缩放保持·收口）",
+            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.12 缩放保持·收口）",
                   (long)source, manualScale);
             targetScale = manualScale;
             targetIsBase = NO;
@@ -2108,7 +2108,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
     NSUInteger generation = ++keyboardZoomGeneration;
     keyboardZoomApplied = !targetIsBase;
-    // 【0.4.11 诊断】"写回基准"是唯一会把卡片弹回默认大小的动作 ⇒ 原倍率非 1.0 时留一行，
+    // 【0.4.12 诊断】"写回基准"是唯一会把卡片弹回默认大小的动作 ⇒ 原倍率非 1.0 时留一行，
     // 下一轮若还复发，凭 source/override/latch 三个值即可锁定是哪条出口（配合拦截日志一起看）。
     if (targetIsBase && fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON) {
         MFLog(@"[card] 卡片倍率被写回基准 1.0（原 %.2f，source=%ld，override=%.2f，记住=%d，停靠边=%ld，panel=%ld）",
@@ -2164,7 +2164,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self applyResolvedCardScaleAnimated:animated source:POCardScaleTransitionSourceKeyboard];
 }
 
-/// 【0.4.11 用户 log39】用户手动缩放档位"当前是否有效"——有效则返回该倍率，否则返回 0。
+/// 【0.4.12 用户 log39】用户手动缩放档位"当前是否有效"——有效则返回该倍率，否则返回 0。
 /// 语义：面板打开、未停靠、已 latch（用户确实手动缩放过），且 override 是个合法非 1.0 倍率。
 /// 用途：所有"回基准（1.0）"的内部协调出口（restoreKeyboardZoom… / 旋转 / 布局重排）都先问这一句，
 /// 有值就重施用户档位 —— 这就是"点 App 二级菜单不该弹回默认大小"的兜底。
@@ -2178,7 +2178,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (panelState != POPanelStateOpen) {
         return 0.0;
     }
-    // ★【0.4.11 log38】不再要求 keyboardZoomContainer.hidden==NO：给隐藏容器施用户倍率无害，
+    // ★【0.4.12 log38】不再要求 keyboardZoomContainer.hidden==NO：给隐藏容器施用户倍率无害，
     //   而且重新显示时恰好就是"保持"；log38 的第三条回基准路可能正踩在 hidden 的瞬间。
     CGFloat scale = mfUserCardScaleOverride;
     if (!isfinite(scale) || scale <= 0.0 || fabs(scale - 1.0) <= PO_CARD_SCALE_EPSILON) {
@@ -2193,7 +2193,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     CGFloat manualScale = [self mfLatchedManualCardScale];
     if (manualScale > 0.0) {
-        // 【0.4.11】用户手动缩放生效中 → "回基准"改成"回到用户档位"（不再抹成 1.0）
+        // 【0.4.12】用户手动缩放生效中 → "回基准"改成"回到用户档位"（不再抹成 1.0）
         [self applyCardScaleTarget:manualScale animated:animated source:POCardScaleTransitionSourceReconcile];
         return;
     }
@@ -2206,9 +2206,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     CGFloat manualScale = [self mfLatchedManualCardScale];
     if (manualScale > 0.0) {
-        // 【0.4.11】同上：这是 log39"缩放被弹回默认"的收口点
+        // 【0.4.12】同上：这是 log39"缩放被弹回默认"的收口点
         [self applyCardScaleTarget:manualScale animated:NO source:POCardScaleTransitionSourceReconcile];
-        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.11 缩放保持）", manualScale);
+        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.12 缩放保持）", manualScale);
         return;
     }
     [self applyCardScaleTarget:1.0 animated:NO source:POCardScaleTransitionSourceReconcile];
@@ -2727,7 +2727,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         keyboardStateHostGeneration = 0;
         keyboardZoomSuppressedForCurrentSession = NO;
         mfUserCardScaleOverride = 0;   // 【0.3.11】面板关闭 = 清除手动缩放档位
-        mfManualCardScaleLatched = NO;  // 【0.4.11】同时撤掉"缩放保持"latch（下次打开是新会话）
+        mfManualCardScaleLatched = NO;  // 【0.4.12】同时撤掉"缩放保持"latch（下次打开是新会话）
         [self restoreKeyboardZoomImmediately];
         // 【0.3.19 血泪 log25】缩放态关闭（performDirectScaledProgrammaticCloseAnimation）
         // 会把手柄 rail center 挪到 handleEndCenter，完成后果链上没人复位——
@@ -3077,7 +3077,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.4.11 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.4.12 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3105,7 +3105,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                                    w20, CGRectGetHeight(cardRect));
     CGRect rightBand  = CGRectMake(CGRectGetMaxX(cardRect), CGRectGetMinY(cardRect),
                                    w20, CGRectGetHeight(cardRect));
-    // 【0.4.11 用户 log39】底带（移动）**向卡内再压入 20pt**：原来只有卡外 20pt，
+    // 【0.4.12 用户 log39】底带（移动）**向卡内再压入 20pt**：原来只有卡外 20pt，
     //   实测用户三次按在卡片底边内侧 1~5pt 都落空（`MFEdgeBandHostView.hitTest` 只认带子子视图，
     //   空隙一律透传给 App）⇒ 用户觉得"移动很不灵敏"。现在移动热区 = 卡内 20 + 卡外 20 = 40pt 高。
     //   （左右带 x 范围在卡片之外，与本带无重叠，所以不用担心抢走"侧边停靠"的点击。）
@@ -3764,8 +3764,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     mfDockedCardFrame = CGRectZero;
     mfEdgeDragMode = 0;
     mfEdgeDragFromDocked = NO;
-    // 【0.4.11 用户 log39】还原停靠时也要把"用户档位"一致性带回来：
-    //   停靠前是放大（>1.0）时，0.4.11 前这里会写成 0 ⇒ 还原后倍率丢失。改成"不等于 1.0 就记档 + 上 latch"。
+    // 【0.4.12 用户 log39】还原停靠时也要把"用户档位"一致性带回来：
+    //   停靠前是放大（>1.0）时，0.4.12 前这里会写成 0 ⇒ 还原后倍率丢失。改成"不等于 1.0 就记档 + 上 latch"。
     mfUserCardScaleOverride = fabs(restoreScale - 1.0) > PO_CARD_SCALE_EPSILON ? restoreScale : 0.0;
     mfManualCardScaleLatched = fabs(restoreScale - 1.0) > PO_CARD_SCALE_EPSILON;
     mfManualScaleAnchorRight = NO;
@@ -3855,7 +3855,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     mfDockedSide = toRight ? 1 : -1;   // 【0.3.20】记录停靠边（"再点同侧=还原"的唯一依据）
     mfUserCardScaleOverride = 0;       // 停靠不是缩放档位（还原时用 mfPreDockScale）
-    mfManualCardScaleLatched = NO;     // 【0.4.11】停靠期间不是缩放档位（还原按 mfPreDockScale 重施）
+    mfManualCardScaleLatched = NO;     // 【0.4.12】停靠期间不是缩放档位（还原按 mfPreDockScale 重施）
     mfManualScaleAnchorRight = NO;
     mfEdgeDragMode = 0;
     mfEdgeDragFromDocked = NO;
@@ -3900,7 +3900,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 松手收尾（缩放）：**不再吸附档位**（0.3.24 用户 log33：随便放大缩小），
 /// 只把当前倍率钳进 [mfMinCardScale, mfMaxCardScale]，并用弹簧动画收一下尾巴（Stheno 式手感）。
 /// 非 1.0 倍率记入 mfUserCardScaleOverride，键盘弹出/面板关闭时自动清除。
-/// ★【0.4.11 用户 log39】"随便放大缩小"里**放大也必须被记住**：
+/// ★【0.4.12 用户 log39】"随便放大缩小"里**放大也必须被记住**：
 ///   0.3.11 起这里写的是 `clamped >= 1.0 - eps ? 0.0 : clamped` ⇒ 只有缩小才进 override，
 ///   放大（>1.0）永远被当成"没档位"，于是任何一次内部"回基准"都把放大结果抹掉 —— 用户看到的就是
 ///   "点 App 二级菜单后弹回默认大小"。改成"只要不等于 1.0 就记档 + 上 latch"。
@@ -4031,7 +4031,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         scrollView.dragging || scrollView.decelerating || scrollSnapAnimationInProgress ||
         handlePanIntent != POHandlePanIntentNone;
 
-    // 【0.4.11 用户 log38】布局重排**绝不能丢用户手动缩放的倍率**。
+    // 【0.4.12 用户 log38】布局重排**绝不能丢用户手动缩放的倍率**。
     //   用户实测："调好窗口大小后，点 App 内某个二级菜单 ⇒ 浮窗弹回默认大小"。
     //   根因：下面那句无条件 `appliedCardScale = 1.0` 把倍率抹掉，而方法末尾那句"重施缩放"的
     //   判断条件恰好就是 `appliedCardScale != 1.0` ⇒ **永远为假（死代码）**（与铁律 5 里
@@ -4246,7 +4246,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self.contentView.frame = keyboardZoomContainer.bounds;
         [self mfApplyCardCornerChrome];   // 【0.3.24】圆角随卡宽自适应
     }];
-    // 【0.3.20 / 0.4.11】上面把 transform 打回 Identity 了：若是缩放态，按新 baseFrame 重算缩放锚**重施**，
+    // 【0.3.20 / 0.4.12】上面把 transform 打回 Identity 了：若是缩放态，按新 baseFrame 重算缩放锚**重施**，
     // 否则布局 passe 一来卡片就"视觉上弹回满尺寸"。
     //   ★ 0.3.20 写的判断是 `fabs(appliedCardScale - 1.0) > eps`，但 appliedCardScale 在本方法开头
     //     刚被置成 1.0 ⇒ 恒不成立、从来没执行过（死代码）—— 这正是"点二级菜单弹回默认大小"的根因。
@@ -4438,7 +4438,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)keyboardWillShow:(NSNotification *)notification{
     [self updateKeyboardAnimationFromNotification:notification];
     mfUserCardScaleOverride = 0;   // 【0.3.11】键盘弹出 = 恢复自动缩放（避让优先于手动档位）
-    mfManualCardScaleLatched = NO; // 【0.4.11】键盘避让同样优先于"缩放保持"
+    mfManualCardScaleLatched = NO; // 【0.4.12】键盘避让同样优先于"缩放保持"
     if (panelState == POPanelStateOpen && hostSession.state == POHostSessionStateLive &&
         hostSession.currentGeneration != 0) {
         [[ContextHostManager sharedInstance]

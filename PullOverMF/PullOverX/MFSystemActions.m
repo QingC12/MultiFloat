@@ -186,7 +186,7 @@ static BOOL MFSystemActionAppIsInstalled(NSString *bundleId) {
 
 #pragma mark - 动作①：截屏
 
-/// 【0.4.11 用户 log37】0.4.11 的三条候选在用户设备上**静默全灭**（日志只有"所有候选都没成功"，
+/// 【0.4.12 用户 log37】0.4.12 的三条候选在用户设备上**静默全灭**（日志只有"所有候选都没成功"，
 /// 连一条候选日志都没有 —— 类不存在 / selector 不响应都被无声跳过）。这一版：
 ///   ① 每条候选都打"类是否存在 / 是否响应 / 实际调用"诊断日志；
 ///   ② 已知类列表扩到 SBScreenShotter / SBScreenshotManager，类方法和实例方法都试；
@@ -232,7 +232,7 @@ static void MFSystemActionDumpScreenshotMethods(Class cls, NSString *label);
 
 /// 对单个"疑似截图管理"类：打存在性日志 → 尽一切可能拿到**实例** → 已知 selector 逐个试。
 /// 实例来源（log38 实证 + AppleWiki iOS 9.3 起实证：SBScreenShotter 已被 SBScreenshotManager 取代，
-/// 实例挂在 SpringBoard 的 screenshotManager 属性上——0.4.11 只试了类方法所以全灭）：
+/// 实例挂在 SpringBoard 的 screenshotManager 属性上——0.4.12 只试了类方法所以全灭）：
 ///   ① 类的 sharedInstance；
 ///   ② SpringBoard sharedApplication 的 screenshotManager 属性（是本类的实例才收）；
 ///   ③ 类名含 ScreenshotProvider 的（_SBMainScreenScreenshotProvider 等，无 sharedInstance）→ alloc/init。
