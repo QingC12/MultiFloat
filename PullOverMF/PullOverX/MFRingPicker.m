@@ -2,6 +2,24 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.2.7 核心改动 ============================
+//  ① **全屏 App 呼出圆盘 —— 换「SBSystemGestureManager 系统边缘手势」路线（triggr 实证）**：
+//     0.2.5 的 Stheno 5 个候选手势类在 iOS 17.3.1 **全部不存在**（log11/12 实证），
+//     而"SpringBoard 普通窗口在全屏 App 活跃时收不到屏幕触摸"（归档 38）是死结。
+//     本版改用 **SpringBoard 系统手势管理器**（triggr 开源实证 iOS 15~18 同一实现、
+//     覆盖 App 上/桌面/锁屏）：
+//       · `SBSystemGestureManager.mainDisplayManager` 拿到管理器；
+//       · `UIScreenEdgePanGestureRecognizer` 用 SpringBoard 同款私有 init
+//         `-initWithTarget:action:type:options:`（type=2，真手指才认，合成触摸不认）；
+//       · `[manager addGestureRecognizer:rec withType:0x7467000]`（自定义 type 号，
+//         远离系统自己的 type 数字）；`_setEdgeRegionSize:20` 收窄起手区；
+//       · 系统手势 hook 的两个放行开关（`_isGestureWithTypeAllowed:` /
+//         `_shouldEnableSystemGestureWithType:`，在 PullOverX.mm）对自定义 type 直接放行。
+//     只有触点落在**配置的贴边触发带 ±60pt 内**才接管呼出，带外立即 Failed 原样放行；
+//     沿边滑出 ≥ `mfRingEdgePanDistance`（默认 40pt）即呼出圆盘。
+//     兜底：即使 `_init` hook 没触发，启动 10 秒后再尝试安装一次（幂等）。
+//     崩溃自解除沿用 gestureguard（见 PullOverX.mm）。
+//
 //  ============================ 0.2.6 核心改动 ============================
 //  ① **编辑器过滤改用「桌面图标模型」判据（用户：又出现很多白图标/系统组件，
 //     "只显示桌面图标，或设置中显示的 APP"）**：
@@ -195,6 +213,7 @@
 //    mfRingScaleCountHigh number 数量 ≥ 此值 → 用 mfRingScaleMax（默认 24）
 //    mfRingGestureSummon BOOL  是否接管"便捷访问"手势呼出圆盘（默认 YES；hook 在 PullOverX.mm，
 //                              关掉则系统手势原样放行）
+//    mfRingEdgePanDistance number 0.2.7 系统边缘手势沿边滑出多少 pt 呼出圆盘（默认 40）
 //    mfRingFetchIcons   BOOL   是否抓取真图标（默认 YES；关掉就只用首字母）
 //    ringApps           array  bundleID 数组（**你自己指定圆盘内容，最优先**；
 //                              长按边缘触发条打开编辑器即会写入这里）
@@ -1239,7 +1258,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
         self.iconButtons = [NSMutableArray array];
 
-        MFLog(@"[ring] 0.2.6 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
+        MFLog(@"[ring] 0.2.7 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
               @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
@@ -2659,5 +2678,176 @@ void MFRingSummonFromSystemGestureAtPoint(CGPoint point) {
         [picker showAtPoint:point];
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 系统手势呼出异常：%@", exception);
+    }
+}
+
+#pragma mark - 系统边缘手势呼出（0.2.7，triggr 实证路线）
+
+// SpringBoard 系统手势管理器：iOS 15~18 同一实现（triggr 实证），它把边缘触摸
+// 路由给注册进来的手势识别器 —— **在全屏 App 上也有效**（这正是归档 38 死结的解法）。
+@interface SBSystemGestureManager : NSObject
++ (instancetype)mainDisplayManager;
+- (void)addGestureRecognizer:(UIGestureRecognizer *)recognizer withType:(unsigned long long)type;
+@end
+
+// SpringBoard 自己创建边缘手势用的私有 init（type=2）：系统手势路由只给这种
+// 识别器持续喂触摸 —— 普通公开 init 建的识别器收不到 App 上的触摸（triggr 实证）。
+@interface UIScreenEdgePanGestureRecognizer (MFRingPrivateEdge)
+- (instancetype)initWithTarget:(id)target action:(SEL)action type:(long long)type options:(unsigned long long)options;
+- (void)_setEdgeRegionSize:(double)size;
+@end
+
+// 自定义手势 type 号：取一个离系统自己 type 数字很远的值（triggr 同款）
+static const unsigned long long MFRingEdgeGestureType = 0x7467000ULL;
+
+// 自定义 type 的放行判定（PullOverX.mm 的 hook 会引用这个范围）
+BOOL MFRingIsEdgeGestureType(unsigned long long type) {
+    return type >= MFRingEdgeGestureType && type < MFRingEdgeGestureType + 4ULL;
+}
+
+// 动作目标：识别器只做识别，动作全部走这里（@try 全包，绝不能把异常抛回系统手势路由）
+@interface MFRingEdgePanTarget : NSObject
+@end
+@implementation MFRingEdgePanTarget
+- (void)mfEdgeSlid:(UIScreenEdgePanGestureRecognizer *)recognizer {
+    @try {
+        if (recognizer == nil) {
+            return;
+        }
+        // 圆盘开着/编辑器开着/未安装/用户关了开关 → 立即放弃，系统行为完全不受影响
+        if (!MFRingWantsSystemGestureSummon()) {
+            if (recognizer.state == UIGestureRecognizerStatePossible ||
+                recognizer.state == UIGestureRecognizerStateBegan) {
+                recognizer.state = UIGestureRecognizerStateFailed;   // 越早放行越不干扰
+            }
+            return;
+        }
+        MFRingPicker *picker = [MFRingPicker shared];
+        CGRect band = picker.triggerFrame;
+        if (CGRectIsEmpty(band)) {
+            recognizer.state = UIGestureRecognizerStateFailed;
+            return;
+        }
+        CGPoint location = [recognizer locationInView:nil];
+        if (!isfinite(location.x) || !isfinite(location.y)) {
+            location = CGPointMake(CGRectGetMidX(band), CGRectGetMidY(band));   // 兜底：触发带中心
+        }
+        // 只在贴边触发带 ±60pt 内生效；带外立即放行（右缘没有系统手势，左缘不挡回滑）
+        if (!CGRectContainsPoint(CGRectInset(band, -60.0, -60.0), location)) {
+            if (recognizer.state == UIGestureRecognizerStatePossible ||
+                recognizer.state == UIGestureRecognizerStateBegan) {
+                recognizer.state = UIGestureRecognizerStateFailed;
+            }
+            return;
+        }
+        if (recognizer.state != UIGestureRecognizerStateChanged &&
+            recognizer.state != UIGestureRecognizerStateEnded) {
+            return;   // Began 之前的层级不做事（等滑出距离）
+        }
+        // 沿边滑出 ≥ mfRingEdgePanDistance 才呼出（避免误触）
+        CGPoint translation = [recognizer translationInView:nil];
+        if (!isfinite(translation.x) || !isfinite(translation.y)) {
+            return;
+        }
+        UIRectEdge edge = recognizer.edges;
+        CGFloat along = 0.0;
+        if (edge == UIRectEdgeRight) {
+            along = -translation.x;          // 右缘往左滑 = 离边
+        } else if (edge == UIRectEdgeLeft) {
+            along = translation.x;
+        } else if (edge == UIRectEdgeTop) {
+            along = translation.y;
+        } else if (edge == UIRectEdgeBottom) {
+            along = -translation.y;
+        } else {
+            along = MAX(fabs(translation.x), fabs(translation.y));
+        }
+        double distance = MFRingNumber(@"mfRingEdgePanDistance", 40.0);
+        if (distance < 12.0) {
+            distance = 12.0;
+        }
+        if (along < (CGFloat)distance) {
+            return;
+        }
+        MFRingSummonFromSystemGestureAtPoint(location);
+    } @catch (NSException *edgeException) {
+        (void)edgeException;   // 失败放行
+    }
+}
+@end
+
+/// 由 PullOverX.mm 调用：向 SBSystemGestureManager 注册贴边识别器（幂等，可重试）。
+/// 时机 = SpringBoard 建好自己的手势管理器之后（_init hook 或启动 10s 兜底）。
+/// ⚠️ 不能替 SpringBoard 先建管理器（iOS 17 实测会 abort，triggr 同款教训）。
+void MFRingInstallEdgePanGesture(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ MFRingInstallEdgePanGesture(); });
+        return;
+    }
+    static BOOL installed = NO;
+    if (installed) {
+        return;
+    }
+    @try {
+        if (!MFRingBool(@"mfRingGestureSummon", YES)) {
+            return;   // 用户关了系统手势呼出 → 不注册
+        }
+        Class managerClass = objc_getClass("SBSystemGestureManager");
+        if (managerClass == nil) {
+            MFLog(@"[ring] 0.2.7 边缘手势：SBSystemGestureManager 不存在 -> 放弃（iOS 版本差异）");
+            return;
+        }
+        if (![managerClass respondsToSelector:@selector(mainDisplayManager)]) {
+            MFLog(@"[ring] 0.2.7 边缘手势：+mainDisplayManager 不存在 -> 放弃");
+            return;
+        }
+        id manager = ((id (*)(id, SEL))objc_msgSend)(managerClass, @selector(mainDisplayManager));
+        if (manager == nil) {
+            MFLog(@"[ring] 0.2.7 边缘手势：管理器还没就绪 -> 稍后重试");
+            return;
+        }
+        SEL addSelector = @selector(addGestureRecognizer:withType:);
+        if (![manager respondsToSelector:addSelector]) {
+            MFLog(@"[ring] 0.2.7 边缘手势：addGestureRecognizer:withType: 不存在 -> 放弃");
+            return;
+        }
+        Class panClass = objc_getClass("UIScreenEdgePanGestureRecognizer");
+        SEL privateInit = @selector(initWithTarget:action:type:options:);
+        if (panClass == nil || ![panClass instancesRespondToSelector:privateInit]) {
+            MFLog(@"[ring] 0.2.7 边缘手势：私有 init 不存在 -> 放弃");
+            return;
+        }
+        // 配置的触发边（与可见触发条同一边，默认 right）
+        UIRectEdge edge = UIRectEdgeRight;
+        NSString *edgeName = MFRingEdge();
+        if ([edgeName isEqualToString:@"left"]) {
+            edge = UIRectEdgeLeft;
+        } else if ([edgeName isEqualToString:@"top"]) {
+            edge = UIRectEdgeTop;
+        } else if ([edgeName isEqualToString:@"bottom"]) {
+            edge = UIRectEdgeBottom;
+        }
+        static MFRingEdgePanTarget *edgeTarget;
+        if (edgeTarget == nil) {
+            edgeTarget = [[MFRingEdgePanTarget alloc] init];
+        }
+        UIScreenEdgePanGestureRecognizer *recognizer =
+            [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:edgeTarget
+                                                              action:@selector(mfEdgeSlid:)
+                                                                type:(long long)2
+                                                             options:(unsigned long long)0];
+        recognizer.edges = edge;
+        recognizer.minimumNumberOfTouches = 1;
+        recognizer.maximumNumberOfTouches = 1;
+        if ([recognizer respondsToSelector:@selector(_setEdgeRegionSize:)]) {
+            [recognizer _setEdgeRegionSize:20.0];   // 起手区贴边 20pt（triggr 同款）
+        }
+        ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
+                                                                  recognizer, MFRingEdgeGestureType);
+        installed = YES;
+        MFLog(@"[ring] 0.2.7 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
+              edgeName, (unsigned long long)MFRingEdgeGestureType);
+    } @catch (NSException *installException) {
+        MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
     }
 }
