@@ -4,7 +4,16 @@
 //
 //  Created by Will Smillie on 4/8/19.
 //
-
+//  ============================ 0.3.11 核心改动（用户指定）============================
+//  本版只动浮窗（卡片），圆盘手势/动画（0.3.0 已终版冻结）零改动。
+//  ① **浮窗四周手势区**：卡片容器四边各加 22pt 透明热区（约束 pin 四边，跟 frame 走）——
+//     上/下边拖动 = 竖直移动小窗（复用手柄竖拖 applyPortraitHostedLandscapeVerticalHandleAnchorY:
+//     的同一套锚点/钳制，条件 canMovePortraitHostedLandscapeCardVertically 不满足即失效放行）；
+//     左/右边缘拖动 = 缩放小窗（复用 applyCardScaleTarget:，向内拖=缩小，范围 0.5~1.0）。
+//  ② **小窗吸附**：松手弹簧吸附——位置弹到上/下最近停靠端（现有钳制区间两端），
+//     缩放弹到 0.5/0.75/1.0 最近档（mfUserCardScaleOverride 记档，优先于键盘自动缩放；
+//     键盘弹出/面板关闭时自动清除，避让/关闭行为不受影响）。
+//
 #import "PullOverViewController.h"
 #import "POHostSessionController.h"
 #import "POQuickSwitchDragCoordinator.h"
@@ -16,6 +25,13 @@
 #import <objc/message.h>
 #include <stdlib.h>
 #define HANDLE_EDGE_GAP 5
+// 【0.3.11】浮窗四周手势区 + 吸附
+#define MF_CARD_EDGE_HOTZONE_WIDTH 22.0     // 四边透明热区宽度（pt）
+#define MF_CARD_EDGE_SCALE_MIN 0.5          // 手动缩放下限
+#define MF_CARD_EDGE_HOTZONE_TAG_TOP 10     // 热区 tag：0=上 1=下 2=左 3=右 基数
+#define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11
+#define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12
+#define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13
 #define CONTENT_EDGE_GAP 5
 #define CONTENT_CORNER_RADIUS 20   // 上游默认值（本 fork 改用 MFPanelCornerRadius()，见下）
 
@@ -231,6 +247,15 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL quickSwitchYieldActive;
     CGRect quickSwitchSavedContainerFrame;
     CGRect keyboardZoomBaseFrame;
+    // 【0.3.11】浮窗四周手势区（上/下边拖=竖直移动，左/右边缘拖=缩放）+ 松手吸附
+    UIView *mfEdgeHotzoneTop;
+    UIView *mfEdgeHotzoneBottom;
+    UIView *mfEdgeHotzoneLeft;
+    UIView *mfEdgeHotzoneRight;
+    NSInteger mfEdgeDragMode;           // 0=无 1=竖直移动 2=缩放
+    CGFloat mfEdgeDragStartAnchorY;     // 竖直拖动起点（手柄锚 Y）
+    CGFloat mfEdgeDragStartScale;       // 缩放拖动起点
+    CGFloat mfUserCardScaleOverride;    // >0 = 用户手动缩放档位（键盘弹出/面板关闭时清除）
     UIView *handleVisualHandoffSnapshotView;
     NSUInteger handleVisualHandoffGeneration;
     BOOL runtimeHostedCategoryTransitionAnimating;
@@ -400,6 +425,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [keyboardZoomContainer addSubview:shadowView];
 
     [keyboardZoomContainer addSubview:self.contentView];
+
+    // 【0.3.11】浮窗四周透明手势区：上/下边拖动 = 竖直移动小窗；左/右边缘拖动 = 缩放小窗。
+    //   约束 pin 到容器四边（容器 frame 手动设置时约束自动跟随）；挂在最上层。
+    [self mfInstallCardEdgeHotzones];
 
     NSString *savedPinnedBundleId = [[NSUserDefaults standardUserDefaults] stringForKey:@"lastPinnedBundleId"];
     if ([POApplicationHelper isUserFacingApplicationBundleId:savedPinnedBundleId]) {
@@ -1611,6 +1640,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (![self canApplyCardScale]) {
         return 1.0;
     }
+    // 【0.3.11】用户四边手势手动缩放的档位优先于键盘自动缩放（键盘弹出/面板关闭时会清除）
+    if (mfUserCardScaleOverride > 0) {
+        return mfUserCardScaleOverride;
+    }
     POCardScaleContext context = [self currentCardScaleContext];
     if ([self keyboardAutomaticScaleRequested]) {
         return [self keyboardZoomScaleForCardScaleContext:context];
@@ -2283,6 +2316,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         keyboardHideAnimationInFlight = NO;
         keyboardStateHostGeneration = 0;
         keyboardZoomSuppressedForCurrentSession = NO;
+        mfUserCardScaleOverride = 0;   // 【0.3.11】面板关闭 = 清除手动缩放档位
         [self restoreKeyboardZoomImmediately];
         [self removeKeyboardZoomSuspension:POKeyboardZoomSuspensionDragging];
         showingCantHost = NO;
@@ -2547,6 +2581,222 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }];
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
+}
+
+#pragma mark - 【0.3.11】浮窗四周手势区（移动/缩放 + 松手吸附）
+
+/// 安装四条透明热区（上/下/左/右），约束 pin 到卡片容器四边。
+/// 上/下边拖动 = 竖直移动小窗（复用手柄竖拖的同一套 clamp/锚点逻辑）；
+/// 左/右边缘拖动 = 缩放小窗（复用 applyCardScaleTarget，向内拖 = 缩小）。
+/// 松手 = 吸附：位置吸附上/下最近停靠端，缩放吸附 0.5/0.75/1.0 最近档。
+-(void)mfInstallCardEdgeHotzones{
+    if (keyboardZoomContainer == nil) {
+        return;
+    }
+    CGFloat w = MF_CARD_EDGE_HOTZONE_WIDTH;
+    NSDictionary<NSString *, UIView *> *zones =
+        @{ @"top"    : (mfEdgeHotzoneTop    = [[UIView alloc] initWithFrame:CGRectZero]),
+           @"bottom" : (mfEdgeHotzoneBottom = [[UIView alloc] initWithFrame:CGRectZero]),
+           @"left"   : (mfEdgeHotzoneLeft   = [[UIView alloc] initWithFrame:CGRectZero]),
+           @"right"  : (mfEdgeHotzoneRight  = [[UIView alloc] initWithFrame:CGRectZero]) };
+    [zones enumerateKeysAndObjectsUsingBlock:^(NSString *key, UIView *zone, __unused BOOL *stop) {
+        zone.translatesAutoresizingMaskIntoConstraints = NO;
+        zone.userInteractionEnabled = YES;
+        zone.backgroundColor = [UIColor clearColor];
+        if ([key isEqualToString:@"top"]) {
+            zone.tag = MF_CARD_EDGE_HOTZONE_TAG_TOP;
+        } else if ([key isEqualToString:@"bottom"]) {
+            zone.tag = MF_CARD_EDGE_HOTZONE_TAG_BOTTOM;
+        } else if ([key isEqualToString:@"left"]) {
+            zone.tag = MF_CARD_EDGE_HOTZONE_TAG_LEFT;
+        } else {
+            zone.tag = MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
+        }
+        UIPanGestureRecognizer *pan =
+            [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(mfCardEdgePan:)];
+        pan.cancelsTouchesInView = YES;
+        [zone addGestureRecognizer:pan];
+        [keyboardZoomContainer addSubview:zone];
+    }];
+    [NSLayoutConstraint activateConstraints:@[
+        // 上边：横向贯穿、贴顶
+        [mfEdgeHotzoneTop.topAnchor constraintEqualToAnchor:keyboardZoomContainer.topAnchor],
+        [mfEdgeHotzoneTop.leadingAnchor constraintEqualToAnchor:keyboardZoomContainer.leadingAnchor],
+        [mfEdgeHotzoneTop.trailingAnchor constraintEqualToAnchor:keyboardZoomContainer.trailingAnchor],
+        [mfEdgeHotzoneTop.heightAnchor constraintEqualToConstant:w],
+        // 下边：横向贯穿、贴底
+        [mfEdgeHotzoneBottom.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
+        [mfEdgeHotzoneBottom.leadingAnchor constraintEqualToAnchor:keyboardZoomContainer.leadingAnchor],
+        [mfEdgeHotzoneBottom.trailingAnchor constraintEqualToAnchor:keyboardZoomContainer.trailingAnchor],
+        [mfEdgeHotzoneBottom.heightAnchor constraintEqualToConstant:w],
+        // 左边：纵向贯穿、贴左（与上下热区重叠区由约束各自覆盖，手势互斥无碍）
+        [mfEdgeHotzoneLeft.leadingAnchor constraintEqualToAnchor:keyboardZoomContainer.leadingAnchor],
+        [mfEdgeHotzoneLeft.topAnchor constraintEqualToAnchor:keyboardZoomContainer.topAnchor],
+        [mfEdgeHotzoneLeft.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
+        [mfEdgeHotzoneLeft.widthAnchor constraintEqualToConstant:w],
+        // 右边：纵向贯穿、贴右
+        [mfEdgeHotzoneRight.trailingAnchor constraintEqualToAnchor:keyboardZoomContainer.trailingAnchor],
+        [mfEdgeHotzoneRight.topAnchor constraintEqualToAnchor:keyboardZoomContainer.topAnchor],
+        [mfEdgeHotzoneRight.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
+        [mfEdgeHotzoneRight.widthAnchor constraintEqualToConstant:w],
+    ]];
+}
+
+-(NSInteger)mfCardEdgeKindForTag:(NSUInteger)tag{
+    switch (tag) {
+        case MF_CARD_EDGE_HOTZONE_TAG_TOP:    return 0;
+        case MF_CARD_EDGE_HOTZONE_TAG_BOTTOM: return 1;
+        case MF_CARD_EDGE_HOTZONE_TAG_LEFT:   return 2;
+        case MF_CARD_EDGE_HOTZONE_TAG_RIGHT:  return 3;
+        default: return -1;
+    }
+}
+
+-(void)mfCardEdgePan:(UIPanGestureRecognizer *)pan{
+    NSInteger edge = [self mfCardEdgeKindForTag:pan.view.tag];
+    if (edge < 0) {
+        return;
+    }
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        // 条件与手柄竖拖完全一致；不满足就立刻失效放行（不抢内容触摸）
+        if (![self canMovePortraitHostedLandscapeCardVertically]) {
+            pan.enabled = NO;
+            pan.enabled = YES;
+            return;
+        }
+        [self cancelAutoNubTimer];
+        if (edge == 0 || edge == 1) {
+            // 竖直移动：与手柄竖拖同一套锚点/钳制
+            CGFloat anchor = [self currentHandleScreenY];
+            if (!isfinite(anchor)) {
+                pan.enabled = NO;
+                pan.enabled = YES;
+                return;
+            }
+            mfEdgeDragMode = 1;
+            mfEdgeDragStartAnchorY = anchor;
+            [self restoreKeyboardZoomImmediately];   // 与手柄竖拖一致：拖动前回到基准
+            MFLog(@"[card] 四边手势开始（上/下边拖动 = 移动，edge=%ld）", (long)edge);
+        } else {
+            // 缩放：起点 = 当前真实缩放
+            mfEdgeDragMode = 2;
+            mfEdgeDragStartScale = (appliedCardScale > 0 && isfinite(appliedCardScale))
+                ? appliedCardScale : 1.0;
+            MFLog(@"[card] 四边手势开始（左/右边缘拖动 = 缩放，edge=%ld 起点 %.2f）",
+                  (long)edge, mfEdgeDragStartScale);
+        }
+        return;
+    }
+
+    if (pan.state == UIGestureRecognizerStateChanged) {
+        if (mfEdgeDragMode == 1) {
+            CGFloat ty = [pan translationInView:self.view].y;
+            [self applyPortraitHostedLandscapeVerticalHandleAnchorY:mfEdgeDragStartAnchorY + ty];
+        } else if (mfEdgeDragMode == 2) {
+            CGFloat tx = [pan translationInView:self.view].x;
+            // 向内拖 = 缩小：左边缘向右拖 / 右边缘向左拖；向外拖 = 回到 1.0 封顶
+            CGFloat inward = (edge == 3) ? -tx : tx;
+            inward = MAX(inward, 0.0);
+            CGFloat span = MAX(CGRectGetWidth(keyboardZoomBaseFrame) * 0.6, 1.0);
+            CGFloat target = mfEdgeDragStartScale -
+                (inward / span) * (mfEdgeDragStartScale - MF_CARD_EDGE_SCALE_MIN);
+            target = MIN(MAX(target, MF_CARD_EDGE_SCALE_MIN), 1.0);
+            [self applyCardScaleTarget:target animated:NO source:POCardScaleTransitionSourceHandle];
+        }
+        return;
+    }
+
+    if (pan.state == UIGestureRecognizerStateEnded ||
+        pan.state == UIGestureRecognizerStateCancelled ||
+        pan.state == UIGestureRecognizerStateFailed) {
+        BOOL ended = pan.state == UIGestureRecognizerStateEnded;
+        if (mfEdgeDragMode == 1) {
+            // 【0.3.11】吸附：松手弹到上/下最近停靠端
+            if (ended) {
+                [self mfSnapCardVerticallyToNearestEdgeAnimated:YES];
+            }
+        } else if (mfEdgeDragMode == 2) {
+            // 【0.3.11】吸附：松手弹到 0.5 / 0.75 / 1.0 最近档
+            if (ended) {
+                [self mfSnapCardScaleAnimated:YES];
+            }
+        }
+        mfEdgeDragMode = 0;
+        [self resetAutoNubTimer];
+    }
+}
+
+/// 松手吸附（位置）：卡片底边弹到"顶停靠端 / 底停靠端"中最近的一端（弹簧动画）。
+/// 停靠端 = 现有竖直移动的钳制区间两端，与手柄竖拖/布局逻辑完全一致。
+-(void)mfSnapCardVerticallyToNearestEdgeAnimated:(BOOL)animated{
+    if (CGRectIsEmpty(keyboardZoomBaseFrame)) {
+        return;
+    }
+    CGFloat cardHeight = CGRectGetHeight(keyboardZoomBaseFrame);
+    if (cardHeight <= 0) {
+        return;
+    }
+    CGRect bounds = self.view.bounds;
+    UIEdgeInsets viewInsets = self.view.safeAreaInsets;
+    UIEdgeInsets windowInsets = self.view.window.safeAreaInsets;
+    CGFloat topInset = MAX(viewInsets.top, windowInsets.top) + CONTENT_EDGE_GAP;
+    CGFloat bottomInset = MAX(viewInsets.bottom, windowInsets.bottom) + CONTENT_EDGE_GAP;
+    CGFloat minimumCardBottomY = topInset + cardHeight;
+    CGFloat maximumCardBottomY = CGRectGetHeight(bounds) - bottomInset -
+        [self portraitHostedLandscapeReservedBottomChromeHeight] - HANDLE_EDGE_GAP;
+    if (maximumCardBottomY < minimumCardBottomY) {
+        return;
+    }
+    CGFloat currentBottom = CGRectGetMaxY(keyboardZoomBaseFrame);
+    CGFloat targetBottom = (currentBottom - minimumCardBottomY) <= (maximumCardBottomY - currentBottom)
+        ? minimumCardBottomY
+        : maximumCardBottomY;
+    CGFloat screenScale = UIScreen.mainScreen.scale;
+    CGRect baseFrame = keyboardZoomBaseFrame;
+    baseFrame.origin.y = round((targetBottom - cardHeight) * screenScale) / screenScale;
+    portraitHostedLandscapeHandleAnchorY = targetBottom + HANDLE_EDGE_GAP;
+    keyboardZoomBaseFrame = baseFrame;
+
+    void (^applyFrame)(void) = ^{
+        self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
+        self->keyboardZoomContainer.frame = baseFrame;
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.35
+                              delay:0.0
+             usingSpringWithDamping:0.75
+              initialSpringVelocity:0.3
+                            options:(UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction |
+                                     UIViewAnimationOptionCurveEaseOut)
+                         animations:applyFrame
+                         completion:nil];
+    } else {
+        [UIView performWithoutAnimation:applyFrame];
+    }
+    [self updatePortraitHostedLandscapeHandleForCurrentOffset];
+    [self syncHorizontalQuickSwitchPresentationAnchor];
+    MFLog(@"[card] 位置吸附：底边 %.0f -> %.0f（%@）", currentBottom, targetBottom,
+          animated ? @"弹簧" : @"直接");
+}
+
+/// 松手吸附（缩放）：弹到 0.5 / 0.75 / 1.0 中最近的一档（弹簧动画）。
+/// 非 1.0 档记入 mfUserCardScaleOverride，键盘弹出/面板关闭时自动清除。
+-(void)mfSnapCardScaleAnimated:(BOOL)animated{
+    CGFloat current = appliedCardScale > 0 && isfinite(appliedCardScale) ? appliedCardScale : 1.0;
+    const CGFloat steps[3] = { MF_CARD_EDGE_SCALE_MIN, 0.75, 1.0 };
+    CGFloat best = 1.0;
+    CGFloat bestDistance = CGFLOAT_MAX;
+    for (int i = 0; i < 3; i++) {
+        CGFloat distance = fabs(current - steps[i]);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = steps[i];
+        }
+    }
+    mfUserCardScaleOverride = best >= 1.0 - PO_CARD_SCALE_EPSILON ? 0.0 : best;
+    [self applyCardScaleTarget:best animated:animated source:POCardScaleTransitionSourceHandle];
+    MFLog(@"[card] 缩放吸附：%.2f -> %.2f（override=%g）", current, best, mfUserCardScaleOverride);
 }
 
 #pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧
@@ -2987,6 +3237,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 -(void)keyboardWillShow:(NSNotification *)notification{
     [self updateKeyboardAnimationFromNotification:notification];
+    mfUserCardScaleOverride = 0;   // 【0.3.11】键盘弹出 = 恢复自动缩放（避让优先于手动档位）
     if (panelState == POPanelStateOpen && hostSession.state == POHostSessionStateLive &&
         hostSession.currentGeneration != 0) {
         [[ContextHostManager sharedInstance]
