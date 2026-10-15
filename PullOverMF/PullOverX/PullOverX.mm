@@ -1356,7 +1356,21 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // ⚠️ constructor 阶段 Foundation/UIKit 尚未就绪 —— 这里只能用纯 C 日志。
     // 0.1.2 正是在这里调用 NSDateFormatter / [UIDevice currentDevice] 把整个 tweak 拖崩，
     // 结果 dylib 加载失败、桌面连手柄都不显示。
-    MFLogRawC("=== PullOverMF 0.3.27 加载（SpringBoard）===");
+    // ===== 【0.4.0】v0.3.x 终结 → v0.4.0 起：相机兼容拆包 =====
+    //  浮窗里的 App（微信"扫一扫" / QQ 拍照）用不了相机的根因：
+    //  画面被搬进 SpringBoard 了，但那个 App 自身仍是**后台** ⇒ 相机服务 cameracaptured
+    //  拒绝为它出帧。修法只能往相机守护进程注入、放宽"前台相机权"的判定。
+    //  ⚠️ 但**绝不能**把本 dylib 注进去：本 dylib 的未定义符号里有
+    //  `_UIApplicationLaunchOptionsSourceApplicationKey` / `_kCACornerCurveContinuous` /
+    //  `_OBJC_CLASS_$_UIApplication` 这类**加载期即绑定**（non-lazy）的 UIKit / QuartzCore
+    //  符号，而相机守护进程不加载这两个框架 ⇒ 注入即在 dyld 绑定阶段 "Symbol not found"
+    //  崩掉相机服务（比不修还糟）。
+    //  ⇒ 相机兼容独立成 **POCaptureCompat.dylib**（零 UIKit/零 QuartzCore 依赖，
+    //    plist 只注 cameracaptured）。见 Makefile / POCameraCompatibility.m /
+    //    POCaptureCompat.plist。本文件（主 dylib）依旧只注入 SpringBoard，
+    //    **一行新 hook 都没加**（前期"不要多个 hook，确保不卡开机"的要求继续满足）。
+    //  取证工具：`.workbuddy-ai/tmp/probe_undef.py <deb>` 列未定义符号并标出加载期绑定的全局量。
+    MFLogRawC("=== PullOverMF 0.4.0 加载（SpringBoard）===");
 
     // 【MF 0.1.3】Stheno 风格圆盘选择器：延迟 2 秒安装（等屏幕就绪）。
     // 零 hook；安装失败只损失圆盘，不影响浮窗与手柄。
@@ -1401,7 +1415,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 下次启动见标记则本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）。
     {
         if (POPosixFileExists(kPOGestureGuardPath)) {
-            MFLogRawC("PullOverMF 0.3.27: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
+            MFLogRawC("PullOverMF 0.4.0: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
         } else {
             int registered = 0;
             char summary[384];
@@ -1436,7 +1450,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                 }
             }
             if (registered == 0) {
-                MFLogRawC("PullOverMF 0.3.27: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
+                MFLogRawC("PullOverMF 0.4.0: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
             }
 
             // —— ② 0.2.7 注册 / 0.2.8 完整驱动：SBSystemGestureManager 系统边缘手势（triggr 实证 iOS 15~18）——
@@ -1473,7 +1487,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
             if (registered > 0) {
                 char line[512];
                 snprintf(line, sizeof(line),
-                         "PullOverMF 0.3.27: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
+                         "PullOverMF 0.4.0: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
                          registered, (summaryLen > 0 ? summary : "SBSystemGestureManager 边缘手势"));
                 MFLogRawC(line);
                 POPosixWriteFile(kPOGestureGuardPath);
@@ -1488,7 +1502,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                     MFRingInstallEdgePanGesture();
                 });
             } else {
-                MFLogRawC("PullOverMF 0.3.27: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
+                MFLogRawC("PullOverMF 0.4.0: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
             }
         }
     }

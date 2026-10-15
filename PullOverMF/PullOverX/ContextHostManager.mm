@@ -1483,7 +1483,13 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         }
     }
 
+    // 【0.4.0】把"当前应当享有前台相机权"的 App 告诉相机守护进程。
+    //  接收端是**独立的** POCaptureCompat.dylib（只注入 cameracaptured）——
+    //  主 dylib 里引用了 _UIApplicationLaunchOptionsSourceApplicationKey / _kCACornerCurveContinuous
+    //  这类加载期即绑定的 UIKit/QuartzCore 符号，注进相机守护进程会在 dyld 绑定阶段崩掉它，
+    //  所以相机那边的代码必须是另一个零依赖的 dylib（见 Makefile 与 POCameraCompatibility.m）。
     POSetCameraForegroundGrantBundleIdentifier(bundleId);
+    MFLog(@"[cam] 设定相机前台授权（准备托管）：%@", bundleId);
 
     if (self.ownedHostedScene && ![self.ownedHostedBundleId isEqualToString:bundleId]) {
         NSString *oldBundleId = [self.ownedHostedBundleId copy];
@@ -1732,6 +1738,8 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         self.ownedCanonicalSceneAwaitingLeaseBundleId = nil;
     }
     POSetCameraForegroundGrantBundleIdentifier(bundleId);
+    MFLog(@"[cam] 设定相机前台授权（前台租约生效）：%@ 场景 %@",
+          bundleId, NSStringFromClass([scene class]));
     [self startObservingHostedSceneEvents:scene];
     self.hostedLayerManager = nil;
     self.hostedFallbackHostManager = nil;
@@ -2005,7 +2013,9 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
     BOOL ownsScene = scene && scene == self.ownedHostedScene;
     int ownedProcessPID = ownsScene ? self.ownedHostedProcessPID : 0;
+    // 【0.4.0】放弃托管 ⇒ 立即撤销相机前台授权（否则退回桌面后那个 App 还留着后台相机权）
     POSetCameraForegroundGrantBundleIdentifier(nil);
+    MFLog(@"[cam] 清空相机前台授权（放弃托管 %@）", hostedId ?: @"-");
     self.foregroundLeaseActive = NO;
     self.activeLeaseGeneration = 0;
     [self releaseProcessAssertion];
