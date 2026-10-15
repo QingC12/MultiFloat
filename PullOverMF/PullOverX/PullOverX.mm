@@ -1356,7 +1356,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // ⚠️ constructor 阶段 Foundation/UIKit 尚未就绪 —— 这里只能用纯 C 日志。
     // 0.1.2 正是在这里调用 NSDateFormatter / [UIDevice currentDevice] 把整个 tweak 拖崩，
     // 结果 dylib 加载失败、桌面连手柄都不显示。
-    MFLogRawC("=== PullOverMF 0.2.13 加载（SpringBoard）===");
+    MFLogRawC("=== PullOverMF 0.2.14 加载（SpringBoard）===");
 
     // 【MF 0.1.3】Stheno 风格圆盘选择器：延迟 2 秒安装（等屏幕就绪）。
     // 零 hook；安装失败只损失圆盘，不影响浮窗与手柄。
@@ -1385,9 +1385,10 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 【0.2.12】log17 实证：松手点常已离开圆盘回到边缘一带（桌面呼出现在也走边缘手势）
     //          ⇒ 当前选中早已清空 = 仍要二次点击。修法：松手回退开时间窗内最近悬停选中
     //          （见 MFRingPicker.m releaseOpenBundleIdForPoint:）。
-    // 【0.2.13】log18 实证：回退窗口 2.0s 差 0.275s 没够着；悬停事件流离边即断
-    //          （"只有右边能滑动选中"）。修法：呼出即停靠 + 窗口 5.0s + 松手无选中
-    //          保留圆盘（不收起），后续交互全走圆盘自身手势/按钮。
+    // 【0.2.13】log18 实证：回退窗口 2.0s 差 0.275s 没够着；悬停事件流离边即断。
+    // 【0.2.14】按用户硬性要求重做：自查发现"只有右边能选中"真凶是展开后仍有的带门
+    //          （呼出后手指滑离触发带，事件全被自己丢掉）。修法：展开后去带门（全屏
+    //          任意位置 跟随/停靠/悬停/松手）+ 恢复跟随 + 松手必关圆盘（见 MFRingPicker.m）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         MFRingPickerInstall();
@@ -1400,7 +1401,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 下次启动见标记则本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）。
     {
         if (POPosixFileExists(kPOGestureGuardPath)) {
-            MFLogRawC("PullOverMF 0.2.13: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
+            MFLogRawC("PullOverMF 0.2.14: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
         } else {
             int registered = 0;
             char summary[384];
@@ -1435,7 +1436,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                 }
             }
             if (registered == 0) {
-                MFLogRawC("PullOverMF 0.2.13: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
+                MFLogRawC("PullOverMF 0.2.14: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
             }
 
             // —— ② 0.2.7 注册 / 0.2.8 完整驱动：SBSystemGestureManager 系统边缘手势（triggr 实证 iOS 15~18）——
@@ -1472,7 +1473,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
             if (registered > 0) {
                 char line[512];
                 snprintf(line, sizeof(line),
-                         "PullOverMF 0.2.13: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
+                         "PullOverMF 0.2.14: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
                          registered, (summaryLen > 0 ? summary : "SBSystemGestureManager 边缘手势"));
                 MFLogRawC(line);
                 POPosixWriteFile(kPOGestureGuardPath);
@@ -1487,7 +1488,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                     MFRingInstallEdgePanGesture();
                 });
             } else {
-                MFLogRawC("PullOverMF 0.2.13: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
+                MFLogRawC("PullOverMF 0.2.14: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
             }
         }
     }

@@ -1,6 +1,6 @@
 Package: com.qingc12.pullovermf
 Name: PullOverMF
-Version: 0.2.13
+Version: 0.2.14
 Architecture: iphoneos-arm64e
 Description: 悬浮分屏
 Maintainer: QingC12
