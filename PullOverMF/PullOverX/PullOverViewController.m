@@ -44,15 +44,21 @@
 #define HANDLE_EDGE_GAP 5
 // 【0.3.13】浮窗手势区：底部整条边=自由移动 / 左右侧=点击停靠；【0.3.21】底带右端=滑动缩放
 #define MF_CARD_EDGE_HOTZONE_WIDTH 20.0     // 【0.3.19】卡外热区带宽度（pt，用户指定 20）
-#define MF_CARD_EDGE_SCALE_MIN 0.5          // 手动缩放下限
-#define MF_CARD_EDGE_SCALE_MAX 1.0          // 手动缩放上限
-#define MF_CARD_EDGE_SCALE_SNAP_A 0.5       // 【0.3.21】滑动缩放松手吸附档（用户档位不变）
-#define MF_CARD_EDGE_SCALE_SNAP_B 0.75
+// 【0.3.24 用户 log33】缩放**解除档位限制**：随便放大缩小。
+//   下限 = 停靠小窗的宽度 / 基准卡宽（再小就比停靠小窗还小，见 mfMinCardScale）
+//   上限 = 屏宽/屏高各 95% 允许的最小倍率（不会把屏幕填满、留得下正常操作，见 mfMaxCardScale）
+//   0.5 / 0.75 / 1.0 三档吸附（0.3.21~0.3.23）已删除。
+#define MF_CARD_SCALE_SCREEN_RATIO 0.95     // 【0.3.24】放大上限：不超过主屏宽/高的 95%
+#define MF_CARD_CORNER_WIDTH_RATIO 0.17     // 【0.3.24】圆角上限 = 卡宽 ×0.17（停靠小窗 135 → 23）
+#define MF_CARD_ANIM_DURATION 0.34          // 【0.3.24】停靠/还原等卡片形变动画时长（Stheno 式弹簧）
+#define MF_CARD_ANIM_DAMPING 0.86           // 弹簧阻尼（欠阻尼 → 收尾有一点点回弹）
+#define MF_CARD_LIFT_SHADOW_OPACITY 0.42    // 【0.3.24】拖动中的"抬起"阴影（平时 0.28）
+#define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
 #define MF_CARD_EDGE_CORNER_SCALE_WIDTH 96.0     // 【0.3.23】右下角"滑动缩放"热区宽度（pt，原来是 84）
 #define MF_CARD_EDGE_CORNER_SCALE_INSIDE 76.0    // 【0.3.23】热区向卡片**内侧**压入的高度（原来是 40）
-#define MF_CARD_EDGE_SCALE_DRAG_SPAN 200.0       // 【0.3.23】对角位移 200pt ≈ 缩放一整个档位（原 220，改灵敏些）
+#define MF_CARD_EDGE_SCALE_DRAG_SPAN 200.0       // 【0.3.23/0.3.24】对角位移 200pt ≈ 倍率变化 1.0（无档位）
 #define MF_CARD_EDGE_TAP_SLOP 24.0               // 【0.3.23】停靠小窗上"点"的位移容差（小于它=还原；原 16 太苛刻）
 #define MF_CARD_DOCK_ASPECT (9.0 / 16.0)         // 【0.3.23】停靠小窗固定 **9:16**（宽:高 = 竖屏比例）
                                                  //   0.3.22 误做成 16:9（横屏比例）——用户 log32 明确更正。
@@ -77,14 +83,19 @@
 // 本 fork 改为：面板按屏宽比例缩小 → 打开后**停在屏幕正中**；圆角加大（默认 44，上游 20）。
 // 两个参数都可在 /var/mobile/Library/Preferences/com.mlgm.pulloverx.plist 里直接调整，
 // 改完 respring 生效（无需重新编译）：
-//     mfPanelWidthRatio   0.30 ~ 1.00   面板宽度占屏幕比例（默认 0.663）
-//     mfPanelCornerRadius 0    ~ 80     面板圆角（默认 44）
-// 【0.3.22 用户 log31】"悬浮窗默认打开的尺寸有点大" ⇒ 默认比例 0.78 → 0.663（= 原来默认的 85%，
-// 本机 335x727 → 285x618）。scale 语义不变（1.0 = 新默认尺寸），四边手势的档位全部跟着变。
+//     mfPanelWidthRatio   0.30 ~ 1.00   面板宽度占屏幕比例（默认 0.716）
+//     mfPanelCornerRadius 0    ~ 80     面板圆角（默认 44；**上限还会按卡宽 ×0.17 自适应**，
+//                                     所以停靠小窗（~135 宽）实际圆角 ≈ 23，不再是 44 的"胶囊"）
+// 【0.3.22 用户 log31】"悬浮窗默认打开的尺寸有点大" ⇒ 默认比例 0.78 → 0.663。
+// 【0.3.24 用户 log33】"默认尺寸有点小，在现在的基础上放大 8%" ⇒ 0.663 → 0.716
+// （本机 285x618 → 约 308x668）。scale 语义不变（1.0 = 新默认尺寸），四边手势的档位全部跟着变。
+// 【0.3.24 用户 log33】"默认尺寸有点小，在现在的基础上放大 8%" ⇒ 0.663 × 1.08 = 0.716
+// （本机 285x618 → 约 308x668）。0.663 / 0.78 都算"从没手动改过"的历史默认值，自动迁移。
 #define MF_PANEL_WIDTH_RATIO_KEY      @"mfPanelWidthRatio"
 #define MF_PANEL_CORNER_RADIUS_KEY    @"mfPanelCornerRadius"
-#define MF_DEFAULT_PANEL_WIDTH_RATIO  0.663
-#define MF_LEGACY_PANEL_WIDTH_RATIO   0.78      // 【0.3.22】旧默认值 → 视为"没改过"，用新默认
+#define MF_DEFAULT_PANEL_WIDTH_RATIO  0.716
+#define MF_LEGACY_PANEL_WIDTH_RATIO   0.78      // 【0.3.22】0.3.21 及以前的默认值
+#define MF_LEGACY2_PANEL_WIDTH_RATIO  0.663     // 【0.3.24】0.3.22~0.3.23 的默认值
 #define MF_DEFAULT_PANEL_CORNER_RADIUS 44.0
 
 static NSUserDefaults *MFGeometryDefaults(void) {
@@ -111,11 +122,12 @@ static CGFloat MFGeometryNumber(NSString *key, CGFloat fallback) {
 }
 
 /// 面板宽度占屏幕（画布）比例，钳制在 0.30 ~ 1.00
-/// 【0.3.22】plist 里若还是旧的 0.78（= 从没手动改过、只是老默认写进去过），
-/// 按新默认 0.663 处理，否则用户会觉得"新版本没生效"。
+/// 【0.3.22 / 0.3.24】plist 里若还是历史默认值（0.78 / 0.663，= 从没手动改过、只是老默认写进去过），
+/// 一律按**当前默认** 0.716 处理，否则用户会觉得"新版本默认尺寸没变"。
 static CGFloat MFPanelWidthRatio(void) {
     CGFloat ratio = MFGeometryNumber(MF_PANEL_WIDTH_RATIO_KEY, MF_DEFAULT_PANEL_WIDTH_RATIO);
-    if (fabs(ratio - MF_LEGACY_PANEL_WIDTH_RATIO) < 0.0005) {
+    if (fabs(ratio - MF_LEGACY_PANEL_WIDTH_RATIO) < 0.0005 ||
+        fabs(ratio - MF_LEGACY2_PANEL_WIDTH_RATIO) < 0.0005) {
         return MF_DEFAULT_PANEL_WIDTH_RATIO;
     }
     return MIN(MAX(ratio, 0.30), 1.00);
@@ -125,6 +137,18 @@ static CGFloat MFPanelWidthRatio(void) {
 static CGFloat MFPanelCornerRadius(void) {
     CGFloat radius = MFGeometryNumber(MF_PANEL_CORNER_RADIUS_KEY, MF_DEFAULT_PANEL_CORNER_RADIUS);
     return MIN(MAX(radius, 0.0), 80.0);
+}
+
+/// 【0.3.24 用户 log33】"停靠吸附后的小窗圆角化太严重了" —— 用户配的 44 是按**满宽卡片**
+/// （本机 308 宽）选的；停靠小窗只有 ~135 宽，44 ≈ 三分之一宽度 ⇒ 视觉上是"胶囊"。
+/// 所以圆角改成**随卡片宽度自适应**：上限 = 宽 × 0.17（135 → 23、308 → 52→仍取 44 用户值）。
+/// 下限 10 防止极端窄卡把圆角变成 0（直角）。
+static CGFloat MFCardCornerRadiusForWidth(CGFloat width) {
+    CGFloat base = MFPanelCornerRadius();
+    if (!(width > 0) || !isfinite(width)) {
+        return base;
+    }
+    return MIN(base, MAX(10.0, width * MF_CARD_CORNER_WIDTH_RATIO));
 }
 
 // 【MF 0.1.2】面板打开后，手柄（nub）与卡片右边缘之间的间距，默认 6pt
@@ -629,6 +653,115 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self applyLayoutPreservingHandlePosition:YES];
 }
 
+/// 【0.3.24 用户 log33】卡片"外观"（圆角 + 阴影路径）随**当前卡片宽度**刷新。
+/// 所有改过 keyboardZoomContainer.bounds 的地方（停靠 / 还原 / 布局 passe / 容器几何校正）
+/// 都必须走这里 —— 否则停靠小窗（135 宽）还挂着满宽卡的 44 圆角，看着就是个"胶囊"。
+-(void)mfApplyCardCornerChrome{
+    CGFloat radius = MFCardCornerRadiusForWidth(CGRectGetWidth(keyboardZoomContainer.bounds));
+    if (fabs(self.contentView.layer.cornerRadius - radius) > 0.01) {
+        self.contentView.layer.cornerRadius = radius;
+    }
+    shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
+                                                          cornerRadius:radius].CGPath;
+}
+
+/// 卡片当前"视觉"矩形（屏幕坐标）：把缩放变换算进去。
+/// ★★ 【0.3.24】`convertRect:keyboardZoomContainer.frame` 只做**父视图**坐标链换算，
+/// **不含卡片自身的 transform** ⇒ 缩放态下热区带一直按"基准尺寸"摆（用户缩到 0.6 后，
+/// 右下角缩放把手会飘到卡片外面去 —— 这正是"缩放不灵敏"的一部分）。
+/// 缩放是绕 layer.position（= center）的纯缩放，视觉矩形 = center ± (bounds × scale)/2。
+-(CGRect)mfCardVisualScreenRect{
+    if (keyboardZoomContainer.superview == nil || CGRectIsEmpty(keyboardZoomContainer.frame)) {
+        return CGRectZero;
+    }
+    CGSize boundsSize = keyboardZoomContainer.bounds.size;
+    CGAffineTransform t = keyboardZoomContainer.transform;
+    CGFloat sx = CGAffineTransformIsIdentity(t) ? 1.0 : hypot(t.a, t.b);
+    CGFloat sy = CGAffineTransformIsIdentity(t) ? 1.0 : hypot(t.c, t.d);
+    if (!(sx > 0.01) || !isfinite(sx)) { sx = 1.0; }
+    if (!(sy > 0.01) || !isfinite(sy)) { sy = 1.0; }
+    CGPoint c = keyboardZoomContainer.center;
+    CGRect visual = CGRectMake(c.x - boundsSize.width * sx / 2.0,
+                               c.y - boundsSize.height * sy / 2.0,
+                               boundsSize.width * sx, boundsSize.height * sy);
+    return [keyboardZoomContainer.superview convertRect:visual toView:self.view];
+}
+
+/// 【0.3.24】手动缩放的**下限**：不小于停靠小窗的宽度（用户 log33 指令）。
+/// 停靠小窗宽 = mfDockedCardFrameForSide: 算出来的宽（本机 135），基准卡宽 ≈ 308 → 0.438。
+-(CGFloat)mfMinCardScale{
+    CGFloat baseWidth = contentLayoutWidth > 0 ? contentLayoutWidth : CGRectGetWidth(keyboardZoomBaseFrame);
+    if (!(baseWidth > 0)) {
+        return 0.30;
+    }
+    CGRect dockFrame = [self mfDockedCardFrameForSide:YES];
+    CGFloat dockWidth = CGRectGetWidth(dockFrame);
+    if (!(dockWidth > 0) || !isfinite(dockWidth)) {
+        dockWidth = baseWidth * 0.44;
+    }
+    CGFloat minScale = dockWidth / baseWidth;
+    return MIN(MAX(minScale, 0.20), 1.0);
+}
+
+/// 【0.3.24】手动缩放的**上限**：主屏宽/高各 95% 允许的最小倍率（用户 log33：
+/// "最大不能超过手机主屏幕 95%，保证手机正常使用、不会导致被悬浮窗填满而无法操作"）。
+-(CGFloat)mfMaxCardScale{
+    CGRect bounds = self.view.bounds;
+    CGFloat baseWidth = contentLayoutWidth > 0 ? contentLayoutWidth : CGRectGetWidth(keyboardZoomBaseFrame);
+    CGFloat baseHeight = contentLayoutHeight > 0 ? contentLayoutHeight : CGRectGetHeight(keyboardZoomBaseFrame);
+    if (!(baseWidth > 0) || !(baseHeight > 0)) {
+        return 1.20;
+    }
+    CGFloat maxByWidth = (CGRectGetWidth(bounds) * MF_CARD_SCALE_SCREEN_RATIO) / baseWidth;
+    CGFloat maxByHeight = (CGRectGetHeight(bounds) * MF_CARD_SCALE_SCREEN_RATIO) / baseHeight;
+    CGFloat maxScale = MIN(maxByWidth, maxByHeight);
+    return MAX(maxScale, 1.0);
+}
+
+/// 【0.3.24】缩放/停靠后**整卡必须在屏内**：锚点算出来的矩形若越界（放大时最容易顶出屏），
+/// 就把基准 frame 的 origin 朝屏内挪同样多的量 —— 视觉上等价于"贴着允许的边界停住"。
+/// 返回是否真的挪过（供日志用）。
+-(BOOL)mfClampBaseFrameIntoScreenForScale:(CGFloat)scaleValue{
+    if (CGRectIsEmpty(keyboardZoomBaseFrame) || scaleValue <= 1.0 + PO_CARD_SCALE_EPSILON) {
+        return NO;
+    }
+    CGRect bounds = self.view.bounds;
+    CGFloat screenW = CGRectGetWidth(bounds);
+    CGFloat screenH = CGRectGetHeight(bounds);
+    if (screenW <= 0 || screenH <= 0) {
+        return NO;
+    }
+    CGFloat offsetX = [self mfCardScrollOffsetX];
+    CGFloat w = CGRectGetWidth(keyboardZoomBaseFrame) * scaleValue;
+    CGFloat h = CGRectGetHeight(keyboardZoomBaseFrame) * scaleValue;
+    if (w >= screenW - 2.0 * CONTENT_EDGE_GAP || h >= screenH - 2.0 * CONTENT_EDGE_GAP) {
+        return NO;   // 已经顶满屏（理论上被 95% 上限挡住了），不折腾
+    }
+    CGPoint center = [self keyboardZoomTargetCenterForBaseFrame:keyboardZoomBaseFrame
+                                                          scale:scaleValue
+                                                   anchorAtLeft:!mfManualScaleAnchorRight
+                                                    anchorAtTop:YES];
+    CGFloat left = center.x - offsetX - w / 2.0;
+    CGFloat top = center.y - h / 2.0;
+    CGFloat minLeft = [self mfCardScreenMinX];
+    CGFloat maxLeft = MAX(minLeft, screenW - CONTENT_EDGE_GAP - w);
+    CGFloat maxTop = MAX(CONTENT_EDGE_GAP, screenH - CONTENT_EDGE_GAP - h);
+    CGFloat dx = MIN(MAX(left, minLeft), maxLeft) - left;
+    CGFloat dy = MIN(MAX(top, CONTENT_EDGE_GAP), maxTop) - top;
+    if (fabs(dx) < 0.5 && fabs(dy) < 0.5) {
+        return NO;
+    }
+    CGRect frame = keyboardZoomBaseFrame;
+    frame.origin.x += dx;                                                    // 屏幕 dx == 内容 dx
+    frame.origin.y += dy;
+    CGFloat screenScale = UIScreen.mainScreen.scale;
+    frame.origin.x = round(frame.origin.x * screenScale) / screenScale;
+    frame.origin.y = round(frame.origin.y * screenScale) / screenScale;
+    keyboardZoomBaseFrame = frame;
+    portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(frame) + HANDLE_EDGE_GAP;
+    return YES;
+}
+
 -(void)reconcilePresentedContainerGeometry{
     if (panelState == POPanelStateClosed || keyboardZoomContainer.hidden ||
         quickSwitchYieldActive || keyboardZoomApplied ||
@@ -651,8 +784,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     keyboardZoomContainer.frame = keyboardZoomBaseFrame;
     shadowView.frame = keyboardZoomContainer.bounds;
     self.contentView.frame = keyboardZoomContainer.bounds;
-    shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
-                                                              cornerRadius:MFPanelCornerRadius()].CGPath;
+    [self mfApplyCardCornerChrome];   // 【0.3.24】圆角随卡宽自适应（小窗不再圆成胶囊）
     [self layoutContextView];
 }
 
@@ -2447,6 +2579,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (shouldOpen) {
         panelState = POPanelStateOpen;
         keyboardZoomContainer.hidden = NO;
+        [self mfAnimateCardAppearIfNeeded];   // 【0.3.24】打开动画：卡片淡入 + 阴影浮起
         // 【0.3.19】保险：打开完成即把 rail 摆到打开态位（跟随卡片右缘），不等下一次滚动回调
         [self mfUpdateVerticalHandleRailPosition];
         [self mfUpdateEdgeBands];   // 【0.3.19】打开完成 → 带子包住卡片
@@ -2856,7 +2989,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.3.23 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.3.24 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -2871,8 +3004,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         mfEdgeBandHost.hidden = YES;
         return;
     }
-    CGRect cardRect = [keyboardZoomContainer.superview convertRect:keyboardZoomContainer.frame
-                                                            toView:self.view];
+    // 【0.3.24】用**视觉矩形**（含缩放）而不是裸 frame —— 缩放态热区也要贴着看得见的卡片边。
+    CGRect cardRect = [self mfCardVisualScreenRect];
     if (CGRectIsEmpty(cardRect) || !isfinite(cardRect.origin.x) || !isfinite(cardRect.origin.y)) {
         mfEdgeBandHost.hidden = YES;
         return;
@@ -3032,10 +3165,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)mfCardBottomYRangeMin:(CGFloat *)minOut max:(CGFloat *)maxOut{
     CGFloat cardHeight = CGRectGetHeight(keyboardZoomBaseFrame);
     CGFloat screenHeight = CGRectGetHeight(self.view.bounds);
+    // 【0.3.24】缩放锚在"左上角" ⇒ 视觉上边 == 基准上边，视觉下边 = 基准下边 + 卡高×(倍率−1)。
+    // 所以下限不变（卡高 + 边距），上限要再扣掉放大出来的那一段，否则放大后往下拖会顶出屏。
+    CGFloat scaleValue = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+    CGFloat extraHeight = cardHeight * (scaleValue - 1.0);
     CGFloat minBottom = cardHeight + CONTENT_EDGE_GAP;
-    CGFloat maxBottom = screenHeight - HANDLE_EDGE_GAP;
+    CGFloat maxBottom = screenHeight - HANDLE_EDGE_GAP - extraHeight;
     if (maxBottom < minBottom) {          // 卡片比屏还高（异常）→ 只能锁在屏内
-        minBottom = maxBottom = screenHeight;
+        minBottom = maxBottom = screenHeight - extraHeight;
     }
     if (minOut) *minOut = minBottom;
     if (maxOut) *maxOut = maxBottom;
@@ -3053,17 +3190,33 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat minimumCardBottomY = 0;
     CGFloat maximumCardBottomY = 0;
     [self mfCardBottomYRangeMin:&minimumCardBottomY max:&maximumCardBottomY];
-    cardBottomY = MIN(MAX(cardBottomY, minimumCardBottomY), maximumCardBottomY);
+    // 【0.3.24 用户 log33】拖动越界走**橡皮筋**（只允许 25% 的越界量），松手时
+    // mfSettleCardPositionAnimated 会用弹簧弹回合法区间 —— 这就是"移动"这一步的动画。
+    CGFloat rawCardBottomY = cardBottomY;
+    if (rawCardBottomY < minimumCardBottomY) {
+        cardBottomY = minimumCardBottomY - (minimumCardBottomY - rawCardBottomY) * MF_CARD_MOVE_RUBBER_BAND;
+    } else if (rawCardBottomY > maximumCardBottomY) {
+        cardBottomY = maximumCardBottomY + (rawCardBottomY - maximumCardBottomY) * MF_CARD_MOVE_RUBBER_BAND;
+    } else {
+        cardBottomY = rawCardBottomY;
+    }
     // 【0.3.19】X 钳制必须在屏幕坐标空间做（originX 是内容坐标）：
     // 屏幕可见 x = 内容 x − contentOffset.x，钳完再加回 offset。
     CGFloat offsetX = [self mfCardScrollOffsetX];
     CGFloat screenMinX = [self mfCardScreenMinX];
-    CGFloat screenMaxX = [self mfCardScreenMaxXForCardWidth:cardWidth];
-    CGFloat screenX = originX - offsetX;
+    // 【0.3.24】X 钳制同样要用**视觉宽度**（放大后右缘会外扩），否则放大态往右拖会出屏。
+    CGFloat scaleValue = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+    CGFloat screenMaxX = [self mfCardScreenMaxXForCardWidth:cardWidth * scaleValue];
+    CGFloat rawScreenX = originX - offsetX;
+    CGFloat screenX = 0;
     if (screenMaxX < screenMinX) {
         screenX = screenMinX;
+    } else if (rawScreenX < screenMinX) {
+        screenX = screenMinX - (screenMinX - rawScreenX) * MF_CARD_MOVE_RUBBER_BAND;
+    } else if (rawScreenX > screenMaxX) {
+        screenX = screenMaxX + (rawScreenX - screenMaxX) * MF_CARD_MOVE_RUBBER_BAND;
     } else {
-        screenX = MIN(MAX(screenX, screenMinX), screenMaxX);
+        screenX = rawScreenX;
     }
     originX = screenX + offsetX;
     CGFloat screenScale = UIScreen.mainScreen.scale;
@@ -3092,6 +3245,116 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self syncHorizontalQuickSwitchPresentationAnchor];
     [self mfUpdateVerticalHandleRailPosition];   // 【0.3.19】rail 跟随移动后的卡片右缘
     [self mfUpdateEdgeBands];                    // 【0.3.19】带子跟手（每帧移动都同步）
+}
+
+/// 【0.3.24 用户 log33】拖动越界（橡皮筋）松手 → 弹簧弹回合法区间。
+/// 这是"移动"这一步的动画：拖动过程仍然 1:1 跟手，只有越界那部分弹回来。
+-(void)mfSettleCardPositionAnimated{
+    if (CGRectIsEmpty(keyboardZoomBaseFrame) || keyboardZoomContainer.hidden) {
+        return;
+    }
+    CGFloat cardHeight = CGRectGetHeight(keyboardZoomBaseFrame);
+    CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
+    if (cardWidth <= 0 || cardHeight <= 0) {
+        return;
+    }
+    CGFloat minBottom = 0, maxBottom = 0;
+    [self mfCardBottomYRangeMin:&minBottom max:&maxBottom];
+    CGFloat bottom = CGRectGetMaxY(keyboardZoomBaseFrame);
+    CGFloat targetBottom = MIN(MAX(bottom, minBottom), maxBottom);
+    CGFloat scaleValue = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+    CGFloat offsetX = [self mfCardScrollOffsetX];
+    CGFloat minScreenX = [self mfCardScreenMinX];
+    CGFloat maxScreenX = [self mfCardScreenMaxXForCardWidth:cardWidth * scaleValue];
+    CGFloat screenX = CGRectGetMinX(keyboardZoomBaseFrame) - offsetX;
+    CGFloat targetScreenX = maxScreenX < minScreenX ? minScreenX : MIN(MAX(screenX, minScreenX), maxScreenX);
+    if (fabs(targetBottom - bottom) <= 0.5 && fabs(targetScreenX - screenX) <= 0.5) {
+        return;   // 没越界 → 没有可弹回的位移
+    }
+    CGFloat screenScale = UIScreen.mainScreen.scale;
+    CGRect baseFrame = keyboardZoomBaseFrame;
+    baseFrame.origin.x = round((targetScreenX + offsetX) * screenScale) / screenScale;
+    baseFrame.origin.y = round((targetBottom - cardHeight) * screenScale) / screenScale;
+    keyboardZoomBaseFrame = baseFrame;
+    portraitHostedLandscapeHandleAnchorY = targetBottom + HANDLE_EDGE_GAP;
+    if (mfDockedSide != 0) {
+        mfDockedCardFrame = baseFrame;
+    }
+    CGPoint targetCenter = (fabs(scaleValue - 1.0) <= PO_CARD_SCALE_EPSILON)
+        ? CGPointMake(CGRectGetMidX(baseFrame), CGRectGetMidY(baseFrame))
+        : [self keyboardZoomTargetCenterForBaseFrame:baseFrame
+                                               scale:scaleValue
+                                        anchorAtLeft:!mfManualScaleAnchorRight
+                                         anchorAtTop:YES];
+    [UIView animateWithDuration:0.30
+                          delay:0.0
+         usingSpringWithDamping:0.78
+          initialSpringVelocity:0.25
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        self->keyboardZoomContainer.center = targetCenter;
+        self->keyboardZoomContainer.transform = (fabs(scaleValue - 1.0) <= PO_CARD_SCALE_EPSILON)
+            ? CGAffineTransformIdentity
+            : CGAffineTransformMakeScale(scaleValue, scaleValue);
+        self->shadowView.frame = self->keyboardZoomContainer.bounds;
+        self.contentView.frame = self->keyboardZoomContainer.bounds;
+    } completion:nil];
+    [self updatePortraitHostedLandscapeHandleForCurrentOffset];
+    [self syncHorizontalQuickSwitchPresentationAnchor];
+    [self mfUpdateVerticalHandleRailPosition];
+    [self mfUpdateEdgeBands];
+    MFLog(@"[card] 移动越界 → 弹簧回弹（屏x %.0f -> %.0f，底边 %.0f -> %.0f）",
+          screenX, targetScreenX, bottom, targetBottom);
+}
+
+/// 【0.3.24 用户 log33】"所有的悬浮窗手势操作都没有动画" —— 拖动时给卡片"抬起/落下"的观感：
+/// 阴影加深（0.28 → 0.42）+ 半径放大（8 → 18），松手弹簧收回。Stheno 里"上手即浮起"就是这个味道。
+-(void)mfSetCardDragLift:(BOOL)lifting{
+    if (shadowView == nil) {
+        return;
+    }
+    CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
+    CGFloat baseOpacity = CONTENT_SHADOW_OPACITY * progress;
+    CGFloat opacity = lifting ? MAX(baseOpacity, MF_CARD_LIFT_SHADOW_OPACITY) : baseOpacity;
+    CGFloat radius = lifting ? 18.0 : 8.0;
+    [UIView animateWithDuration:lifting ? 0.16 : 0.26
+                          delay:0.0
+         usingSpringWithDamping:0.9
+          initialSpringVelocity:0.0
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        self->shadowView.layer.shadowOpacity = opacity;
+        self->shadowView.layer.shadowRadius = radius;
+    } completion:nil];
+}
+
+/// 【0.3.24 用户 log33】打开浮窗的动画：卡片淡入 + 阴影浮起（与 scrollView 的滑入同时进行）。
+/// 上游只是 `hidden = NO` 硬出现，所以"打开"这一步以前完全没有动画。
+-(void)mfAnimateCardAppearIfNeeded{
+    if (keyboardZoomContainer == nil || keyboardZoomContainer.hidden) {
+        return;
+    }
+    [keyboardZoomContainer.layer removeAllAnimations];
+    keyboardZoomContainer.alpha = 0.0;
+    CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
+    self->shadowView.layer.shadowOpacity = 0;
+    [UIView animateWithDuration:0.26
+                          delay:0.0
+         usingSpringWithDamping:0.92
+          initialSpringVelocity:0.1
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        self->keyboardZoomContainer.alpha = 1.0;
+        self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
+    } completion:nil];
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.26s 弹簧，阴影浮起 %.2f）",
+          CONTENT_SHADOW_OPACITY * progress);
 }
 
 /// 【0.3.13】底部热区：pan 自由移动（X+Y 跟手，松手停在哪就是哪，不吸附）。
@@ -3130,6 +3393,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         [self cancelAutoNubTimer];
         mfEdgeDragLoggedChanged = NO;
+        [self mfSetCardDragLift:YES];   // 【0.3.24】拖动即"抬起"（阴影加深），松手收回
         if (inScaleZone) {
             // ---- 右下角滑动缩放（用户指定：向左/上 = 缩小，向右/下 = 放大；对角 200pt ≈ 一档）----
             mfEdgeDragMode = 2;
@@ -3184,6 +3448,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         pan.state == UIGestureRecognizerStateCancelled ||
         pan.state == UIGestureRecognizerStateFailed) {
         CGPoint endTranslation = [pan translationInView:self.view];
+        [self mfSetCardDragLift:NO];   // 【0.3.24】松手 → 阴影收回（所有分支都覆盖，含早退）
         if (mfEdgeDragMode == 2) {
             // 【0.3.23】缩放收尾：补最后一帧再吸附（短促手势可能只有 Began→Ended，没有 Changed）
             if (pan.state == UIGestureRecognizerStateEnded) {
@@ -3237,24 +3502,27 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             MFLog(@"[card] 自由移动结束（位移(%.1f,%.1f) 屏x=%.0f 底边 %.0f，不吸附）",
                   endTranslation.x, endTranslation.y,
                   endScreenX, CGRectGetMaxY(keyboardZoomBaseFrame));
+            [self mfSettleCardPositionAnimated];   // 【0.3.24】越界部分弹簧弹回
         }
         mfEdgeDragMode = 0;
         [self resetAutoNubTimer];
     }
 }
 
-/// 【0.3.23】右下角滑动缩放的**映射**（区域与归属判定已并入 `mfCardMovePan:` 的 mode=2）。
-/// 映射沿用 0.3.13 用户指定：向左/上（对角）滑 = 缩小，向右/下 = 放大；对角位移 200pt ≈ 一整个档位。
+/// 【0.3.24】右下角滑动缩放的**映射**（区域与归属判定已并入 `mfCardMovePan:` 的 mode=2）。
+/// 映射沿用 0.3.13 用户指定：向左/上（对角）滑 = 缩小，向右/下 = 放大；对角位移 200pt ≈ 一倍。
 /// 缩放锚点：右侧停靠时保持右上锚（右缘贴着屏缘不动），其余保持左上锚（用户指定：左上角不动）。
-/// 松手吸附 0.5 / 0.75 / 1.0 最近档（见 mfSnapCardScaleAnimated:）。
+/// 【0.3.24 用户 log33】**解除档位限制**：范围为 [mfMinCardScale, mfMaxCardScale]
+///   （下限 = 停靠小窗宽/基准宽，上限 = 屏宽/屏高各 95%），松手不再吸附到 0.5/0.75/1.0。
 -(void)mfApplyCornerScaleDragTranslation:(CGPoint)translation{
     CGFloat delta = (translation.x + translation.y) / 2.0;   // 对角
     CGFloat target = mfEdgeDragStartScale + delta / MF_CARD_EDGE_SCALE_DRAG_SPAN;
-    target = MIN(MAX(target, MF_CARD_EDGE_SCALE_MIN), MF_CARD_EDGE_SCALE_MAX);
+    target = MIN(MAX(target, [self mfMinCardScale]), [self mfMaxCardScale]);
     if (fabs(target - appliedCardScale) <= PO_CARD_SCALE_EPSILON) {
         return;
     }
     mfManualScaleAnchorRight = (mfDockedSide == 1);   // 右停靠 → 右缘不动；其余 → 左上角不动
+    [self mfClampBaseFrameIntoScreenForScale:target]; // 放大后整卡不出屏
     [self applyCardScaleTarget:target animated:NO source:POCardScaleTransitionSourceHandle];
 }
 
@@ -3307,6 +3575,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (CGRectIsEmpty(frame)) {
         return;
     }
+    // 【0.3.24 用户 log33】"所有的悬浮窗手势操作都没有动画" —— 0.3.22/0.3.23 这里是
+    // 无条件 `performWithoutAnimation`（日志里明明写着 animated=1，实际是硬跳）。现在真的动：
+    // 窗口矩形 + 阴影/内容尺寸 + 圆角一起走 0.34s 弹簧。
+    BOOL reallyAnimated = animated &&
+        !CGRectIsEmpty(keyboardZoomContainer.frame) &&
+        !CGRectEqualToRect(keyboardZoomContainer.frame, frame) &&
+        !keyboardZoomContainer.hidden;
     mfDockedCardFrame = frame;
     keyboardZoomBaseFrame = frame;
     portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(frame) + HANDLE_EDGE_GAP;
@@ -3318,19 +3593,32 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->keyboardZoomContainer.frame = frame;
         self->shadowView.frame = self->keyboardZoomContainer.bounds;
         self.contentView.frame = self->keyboardZoomContainer.bounds;
-        self->shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self->shadowView.bounds
-                                                                  cornerRadius:MFPanelCornerRadius()].CGPath;
+        [self mfApplyCardCornerChrome];
     };
-    [UIView performWithoutAnimation:changes];
+    if (reallyAnimated) {
+        [UIView animateWithDuration:MF_CARD_ANIM_DURATION
+                              delay:0.0
+             usingSpringWithDamping:MF_CARD_ANIM_DAMPING
+              initialSpringVelocity:0.2
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:changes
+                         completion:nil];
+    } else {
+        [UIView performWithoutAnimation:changes];
+    }
     // 容器尺寸变了 → App 内容按"填满裁切"重排（mfDockedSide 已在调用方写好）
     [self layoutContextView];
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
     [self mfUpdateVerticalHandleRailPosition];
     [self mfUpdateEdgeBands];
-    MFLog(@"[card] 停靠小窗落位：%@（内容 %.0f,%.0f %.0fx%.0f，9:16，scale 复位 1.00，animated=%d）",
+    MFLog(@"[card] 停靠小窗落位：%@（内容 %.0f,%.0f %.0fx%.0f，9:16，scale 复位 1.00，"
+          @"animated=%d 真动=%d，圆角 %.0f）",
           NSStringFromCGRect(frame), frame.origin.x, frame.origin.y,
-          CGRectGetWidth(frame), CGRectGetHeight(frame), (int)animated);
+          CGRectGetWidth(frame), CGRectGetHeight(frame), (int)animated, (int)reallyAnimated,
+          MFCardCornerRadiusForWidth(CGRectGetWidth(frame)));
 }
 
 /// 【0.3.21】停靠态：点小窗 → 还原停靠前的尺寸与位置（用户 log30 指令）。
@@ -3388,25 +3676,44 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(restoreFrame) + HANDLE_EDGE_GAP;
     mfUserCardPositionPinned = YES;
     [self cancelAutoNubTimer];
-    [UIView performWithoutAnimation:^{
+    // 【0.3.24 用户 log33】还原也要"有动画"：窗口矩形 + 阴影/内容尺寸 + 圆角一起弹簧回位。
+    void (^changes)(void) = ^{
         self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
         self->keyboardZoomContainer.frame = restoreFrame;   // 尺寸先回基准（9:16 小窗 → 满卡）
         self->shadowView.frame = self->keyboardZoomContainer.bounds;
         self.contentView.frame = self->keyboardZoomContainer.bounds;
-        self->shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:self->shadowView.bounds
-                                                                  cornerRadius:MFPanelCornerRadius()].CGPath;
-    }];
+        [self mfApplyCardCornerChrome];
+    };
+    BOOL reallyAnimated = !CGRectIsEmpty(keyboardZoomContainer.frame) &&
+        !CGRectEqualToRect(keyboardZoomContainer.frame, restoreFrame) &&
+        !keyboardZoomContainer.hidden;
+    if (reallyAnimated) {
+        [UIView animateWithDuration:MF_CARD_ANIM_DURATION
+                              delay:0.0
+             usingSpringWithDamping:MF_CARD_ANIM_DAMPING
+              initialSpringVelocity:0.2
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:changes
+                         completion:nil];
+    } else {
+        [UIView performWithoutAnimation:changes];
+    }
     [self layoutContextView];   // mfDockedSide 已清 → 回到"完整装入"
     if (fabs(restoreScale - 1.0) > PO_CARD_SCALE_EPSILON) {
-        [self applyCardScaleTarget:restoreScale animated:NO source:POCardScaleTransitionSourceHandle];
+        // 【0.3.24】尺寸弹簧回位完成后再叠缩放档位（两段都是弹簧，衔接自然）
+        [self applyCardScaleTarget:restoreScale animated:reallyAnimated
+                            source:POCardScaleTransitionSourceHandle];
     }
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
     [self mfUpdateVerticalHandleRailPosition];
     [self mfUpdateEdgeBands];
-    MFLog(@"[card] 停靠还原：%@侧 → 尺寸 %.2f（屏x %.0f -> %.0f，底边 %.0f）",
+    MFLog(@"[card] 停靠还原：%@侧 → 尺寸 %.2f（屏x %.0f -> %.0f，底边 %.0f，动画=%d）",
           fromSide == 1 ? @"右" : @"左", restoreScale, currentScreenX,
-          CGRectGetMinX(restoreFrame) - [self mfCardScrollOffsetX], CGRectGetMaxY(restoreFrame));
+          CGRectGetMinX(restoreFrame) - [self mfCardScrollOffsetX], CGRectGetMaxY(restoreFrame),
+          (int)reallyAnimated);
 }
 
 /// 【0.3.19】左/右侧热区：点击停靠到该侧（已停靠该侧再点=还原满尺寸）。
@@ -3492,36 +3799,33 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     });
 }
 
-/// 松手吸附（缩放）：弹到 0.5 / 0.75 / 1.0 中最近的一档（弹簧动画）。
-/// 非 1.0 档记入 mfUserCardScaleOverride，键盘弹出/面板关闭时自动清除。
-/// 【0.3.21】吸附回满尺寸（1.0）时清掉停靠标记（已经不是"小窗"了，盖层要撤）。
+/// 松手收尾（缩放）：**不再吸附档位**（0.3.24 用户 log33：随便放大缩小），
+/// 只把当前倍率钳进 [mfMinCardScale, mfMaxCardScale]，并用弹簧动画收一下尾巴（Stheno 式手感）。
+/// 非 1.0 倍率记入 mfUserCardScaleOverride，键盘弹出/面板关闭时自动清除。
 -(void)mfSnapCardScaleAnimated:(BOOL)animated{
     CGFloat current = appliedCardScale > 0 && isfinite(appliedCardScale) ? appliedCardScale : 1.0;
-    const CGFloat steps[3] = { MF_CARD_EDGE_SCALE_SNAP_A, MF_CARD_EDGE_SCALE_SNAP_B, 1.0 };
-    CGFloat best = 1.0;
-    CGFloat bestDistance = CGFLOAT_MAX;
-    for (int i = 0; i < 3; i++) {
-        CGFloat distance = fabs(current - steps[i]);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = steps[i];
-        }
+    CGFloat minScale = [self mfMinCardScale];
+    CGFloat maxScale = [self mfMaxCardScale];
+    CGFloat clamped = MIN(MAX(current, minScale), maxScale);
+    if (fabs(clamped - 1.0) <= PO_CARD_SCALE_EPSILON) {
+        clamped = 1.0;
     }
-    mfUserCardScaleOverride = best >= 1.0 - PO_CARD_SCALE_EPSILON ? 0.0 : best;
+    mfUserCardScaleOverride = clamped >= 1.0 - PO_CARD_SCALE_EPSILON ? 0.0 : clamped;
     if (mfDockedSide != 0) {
         // 【0.3.22】停靠小窗不出缩放热区 ⇒ 正常到不了这里；真到了就只改档位、绝不动停靠标记
         // （0.3.21 这里会把 mfDockedSide 清 0 → 小窗盖层消失、点小窗再也不能还原）
-        MFLog(@"[card] 缩放吸附（停靠态，保持停靠边=%ld）：%.2f -> %.2f",
-              (long)mfDockedSide, current, best);
-        [self applyCardScaleTarget:best animated:animated source:POCardScaleTransitionSourceHandle];
+        MFLog(@"[card] 缩放收尾（停靠态，保持停靠边=%ld）：%.2f -> %.2f",
+              (long)mfDockedSide, current, clamped);
+        [self applyCardScaleTarget:clamped animated:animated source:POCardScaleTransitionSourceHandle];
         return;
     }
-    if (best >= 1.0 - PO_CARD_SCALE_EPSILON) {
+    if (clamped >= 1.0 - PO_CARD_SCALE_EPSILON) {
         mfDockedSide = 0;   // 回到满尺寸 = 不再是小窗
     }
-    [self applyCardScaleTarget:best animated:animated source:POCardScaleTransitionSourceHandle];
-    MFLog(@"[card] 缩放吸附：%.2f -> %.2f（override=%g，停靠边=%ld）",
-          current, best, mfUserCardScaleOverride, (long)mfDockedSide);
+    [self mfClampBaseFrameIntoScreenForScale:clamped];
+    [self applyCardScaleTarget:clamped animated:animated source:POCardScaleTransitionSourceHandle];
+    MFLog(@"[card] 缩放收尾：%.2f -> %.2f（范围 %.2f..%.2f，override=%g，停靠边=%ld）",
+          current, clamped, minScale, maxScale, mfUserCardScaleOverride, (long)mfDockedSide);
 }
 
 #pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧
@@ -3726,7 +4030,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         MFLog(@"[ui] 面板几何: 卡片 %.0fx%.0f @y=%.0f | 屏幕 %.0fx%.0f | 比例 %.2f | 左右留白 %.0f | 圆角 %.0f",
               contentLayoutWidth, contentLayoutHeight, normalCardFrame.origin.y,
               CGRectGetWidth(bounds), CGRectGetHeight(bounds), scale,
-              MAX(0.0, (CGRectGetWidth(bounds) - contentLayoutWidth) / 2.0), MFPanelCornerRadius());
+              MAX(0.0, (CGRectGetWidth(bounds) - contentLayoutWidth) / 2.0),
+              MFCardCornerRadiusForWidth(contentLayoutWidth));
     }
 
     BOOL horizontalMode = portraitHostedLandscapeOptimization;
@@ -3824,8 +4129,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->keyboardZoomBaseFrame = normalCardFrame;
         shadowView.frame = keyboardZoomContainer.bounds;
         self.contentView.frame = keyboardZoomContainer.bounds;
-        shadowView.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:shadowView.bounds
-                                                                  cornerRadius:MFPanelCornerRadius()].CGPath;
+        [self mfApplyCardCornerChrome];   // 【0.3.24】圆角随卡宽自适应
     }];
     // 【0.3.20】上面把 transform 打回 Identity 了：若当前是缩放/停靠态，按新 baseFrame 重算缩放锚，
     // 否则布局 passe 一来，停靠态卡片会"视觉上弹回满尺寸"。

@@ -1148,6 +1148,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
 @property (nonatomic, strong) UILongPressGestureRecognizer *stripLongPress;
+// 【0.3.24】呼出动画（用户 log33：要从屏幕边缘"拖出来"、由小到大，而不是突然出现在屏幕中间）
+@property (nonatomic, assign) BOOL ringIntroAnimating;              // 呼出动画进行中（跟手改走 pending）
+@property (nonatomic, assign) NSUInteger ringIntroGeneration;       // 代次（作废过期完成回调）
+@property (nonatomic, assign) CGPoint ringIntroPendingCenter;       // 动画期间手指要求的落点
+@property (nonatomic, assign) BOOL ringIntroPendingCenterValid;
 + (instancetype)shared;
 - (void)install;
 - (void)teardownHostViews;
@@ -1165,7 +1170,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)latchToParkAnimated:(BOOL)animated;
 - (void)scheduleSettle;
 - (void)buildRingInContainer:(UIView *)container;
+/// 【0.3.24】delay = 推迟抓图的秒数（呼出动画期间不抓好图，避免掉帧）
+- (void)scheduleIconFillWithGeneration:(NSUInteger)generation delay:(NSTimeInterval)delay;
 - (void)scheduleIconFillWithGeneration:(NSUInteger)generation;
+/// 【0.3.24】呼出动画的起点圆心：贴着**触发条所在的那条屏幕边**，让圆盘"从边缘拖出来"
+- (CGPoint)ringIntroStartCenterForBounds:(CGRect)bounds target:(CGPoint)target;
 - (void)refreshRingContentsIfVisible;
 - (void)scheduleAutoBundleIdEnumeration;
 - (void)updateSelectionForPoint:(CGPoint)point;
@@ -1813,6 +1822,30 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark 展开 / 收起
 
+/// 【0.3.24】呼出动画的起点圆心：贴着**触发条所在的那条屏幕边**。
+/// 右缘呼出 → 起点圆心落在屏右缘内侧一点点（配合 28% 缩放，看起来就是"从右边被拖出来"）；
+/// 左/上/下同理。纵向（或横向）沿用目标圆心，只把"垂直于边"的那一维移到边上。
+- (CGPoint)ringIntroStartCenterForBounds:(CGRect)bounds target:(CGPoint)target {
+    if (CGRectIsEmpty(bounds)) {
+        return target;
+    }
+    CGFloat margin = MAX(0.0, MFRingNumber(@"mfRingEdgeMargin", 12.0));
+    CGFloat extent = MFRingCurrentGeometry(bounds).extent + margin;   // 与 clampRingCenter 同一套几何
+    CGPoint p = target;
+    CGFloat inset = MAX(8.0, extent * 0.18);                          // 起点圆心离屏边一点点
+    NSString *edge = MFRingEdge();
+    if ([edge isEqualToString:@"left"]) {
+        p.x = CGRectGetMinX(bounds) + inset;
+    } else if ([edge isEqualToString:@"top"]) {
+        p.y = CGRectGetMidY(bounds) - inset;   // 圆盘只在下半屏，顶部条同样从"上缘方向"出来
+    } else if ([edge isEqualToString:@"bottom"]) {
+        p.y = CGRectGetMaxY(bounds) - inset;
+    } else {
+        p.x = CGRectGetMaxX(bounds) - inset;   // right（默认）
+    }
+    return p;
+}
+
 /// 展开圆盘。anchor = 圆盘初始圆心（= 手指位置）。
 /// 0.1.9 起**同步构建**：与 PullOver 手柄一样在手势回调里直接改视图（那是已验证可用的做法）。
 - (void)showAtPoint:(CGPoint)point {
@@ -1882,35 +1915,49 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         [self buildRingInContainer:container];
         MFLog(@"[ring] <<< 建圆盘 ok：%lu 个图标", (unsigned long)self.iconButtons.count);
 
-        self.ringRoot.center = [self clampRingCenter:point];
+        CGPoint targetCenter = [self clampRingCenter:point];
+        CGPoint startCenter = [self ringIntroStartCenterForBounds:bounds target:targetCenter];
+        self.ringRoot.center = startCenter;
 
-        // 【0.3.23 用户 log32】呼出动画重做 —— "从屏幕边缘由小到大"，与 Stheno 一致。
-        //   逆向实证（analysis/stheno-ring-gesture-study.md）：Stheno 用的是 SwiftUI `AnyTransition.scale`
-        //   + opacity + spring 弹性（`CustomSpringAnimation` / `DampingFraction` 就是它的标志），
-        //   而且**只缩放圆盘本体**，整屏不做任何遮罩。
-        //   ★ 0.3.22 及以前是"整屏容器 0.55 缩放 + 整屏 18% 黑遮罩淡入"⇒ 用户看到的是两层不对的东西：
-        //     ① 呼出瞬间**整个屏幕泛起一层浅黑**（那就是 container 的 0.18 黑底）；
-        //     ② 缩放中心在**屏幕正中**，不是从边缘长出来。
-        //   现在：容器保持全透明 + 恒等变换；只把 ringRoot 从 16% 弹性放大到 100%，起点就在呼出点
-        //   （手指/屏幕边缘）⇒ 视觉上就是"从边缘由小到大弹出来"。AllowUserInteraction 保证弹出中即可跟手。
-        container.alpha = 1.0;                       // 【0.3.23】容器不再淡入（它现在全透明）
-        container.transform = CGAffineTransformIdentity;
+        // 【0.3.24 用户 log33】呼出动画重做（第 2 版）——"像从屏幕右边缘拖出来"，不是"突然出现在屏幕中间"。
+        //   ★ 0.3.23 的错在哪：只缩放 ringRoot，而缩放是**绕自身中心**的；圆盘半径 117 且圆心被
+        //     clampRingCenter 顶到屏幕内 ≥129pt（本机召唤点 x=378 → 圆心被钳到 301），
+        //     于是"从中心往两边长" ⇒ 看上去就是**屏幕中间冒出来**。
+        //   ★ 现在 = **位移 + 缩放同时做**：起点圆心贴在触发条那条屏边（右缘呼出 → 圆心落在
+        //     屏右缘内侧一点点），从 28% 弹到 100% 并滑到指尖点 ⇒ 观感就是"从边缘被拖出来"。
+        //   ★ 动画期间跟手改为记 pending（见 moveRingToPoint:），动画结束再落到最新手指点，
+        //     这样不会和动画抢 center（0.3.23 那种"两股力气打架"就是不流畅的来源之一）。
+        self.ringIntroGeneration += 1;
+        NSUInteger introGeneration = self.ringIntroGeneration;
+        self.ringIntroAnimating = YES;
+        self.ringIntroPendingCenterValid = NO;
+        self.ringIntroPendingCenter = targetCenter;
         UIView *popRoot = self.ringRoot;
         popRoot.alpha = 0.0;
-        popRoot.transform = CGAffineTransformMakeScale(0.16, 0.16);
-        [UIView animateWithDuration:0.42
+        popRoot.transform = CGAffineTransformMakeScale(0.28, 0.28);
+        [UIView animateWithDuration:0.38
                               delay:0.0
-             usingSpringWithDamping:0.72
-              initialSpringVelocity:0.35
+             usingSpringWithDamping:0.80
+              initialSpringVelocity:0.30
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
                          animations:^{
             popRoot.alpha = 1.0;
+            popRoot.center = targetCenter;
             popRoot.transform = CGAffineTransformIdentity;
-        } completion:nil];
-        MFLog(@"[ring] 呼出动画：从边缘(%.0f,%.0f) 由小到大弹出（16%% → 100%%，弹性 0.72，无整屏遮罩）",
-              point.x, point.y);
+        } completion:^(__unused BOOL finished) {
+            if (introGeneration != self.ringIntroGeneration) {
+                return;   // 已被停靠/收起接管
+            }
+            self.ringIntroAnimating = NO;
+            if (self.ringIntroPendingCenterValid && self.ringRoot == popRoot) {
+                popRoot.center = self.ringIntroPendingCenter;
+                self.ringIntroPendingCenterValid = NO;
+            }
+        }];
+        MFLog(@"[ring] 呼出动画：由小到大 28%% → 100%%（弹性 0.80），从 %@(%.0f,%.0f) 滑出到 (%.0f,%.0f)",
+              MFRingEdge(), startCenter.x, startCenter.y, targetCenter.x, targetCenter.y);
 
         MFLog(@"[ring] <<< 呼出完成：跟随手指(%.0f,%.0f) -> 停靠点(%.0f,%.0f)",
               point.x, point.y, self.parkCenter.x, self.parkCenter.y);
@@ -1918,8 +1965,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         if (self.iconButtons.count == 0) {
             [self scheduleAutoBundleIdEnumeration];
         } else {
-            // 图标延后抓取：先把圆盘显示出来，再慢慢贴真图标（触摸路径零图标查询）
-            [self scheduleIconFillWithGeneration:self.buildGeneration];
+            // 图标延后抓取：**等呼出动画走完**（0.38s）再慢慢贴真图标。
+            // 用户 log33 反馈"呼出动画不流畅"—— log33 实证：召唤瞬间就开始逐个抓 17 个图标
+            // （`取图标` × 17 全落在动画那 0.3 秒里，每条都要查图标缓存），主线程被切碎。
+            [self scheduleIconFillWithGeneration:self.buildGeneration delay:0.42];
         }
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 展开异常：%@", exception);
@@ -1929,6 +1978,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 - (void)hide {
     self.buildGeneration += 1;   // 作废尚未执行的图标填充
+    // 【0.3.24】作废呼出动画的完成回调（否则它可能在收起后去动已脱离视图的 ringRoot）
+    self.ringIntroGeneration += 1;
+    self.ringIntroAnimating = NO;
+    self.ringIntroPendingCenterValid = NO;
     if (self.editorPanel != nil) {
         [self closeEditorSaving:NO];   // 【0.2.1】编辑器开着就一并收起（不保存）
     }
@@ -1952,15 +2005,19 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
     // 【0.3.23】收起 = 圆盘本体缩回 + 淡出（与呼出动画对称：也是"从边缘收回"的观感），
     //   容器本身全透明，只负责在动画结束后把自己摘掉。
-    [UIView animateWithDuration:0.18
+    // 【0.3.24】再加"缩回边缘"的位移：与呼出（从边缘滑出）严格对称，一来一回都像 Stheno。
+    CGPoint collapseCenter = [self ringIntroStartCenterForBounds:self.hostBounds
+                                                          target:collapseRoot.center];
+    [UIView animateWithDuration:0.22
                           delay:0.0
-         usingSpringWithDamping:0.85
-          initialSpringVelocity:0.6
+         usingSpringWithDamping:0.88
+          initialSpringVelocity:0.5
                         options:(UIViewAnimationOptionCurveEaseIn |
                                  UIViewAnimationOptionBeginFromCurrentState)
                      animations:^{
         container.alpha = 0.0;
         collapseRoot.alpha = 0.0;
+        collapseRoot.center = collapseCenter;
         collapseRoot.transform = CGAffineTransformMakeScale(0.45, 0.45);
     } completion:^(__unused BOOL finished) {
         [container removeFromSuperview];
@@ -1974,7 +2031,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (self.ringRoot == nil) {
         return;
     }
-    self.ringRoot.center = [self clampRingCenter:point];
+    CGPoint clamped = [self clampRingCenter:point];
+    if (self.ringIntroAnimating) {
+        // 【0.3.24】呼出动画进行中：**不抢 center**（会跟动画打架 → 观感卡顿/跳），
+        // 只记下手指最新的落点，动画结束后再落过去（见 showAtPoint: 的 completion）。
+        self.ringIntroPendingCenter = clamped;
+        self.ringIntroPendingCenterValid = YES;
+        return;
+    }
+    self.ringRoot.center = clamped;
 }
 
 /// 手指停住一小会儿就把圆盘固定到停靠点（用户自然会在停靠点附近有个停顿）
@@ -2001,6 +2066,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (self.ringRoot == nil || self.ringLatched) {
         return;
     }
+    // 【0.3.24】停靠接管动画：作废呼出动画的完成回调（它不该再把圆心往 pending 上拉），
+    // 缩放补间继续保持（stop 掉会让 28% 的圆盘"啪"地跳回 100%）。
+    self.ringIntroAnimating = NO;
+    self.ringIntroGeneration += 1;
+    self.ringIntroPendingCenterValid = NO;
     self.ringLatched = YES;
     self.settleGeneration += 1;
     // 记录"固定那一刻手指在哪"：手指还没动之前不产生选中，避免刚停靠就误开某个 App
@@ -2277,6 +2347,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 /// 延后抓取真图标。危险动作 ⇒ 立闸门，走完并存活才撤。
 - (void)scheduleIconFillWithGeneration:(NSUInteger)generation {
+    [self scheduleIconFillWithGeneration:generation delay:0.05];
+}
+
+/// 【0.3.24】带 delay 的版本：呼出时用 0.42s（避开呼出动画，避免抓图标把动画切碎）。
+- (void)scheduleIconFillWithGeneration:(NSUInteger)generation delay:(NSTimeInterval)delay {
     if (self.iconButtons.count == 0) {
         return;
     }
@@ -2288,8 +2363,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         MFLog(@"[ring] 降级模式：跳过图标抓取（仅首字母）。删除 %s 可重试", MF_RING_GUARD_PATH);
         return;
     }
+    NSTimeInterval wait = MAX(0.0, isfinite(delay) ? delay : 0.05);
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf == nil) {
