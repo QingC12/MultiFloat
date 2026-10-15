@@ -2855,7 +2855,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGRect targetFrame = keyboardZoomBaseFrame;
     targetFrame.origin.x = targetX;
     keyboardZoomBaseFrame = targetFrame;
-    __typeof(self) __weak weakSelf = self;
+    // 动画 block 是临时对象、执行完即释放，直接持 self 无循环引用；
+    // （0.3.13 首版用 weakSelf-> 解引用 ivar，被 ARC 以 race condition 为由拒绝，CI 编译失败）
     [UIView animateWithDuration:0.4
                           delay:0.0
          usingSpringWithDamping:0.8
@@ -2864,7 +2865,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                                  UIViewAnimationOptionAllowUserInteraction |
                                  UIViewAnimationOptionCurveEaseOut)
                      animations:^{
-        weakSelf->keyboardZoomContainer.frame = targetFrame;
+        self->keyboardZoomContainer.frame = targetFrame;
     } completion:nil];
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
