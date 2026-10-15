@@ -69,6 +69,9 @@
 #define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
+#define MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY 1600.0 // 【0.4.17】底带快速上滑关闭的最小速度（pt/s，Stheno「边中快速上滑关闭」）
+#define MF_CARD_EDGE_FULLSCREEN_DRAG 150.0       // 【0.4.17】底带下拉展开全屏的位移阈值（pt，Stheno「下拉展开」）
+#define MF_CARD_EDGE_FULLSCREEN_VELOCITY 500.0   // 【0.4.17】底带下拉展开全屏的最小下滑速度（pt/s，区分"慢慢挪下去"）
 // 【0.4.12 用户 log39】"移动不灵敏 / 缩放太灵敏" —— 两条都对上实证：
 //   · 移动：用户三次按在**卡片底边内侧 1~5pt**（宿主坐标 y=682/685/686，底带起点 687）⇒ 差一点点，
 //     带子没接住（`MFEdgeBandHostView.hitTest` 只认带子子视图，空隙一律透传给 App）。
@@ -383,6 +386,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL mfEdgeDragFromDocked;          // 【0.3.22】本次拖动起手自"停靠小窗盖层"（小位移=还原）
     BOOL mfManualScaleAnchorRight;      // 【0.3.19】手动缩放锚点：NO=左上角（默认，用户指定） YES=右上角（右侧停靠）
     BOOL mfCardFatMode;                 // 【0.4.14】胖屏态：基准宽高比切到 ~9:16（Stheno「右角::点击切换基础窗口比例」同款）
+    BOOL mfCardFullScreen;              // 【0.4.17】全屏态：卡片铺满屏幕（Stheno FullScreenBackGesture 同语义，底带下拉触发）
+    CGRect mfPreFullScreenFrame;        // 【0.4.17】进全屏前的基准 frame（还原用）
     CGRect mfCardFatSavedBaseFrame;     // 【0.4.14】进胖屏前的基准 frame（再点右下角切回时还原）
     CFTimeInterval mfEdgeDragBeganAt;   // 【0.4.14】右下角手势 Began 时刻（区分"点击=切胖屏"与"拖动=缩放"）
     UIView *handleVisualHandoffSnapshotView;
@@ -2059,7 +2064,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         CGFloat manualScale = [self mfLatchedManualCardScale];
         if (manualScale > 0.0) {
-            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.16 缩放保持·收口）",
+            MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.17 缩放保持·收口）",
                   (long)source, manualScale);
             targetScale = manualScale;
             targetIsBase = NO;
@@ -2232,7 +2237,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (manualScale > 0.0) {
         // 【0.4.12】同上：这是 log39"缩放被弹回默认"的收口点
         [self applyCardScaleTarget:manualScale animated:NO source:POCardScaleTransitionSourceReconcile];
-        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.16 缩放保持）", manualScale);
+        MFLog(@"[card] 回基准请求被用户档位拦住 → 重施 %.2f（0.4.17 缩放保持）", manualScale);
         return;
     }
     [self applyCardScaleTarget:1.0 animated:NO source:POCardScaleTransitionSourceReconcile];
@@ -2753,6 +2758,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         mfUserCardScaleOverride = 0;   // 【0.3.11】面板关闭 = 清除手动缩放档位
         mfManualCardScaleLatched = NO;  // 【0.4.12】同时撤掉"缩放保持"latch（下次打开是新会话）
         mfCardFatMode = NO;             // 【0.4.14】面板关闭 = 胖屏态一并复位（下次打开从默认瘦卡开始）
+        mfCardFullScreen = NO;          // 【0.4.17】全屏态同理复位
         [self restoreKeyboardZoomImmediately];
         // 【0.3.19 血泪 log25】缩放态关闭（performDirectScaledProgrammaticCloseAnimation）
         // 会把手柄 rail center 挪到 handleEndCenter，完成后果链上没人复位——
@@ -3109,7 +3115,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.4.16 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角+左下角=缩放/点击切胖屏 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.4.17 卡外热区带已安装（左右=停靠 底=移动·快速上滑关闭·下拉展开全屏 右下角+左下角=缩放/点击切胖屏 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3599,7 +3605,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 //   再切胖屏，避免"点一下顺手改了大小"。
                 NSTimeInterval held = CACurrentMediaTime() - mfEdgeDragBeganAt;
                 CGFloat travel = hypot(endTranslation.x, endTranslation.y);
-                if (held < 1.2 && travel < 24.0) {
+                // 【0.4.17 log42】时长上限 1.2s 仍拒掉了用户的"点击"（实证 2.34s / 8.7pt —— 用户
+                //   实际是"按住一小会"再松手）⇒ 放宽到 3s；主判据 = 位移（<24pt 的"缩放"本身无感，
+                //   归类为点击无副作用；真想微调大小会拖出 24pt 以上）。
+                if (held < 3.0 && travel < 24.0) {
                     mfEdgeDragMode = 0;
                     [self resetAutoNubTimer];
                     [self mfApplyCornerScaleDragTranslation:CGPointZero];   // 撤回漂移 → 起点档位
@@ -3631,6 +3640,29 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 [self mfRestoreFromDock];
                 return;
             }
+            CGPoint velocity = [pan velocityInView:self.view];
+            // 【0.4.17 用户 log42】Stheno 同款底带手势（逆向实证：GestureIntroduction「边中区域快速上滑关闭」
+            //   + FullScreenBackGesture/下拉展开）—— 单手不用够屏幕顶部也能关，且能一键全屏：
+            //   ① 快速上滑（速度主判据，向上净位移）→ 关闭浮窗；
+            //   ② 下拉超过阈值且有一定速度（区分"慢慢挪下去"）→ 展开/还原全屏。
+            if (velocity.y < -MF_CARD_EDGE_SWIPE_CLOSE_VELOCITY && endTranslation.y < 0 &&
+                fabs(velocity.y) > fabs(velocity.x)) {
+                MFLog(@"[card] 底带快速上滑 → 关闭浮窗（vy=%.0f 位移(%.1f,%.1f)）",
+                      velocity.y, endTranslation.x, endTranslation.y);
+                mfEdgeDragMode = 0;
+                [self resetAutoNubTimer];
+                [self close];
+                return;
+            }
+            if (endTranslation.y > MF_CARD_EDGE_FULLSCREEN_DRAG &&
+                velocity.y > MF_CARD_EDGE_FULLSCREEN_VELOCITY) {
+                MFLog(@"[card] 底带下拉 → %s全屏（位移 y=%.1f vy=%.0f）",
+                      mfCardFullScreen ? "还原" : "展开", endTranslation.y, velocity.y);
+                mfEdgeDragMode = 0;
+                [self resetAutoNubTimer];
+                [self mfToggleCardFullScreenAnimated:YES];
+                return;
+            }
             // 【0.3.21】从未进过 Changed 但总位移非零（log30 的"Began 后同毫秒 End"）→ 补一次移动，
             // 让"拖动只报首尾两帧"的手势也能生效。
             if (!mfEdgeDragLoggedChanged &&
@@ -3644,7 +3676,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
             CGFloat cardRight = endScreenX + cardWidth;
             CGFloat screenWidth = CGRectGetWidth(self.view.bounds);
-            CGPoint velocity = [pan velocityInView:self.view];
             // 【0.3.19】TrollOpen 式甩边关闭：快速向右甩 + 卡片右缘已贴近屏幕右缘 → 关闭浮窗
             if (velocity.x > MF_CARD_EDGE_FLICK_CLOSE_VELOCITY &&
                 cardRight >= screenWidth - MF_CARD_EDGE_FLICK_CLOSE_MARGIN) {
@@ -4075,6 +4106,42 @@ static CGFloat MFCardFatAspect(void) {
           CGRectGetMidX(toFrame), CGRectGetMaxY(toFrame));
 }
 
+/// 【0.4.17 用户 log42】展开/还原全屏（Stheno FullScreenBackGesture 同语义；底带"下拉展开"触发）。
+/// 全屏 = 卡片基准 frame = 屏幕可视区（内容坐标 x 要加 scrollOffset）—— 画布与屏幕同比例，
+/// 内容 scale 恰好 1:1 填满，观感 = 真·全屏。再下拉一次还原进全屏前的窗口。
+-(void)mfToggleCardFullScreenAnimated:(BOOL)animated {
+    if (mfDockedSide != 0) {
+        MFLog(@"[card] 全屏切换忽略（停靠态，先还原小窗）");
+        return;
+    }
+    if (CGRectIsEmpty(keyboardZoomBaseFrame)) {
+        MFLog(@"[card] 全屏切换忽略（基准 frame 无效）");
+        return;
+    }
+    CGRect fromFrame = keyboardZoomBaseFrame;
+    CGRect toFrame;
+    if (mfCardFullScreen) {
+        toFrame = mfPreFullScreenFrame;
+    } else {
+        mfPreFullScreenFrame = fromFrame;
+        CGFloat offX = [self mfCardScrollOffsetX];
+        CGRect bounds = self.view.bounds;
+        toFrame = CGRectMake(offX, 0, CGRectGetWidth(bounds), CGRectGetHeight(bounds));
+    }
+    mfCardFullScreen = !mfCardFullScreen;
+    // 全屏 = 基准彻底变了，手动缩放档位/latch 作废（与胖屏切换同级语义）；胖屏标记保留，
+    // 还原时原样回到进全屏前的胖/瘦形态。
+    mfUserCardScaleOverride = 0;
+    mfManualCardScaleLatched = NO;
+    mfUserCardPositionPinned = YES;
+    keyboardZoomBaseFrame = toFrame;
+    [self applyLayoutPreservingHandlePosition:animated];
+    MFLog(@"[card] 全屏切换 → %@：%.0fx%.0f -> %.0fx%.0f",
+          mfCardFullScreen ? @"全屏" : @"还原窗口",
+          CGRectGetWidth(fromFrame), CGRectGetHeight(fromFrame),
+          CGRectGetWidth(toFrame), CGRectGetHeight(toFrame));
+}
+
 #pragma mark - 【MF 0.1.2】面板打开后把手柄移到浮窗右侧
 
 /// 竖屏（vertical rail）时手柄 rail 应有的"屏幕坐标 x"：
@@ -4309,11 +4376,12 @@ static CGFloat MFCardFatAspect(void) {
         keyboardZoomBaseFrame = normalCardFrame;
         portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(normalCardFrame) + HANDLE_EDGE_GAP;
     } else if (mfUserCardPositionPinned && !CGRectIsEmpty(keyboardZoomBaseFrame) &&
-               (mfCardFatMode ||
+               (mfCardFatMode || mfCardFullScreen ||
                 (fabs(CGRectGetWidth(keyboardZoomBaseFrame) - contentLayoutWidth) <= 1.0 &&
                  fabs(CGRectGetHeight(keyboardZoomBaseFrame) - contentLayoutHeight) <= 1.0))) {
-        // 【0.4.14】胖屏态基准尺寸 ≠ contentLayout（那正是胖屏的意义）→ 也必须保留用户 frame，
+        // 【0.4.14/0.4.17】胖屏/全屏态基准尺寸 ≠ contentLayout（那正是其意义）→ 也必须保留用户 frame，
         //   否则任意一次布局 passe（安全区/键盘/二级菜单）都会把卡片打回瘦卡。钳一次防旋转溢出。
+        //   全屏 frame = 屏幕可视区本身，钳制是恒等；仍走一遍防旋转后溢出。
         normalCardFrame = [self mfClampFatFrameIntoScreen:keyboardZoomBaseFrame];
         keyboardZoomBaseFrame = normalCardFrame;
     } else {

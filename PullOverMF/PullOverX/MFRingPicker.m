@@ -2131,7 +2131,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         //   后续事件完全不来），1.0s 后照样会就地补满并固定，圆盘不会卡成"永远选不了图标"。
         self.ringDwellAnchorPoint = point;
         [self mfScheduleLatchDwell];
-        MFLog(@"[ring] 呼出动画（0.4.16）：%@ 起点=触发条(%.0f,%.0f) 小圆盘 %.0f%% → 跟手位移到屏幕中下中心(%.0f,%.0f) 并长到 100%%（easeOut%.1f·滑得快就都快），停留 %.1f 秒自动固定",
+        MFLog(@"[ring] 呼出动画（0.4.17）：%@ 起点=触发条(%.0f,%.0f) 小圆盘 %.0f%% → 跟手位移到屏幕中下中心(%.0f,%.0f) 并长到 100%%（easeOut%.1f·滑得快就都快），停留 %.1f 秒自动固定",
               MFRingEdge(), startCenter.x, startCenter.y, introMin * 100.0,
               targetCenter.x, targetCenter.y,
               MAX(1.0, MFRingNumber(@"mfRingIntroEase", MF_RING_INTRO_EASE)),
