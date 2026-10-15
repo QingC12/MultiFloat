@@ -519,7 +519,7 @@ static __attribute__((constructor)) void POCameraCompatibilityBootstrap(void) {
         return;   // 非相机守护进程：立刻返回，什么都不碰（铁律 1）
     }
 
-    POCamLog("=== PullOverMF 0.4.2 相机守护进程兼容已加载（进程 %s，pid %d）===",
+    POCamLog("=== PullOverMF 0.4.3 相机守护进程兼容已加载（进程 %s，pid %d）===",
              getprogname(), (int)getpid());
 
     POCameraRegisterStateObservers();

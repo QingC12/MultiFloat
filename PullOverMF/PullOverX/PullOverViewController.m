@@ -2989,7 +2989,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.4.2 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.4.3 卡外热区带已安装（20pt 环带：左右=停靠9:16小窗 底=移动 右下角=缩放【无档位限制】 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
