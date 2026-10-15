@@ -26,8 +26,7 @@ DEBUG = 0
 ARCHS = arm64e
 THEOS_PACKAGE_SCHEME ?= roothide
 MF_SDK_VERSION ?= 16.5
-# 诊断（0.4.6）：让 Theos 打印完整编译/链接命令行 —— 优化级别取证用，确认后即删。
-messages = yes
+# 诊断（0.4.6 临时用过 `messages = yes` 抓命令行，0.4.8 已撤掉恢复安静构建）。
 
 TARGET = iphone:clang:$(MF_SDK_VERSION):14.0
 include $(THEOS)/makefiles/common.mk
@@ -99,19 +98,13 @@ POCaptureCompat_LDFLAGS += -Wl,-x -Wl,-S -Wl,-dead_strip
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
-# ===== 【0.4.6】优化级别：第 3 次尝试 —— 正面命中「Theos 编译规则真正引用的变量」=====
-# 前三轮实测（0.4.3 / 0.4.4 / 0.4.5）产物 __TEXT 段尺寸**始终 835584 B（__text 662760 B）**，
-# 二进制之间只差 118 字节（= 版本字符串引起的地址常量位移）⇒ 优化级别从未改变。
-# 0.4.5 的 $(info) 已经证明 `_THEOS_TARGET_CFLAGS` 末尾**确实带了 -Os**（注入成功），
-# 但产物没变 ⇒ 编译命令引用的**不是** `_THEOS_TARGET_CFLAGS`，而是它被拼进去的那个更内层变量。
-# ⇒ 本轮改为覆盖 `_THEOS_INTERNAL_CFLAGS`（Theos 编译规则直接用它的概率最大），
-#   并把它**修改后**的值打进 CI 日志取证（为空则说明变量名仍不对，改用 messages=yes 抓命令行）。
-ifneq ($(_THEOS_INTERNAL_CFLAGS),)
-_THEOS_INTERNAL_CFLAGS := $(filter-out -O0 -O1 -O2 -O3 -Ofast,$(_THEOS_INTERNAL_CFLAGS)) -Os
-endif
+# ===== 【0.4.8】优化级别注入（保留；0.4.7 起已实测生效）=====
+# 生效前提 = 文件顶部的 `DEBUG = 0`（否则 Theos 在 DEBUG=1 时会于命令行末尾追加 `-DDEBUG -O0` 覆盖掉这些 -Os）。
+# 多处冗余注入（OPTFLAGS / TARGET_CFLAGS / xxx_CFLAGS / ADDITIONAL_CFLAGS / _THEOS_INTERNAL_CFLAGS）
+# 是有意为之：Theos 各版本把这些变量拼进命令行的位置不同，全都放一份，任何一个位置生效即可。
 PullOverMF_CFLAGS += -Os
 POCaptureCompat_CFLAGS += -Os
 ADDITIONAL_CFLAGS += -Os
-$(info === MFDBG3 _THEOS_INTERNAL_CFLAGS: $(_THEOS_INTERNAL_CFLAGS))
-$(info === MFDBG3 _THEOS_TARGET_CFLAGS: $(_THEOS_TARGET_CFLAGS))
-$(info === MFDBG3 OPTFLAGS: $(OPTFLAGS))
+ifneq ($(_THEOS_INTERNAL_CFLAGS),)
+_THEOS_INTERNAL_CFLAGS := $(filter-out -O0 -O1 -O2 -O3 -Ofast,$(_THEOS_INTERNAL_CFLAGS)) -Os
+endif
