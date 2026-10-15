@@ -45,15 +45,13 @@
 // 【0.3.13】浮窗手势区（用户指定方案）：底部中间=自由移动 / 右下角=对角缩放 / 左右侧=点击吸附
 #define MF_CARD_EDGE_HOTZONE_WIDTH 22.0     // 左右侧热区宽度（pt）
 #define MF_CARD_EDGE_CORNER_SIZE 64.0       // 右下角缩放热区边长（pt）
-#define MF_CARD_EDGE_MOVE_RATIO 0.5         // 底部中间移动热区占容器宽度比例
+#define MF_CARD_EDGE_DOCK_SCALE 0.75        // 【0.3.14】侧边停靠档位（无用户档位时）
 #define MF_CARD_EDGE_SCALE_MIN 0.5          // 手动缩放下限
 #define MF_CARD_EDGE_SCALE_SPAN 170.0       // 对角拖动满程（pt）：1.0 <-> 0.5
-#define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部中间移动热区
+#define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部移动热区
 #define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12    // 左侧点击热区
 #define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13   // 右侧点击热区
 #define MF_CARD_EDGE_HOTZONE_TAG_CORNER 14  // 右下角缩放热区
-#define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12
-#define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13
 #define CONTENT_EDGE_GAP 5
 #define CONTENT_CORNER_RADIUS 20   // 上游默认值（本 fork 改用 MFPanelCornerRadius()，见下）
 
@@ -279,6 +277,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat mfEdgeDragStartX;           // 【0.3.13】自由移动起点（卡片 origin.x）
     CGFloat mfEdgeDragStartScale;       // 对角缩放起点
     CGFloat mfUserCardScaleOverride;    // >0 = 用户手动缩放档位（键盘弹出/面板关闭时清除）
+    BOOL mfManualScaleAnchorRight;      // 【0.3.14】手动缩放锚点：NO=左上角（默认，用户指定） YES=右上角（右侧停靠）
     UIView *handleVisualHandoffSnapshotView;
     NSUInteger handleVisualHandoffGeneration;
     BOOL runtimeHostedCategoryTransitionAnimating;
@@ -1686,8 +1685,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return CGRectGetWidth(keyboardZoomBaseFrame) * (1.0 - scaleValue);
 }
 
--(CGPoint)keyboardZoomTargetCenterForBaseFrame:(CGRect)baseFrame scale:(CGFloat)zoom{
-    CGPoint anchor = CGPointMake(CGRectGetMaxX(baseFrame), CGRectGetMaxY(baseFrame));
+-(CGPoint)keyboardZoomTargetCenterForBaseFrame:(CGRect)baseFrame scale:(CGFloat)zoom anchor:(CGPoint)anchor{
     CGPoint targetCenter = CGPointMake(anchor.x - CGRectGetWidth(baseFrame) * zoom / 2.0,
                                         anchor.y - CGRectGetHeight(baseFrame) * zoom / 2.0);
     CGFloat screenScale = UIScreen.mainScreen.scale;
@@ -1757,10 +1755,36 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGRect baseFrame = quickSwitchYieldActive && !CGRectIsEmpty(quickSwitchSavedContainerFrame)
         ? quickSwitchSavedContainerFrame
         : keyboardZoomBaseFrame;
-    CGPoint targetCenter = targetIsBase
-        ? CGPointMake(CGRectGetMidX(baseFrame), CGRectGetMidY(baseFrame))
-        : [self keyboardZoomTargetCenterForBaseFrame:keyboardZoomBaseFrame scale:targetScale];
-    CGFloat handleTranslationX = targetIsBase ? 0 : [self handleCompanionTranslationXForScale:targetScale];
+    CGPoint targetCenter;
+    CGFloat handleTranslationX;
+    if (targetIsBase) {
+        targetCenter = CGPointMake(CGRectGetMidX(baseFrame), CGRectGetMidY(baseFrame));
+        handleTranslationX = 0;
+        mfManualScaleAnchorRight = NO;   // 【0.3.14】回到基准尺寸 → 手动锚点复位为左上（用户默认）
+    } else {
+        // 【0.3.14】缩放锚点分支：键盘自动缩放保持上游右下角锚；
+        // 手动缩放（右下角手势/侧边停靠）—— 默认锚左上角（用户指定：左上角不动，
+        // 从右下角开始向左上缩放），右侧停靠态锚右上（右缘不动向左缩）。
+        CGRect anchorFrame = CGRectIsEmpty(keyboardZoomBaseFrame) ? baseFrame : keyboardZoomBaseFrame;
+        CGPoint scaleAnchor;
+        if (source == POCardScaleTransitionSourceKeyboard) {
+            scaleAnchor = CGPointMake(CGRectGetMaxX(anchorFrame), CGRectGetMaxY(anchorFrame));
+        } else if (mfManualScaleAnchorRight) {
+            scaleAnchor = CGPointMake(CGRectGetMaxX(anchorFrame), CGRectGetMinY(anchorFrame));
+        } else {
+            scaleAnchor = CGPointMake(CGRectGetMinX(anchorFrame), CGRectGetMinY(anchorFrame));
+        }
+        targetCenter = [self keyboardZoomTargetCenterForBaseFrame:anchorFrame scale:targetScale anchor:scaleAnchor];
+        if (source == POCardScaleTransitionSourceKeyboard) {
+            handleTranslationX = [self handleCompanionTranslationXForScale:targetScale];
+        } else {
+            // 手动：左上锚 → 右缘随缩小左移，手柄跟随（0.3.13 右下锚曾把手柄推出屏幕外，
+            // log23 实证手柄跑到 x=445..479）；右上锚 → 右缘不动，手柄不动。
+            handleTranslationX = mfManualScaleAnchorRight
+                ? 0.0
+                : CGRectGetWidth(anchorFrame) * (targetScale - 1.0);
+        }
+    }
     POInteractionMode interactionMode = [self currentInteractionMode];
     CGFloat panelBackdropTargetAlpha = interactionMode == POInteractionModeDrawerModal
         ? 0.5 * [self horizontalOpenProgress]
@@ -1775,8 +1799,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL handleTransformMatches = fabs(handleScrollView.transform.tx - handleTranslationX) <= 0.25 &&
         fabs(handleScrollView.transform.ty) <= 0.25;
     BOOL backdropMatches = fabs(panelBackdropView.alpha - panelBackdropTargetAlpha) <= 0.001;
+    // 【0.3.14】center 也参与判定：切换停靠侧（同 scale 换锚）或缩放态移动 baseFrame 时，
+    // 仅 transform/tx 相同而 center 已变 —— 旧判定会误判"无变化"提前 return，导致不动。
+    CGPoint modelCenter = keyboardZoomContainer.center;
+    BOOL centerMatches = fabs(modelCenter.x - targetCenter.x) <= 0.5 &&
+        fabs(modelCenter.y - targetCenter.y) <= 0.5;
     if (fabs(appliedCardScale - targetScale) <= PO_CARD_SCALE_EPSILON &&
-        cardTransformMatches && handleTransformMatches && backdropMatches) {
+        cardTransformMatches && handleTransformMatches && backdropMatches && centerMatches) {
         keyboardZoomApplied = !targetIsBase;
         [self reconcileCardChromeZOrder];
         return;
@@ -2608,10 +2637,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 #pragma mark - 【0.3.11】浮窗四周手势区（移动/缩放 + 松手吸附）
 
-/// 【0.3.13】安装手势热区（用户指定方案）：
-///   底部中间（宽 50%）= pan 自由移动；右下角 64x64 = pan 对角缩放；
-///   左/右侧 22pt = 点击吸附该侧（已贴则切对侧）。上边热区已删除。
-/// 层级：corner 最顶（覆盖左右/底部热区在角落的重叠），其次 bottomCenter。
+/// 【0.3.14】安装手势热区（用户指定方案）：
+///   底部整条边（右下角 64x64 除外）= pan 自由移动；右下角 64x64 = pan 对角缩放；
+///   左/右侧 22pt = 点击停靠该侧（已贴则切对侧）。上边热区已删除。
+///   【0.3.14 血泪 log23】0.3.13 底部只给中间 50%（x=131..299），用户 5 次按底部
+///   全部落在右下角缩放区（x=369..382），一次都没进移动区 → 改为整条底边。
+/// 层级：corner 最顶（覆盖角落重叠区），其次 bottom；left/right 在内容之上。
 -(void)mfInstallCardEdgeHotzones{
     if (keyboardZoomContainer == nil) {
         return;
@@ -2656,11 +2687,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [mfEdgeHotzoneRight.topAnchor constraintEqualToAnchor:keyboardZoomContainer.topAnchor],
         [mfEdgeHotzoneRight.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
         [mfEdgeHotzoneRight.widthAnchor constraintEqualToConstant:w],
-        // 底部中间：水平居中、宽 50%、贴底
+        // 底部：整条底边（右下角由 corner 热区覆盖，corner 层级更高、优先算缩放）
+        [mfEdgeHotzoneBottom.leadingAnchor constraintEqualToAnchor:keyboardZoomContainer.leadingAnchor],
+        [mfEdgeHotzoneBottom.trailingAnchor constraintEqualToAnchor:keyboardZoomContainer.trailingAnchor],
         [mfEdgeHotzoneBottom.bottomAnchor constraintEqualToAnchor:keyboardZoomContainer.bottomAnchor],
-        [mfEdgeHotzoneBottom.centerXAnchor constraintEqualToAnchor:keyboardZoomContainer.centerXAnchor],
-        [mfEdgeHotzoneBottom.widthAnchor
-            constraintEqualToAnchor:keyboardZoomContainer.widthAnchor multiplier:MF_CARD_EDGE_MOVE_RATIO],
         [mfEdgeHotzoneBottom.heightAnchor constraintEqualToConstant:w],
         // 右下角：贴右下
         [mfEdgeHotzoneCorner.trailingAnchor constraintEqualToAnchor:keyboardZoomContainer.trailingAnchor],
@@ -2729,10 +2759,16 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     baseFrame.origin.y = round((cardBottomY - cardHeight) * screenScale) / screenScale;
     portraitHostedLandscapeHandleAnchorY = cardBottomY + HANDLE_EDGE_GAP;
     keyboardZoomBaseFrame = baseFrame;
-    [UIView performWithoutAnimation:^{
-        self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
-        self->keyboardZoomContainer.frame = baseFrame;
-    }];
+    if (fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON) {
+        // 【0.3.14】缩放态（停靠/手动缩放）移动：保持缩放与锚点，只按新 baseFrame 重摆中心。
+        // 0.3.13 直接把 transform 打回 Identity 会把停靠态拖回满尺寸（视觉上"吸附丢失"）。
+        [self applyCardScaleTarget:appliedCardScale animated:NO source:POCardScaleTransitionSourceReconcile];
+    } else {
+        [UIView performWithoutAnimation:^{
+            self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
+            self->keyboardZoomContainer.frame = baseFrame;
+        }];
+    }
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
 }
@@ -2750,8 +2786,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         mfEdgeDragMode = 1;
         mfEdgeDragStartBottomY = CGRectGetMaxY(keyboardZoomBaseFrame);
         mfEdgeDragStartX = CGRectGetMinX(keyboardZoomBaseFrame);
-        [self restoreKeyboardZoomImmediately];   // 拖动前回到基准（还原键盘缩放 transform）
-        MFLog(@"[card] 自由移动开始（起点 x=%.0f 底边 %.0f）", mfEdgeDragStartX, mfEdgeDragStartBottomY);
+        // 【0.3.14】不再强制 restoreKeyboardZoomImmediately：停靠/缩放态拖动保持当前大小移动
+        MFLog(@"[card] 自由移动开始（起点 x=%.0f 底边 %.0f，scale %.2f）",
+              mfEdgeDragStartX, mfEdgeDragStartBottomY, appliedCardScale);
         return;
     }
     if (pan.state == UIGestureRecognizerStateChanged) {
@@ -2822,54 +2859,56 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
 }
 
-/// 【0.3.13】左/右侧热区：点击吸附到该侧（已贴该侧则切到对侧），弹簧动画。
-/// 吸附只动 X（Y 保持当前位置）；缩放中点击先回基准再吸附。
+/// 【0.3.14】左/右侧热区：点击停靠到该侧（已贴该侧则切到对侧）。
+/// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
     MFLog(@"[card] 侧边点击（%@侧） canDrag=%d", toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow]);
+    [self mfSnapCardToSide:toRight];
+}
+
+/// 【0.3.14】侧边停靠：卡片缩到停靠档位并贴向该侧 —— 右停靠锚右上（右缘不动向左缩）、
+/// 左停靠锚左上（左缘不动向右缩）。已停靠在该侧再点 → 切到对侧。
+/// 【0.3.14 血泪 log23】卡片基础宽度近乎满屏（左右各 ~47pt 留白），0.3.13 只平移 origin.x
+/// （实际位移 <1pt）用户完全看不出"吸附"，且点击位置多落在卡片右缘外的把手/空白上 → 直接关闭。
+-(void)mfSnapCardToSide:(BOOL)toRight{
     if (![self mfCanDragCardEdgeNow]) {
         return;
     }
     [self cancelAutoNubTimer];
-    if (appliedCardScale > 0 && fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON) {
-        [self restoreKeyboardZoomImmediately];
+    BOOL scaledNow = fabs(appliedCardScale - 1.0) > PO_CARD_SCALE_EPSILON;
+    if (scaledNow && mfManualScaleAnchorRight == toRight) {
+        toRight = !toRight;   // 已贴该侧 → 切到对侧
     }
-    CGRect bounds = self.view.bounds;
-    UIEdgeInsets viewInsets = self.view.safeAreaInsets;
-    UIEdgeInsets windowInsets = self.view.window.safeAreaInsets;
+    CGFloat dockScale = (mfUserCardScaleOverride > PO_CARD_SCALE_EPSILON &&
+                         fabs(mfUserCardScaleOverride - 1.0) > PO_CARD_SCALE_EPSILON)
+        ? mfUserCardScaleOverride            // 用户已手动缩放过 → 沿用其档位
+        : MF_CARD_EDGE_DOCK_SCALE;           // 默认 0.75
     CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
     if (cardWidth <= 0) {
         return;
     }
+    CGRect bounds = self.view.bounds;
+    UIEdgeInsets viewInsets = self.view.safeAreaInsets;
+    UIEdgeInsets windowInsets = self.view.window.safeAreaInsets;
     CGFloat minX = MAX(viewInsets.left, windowInsets.left) + CONTENT_EDGE_GAP;
     CGFloat maxX = CGRectGetWidth(bounds) - MAX(viewInsets.right, windowInsets.right) -
         CONTENT_EDGE_GAP - cardWidth;
     if (maxX < minX) {
         return;
     }
-    CGFloat targetX = toRight ? maxX : minX;
-    if (fabs(CGRectGetMinX(keyboardZoomBaseFrame) - targetX) < 8.0) {
-        targetX = toRight ? minX : maxX;   // 已贴该侧 → 切到对侧
-    }
     CGFloat currentX = CGRectGetMinX(keyboardZoomBaseFrame);
     CGRect targetFrame = keyboardZoomBaseFrame;
-    targetFrame.origin.x = targetX;
+    targetFrame.origin.x = toRight ? maxX : minX;
     keyboardZoomBaseFrame = targetFrame;
-    // 动画 block 是临时对象、执行完即释放，直接持 self 无循环引用；
-    // （0.3.13 首版用 weakSelf-> 解引用 ivar，被 ARC 以 race condition 为由拒绝，CI 编译失败）
-    [UIView animateWithDuration:0.4
-                          delay:0.0
-         usingSpringWithDamping:0.8
-          initialSpringVelocity:0.3
-                        options:(UIViewAnimationOptionBeginFromCurrentState |
-                                 UIViewAnimationOptionAllowUserInteraction |
-                                 UIViewAnimationOptionCurveEaseOut)
-                     animations:^{
-        self->keyboardZoomContainer.frame = targetFrame;
-    } completion:nil];
+    mfManualScaleAnchorRight = toRight;
+    mfUserCardScaleOverride = dockScale;
+    [self applyCardScaleTarget:dockScale animated:YES source:POCardScaleTransitionSourceHandle];
     [self updatePortraitHostedLandscapeHandleForCurrentOffset];
     [self syncHorizontalQuickSwitchPresentationAnchor];
-    MFLog(@"[card] 侧边吸附：x %.0f -> %.0f（%@）", currentX, targetX, toRight ? @"右侧" : @"左侧");
+    MFLog(@"[card] 侧边停靠：x %.0f -> %.0f，%@侧（scale %.2f，锚=%@）",
+          currentX, targetFrame.origin.x, toRight ? @"右" : @"左",
+          dockScale, toRight ? @"右上" : @"左上");
 }
 
 /// 松手吸附（缩放）：弹到 0.5 / 0.75 / 1.0 中最近的一档（弹簧动画）。
@@ -2991,6 +3030,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }];
     keyboardZoomApplied = NO;
     appliedCardScale = 1.0;
+    mfManualScaleAnchorRight = NO;   // 【0.3.14】布局重排回基准 → 手动锚点复位
 
     CGFloat portraitCanvasWidth = MIN(CGRectGetWidth(bounds), CGRectGetHeight(bounds));
     CGFloat portraitCanvasHeight = MAX(CGRectGetWidth(bounds), CGRectGetHeight(bounds));
@@ -3619,7 +3659,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (panelState == POPanelStateOpen) {
-        [self close];
+        // 【0.3.14】展开态单击手柄 = 停靠右侧（log23：用户点卡片右缘想要吸附，结果收进把手关闭）。
+        // 关闭方式不变：拖动手柄甩到屏幕边缘 / 点击浮窗外空白 / Home 键。
+        MFLog(@"[card] 手柄点击 → 停靠右侧（0.3.14 起展开态单击不再关闭）");
+        [self mfSnapCardToSide:YES];
     }
 }
 
