@@ -276,6 +276,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat chromeScale;
     CGFloat scale;
     CGFloat contentLayoutWidth;
+    CGFloat contentLayoutHeight;   // 【0.3.22】卡片基准高度（与 contentLayoutWidth 同源；停靠还原/关闭复位要用，故必须是 ivar）
     UIInterfaceOrientation hostedLayoutOrientation;
     BOOL pendingOpenState;
     CGFloat panelPanStartOffsetX;
@@ -3667,7 +3668,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
     CGFloat screenScale = UIScreen.mainScreen.scale;
     contentLayoutWidth = round(logicalCanvas.width * scale * screenScale) / screenScale;
-    CGFloat contentLayoutHeight = round(logicalCanvas.height * scale * screenScale) / screenScale;
+    contentLayoutHeight = round(logicalCanvas.height * scale * screenScale) / screenScale;
     CGFloat anchoredCardBottomY = CGRectGetMidY(bounds);
     if (portraitHostedLandscapeOptimization) {
         CGFloat handleAnchorY = isfinite(portraitHostedLandscapeHandleAnchorY)
