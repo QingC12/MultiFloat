@@ -5643,14 +5643,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self->mfSwapTransitionCover removeFromSuperview];
             self->mfSwapTransitionCover = nil;
         }
-        UIImage *swapCoverImage = [self mfCaptureViewSnapshot:self->contentView];
-        if (swapCoverImage != nil && self->contentView.bounds.size.width > 10.0) {
+        UIImage *swapCoverImage = [self mfCaptureViewSnapshot:self.contentView];
+        if (swapCoverImage != nil && self.contentView.bounds.size.width > 10.0) {
             UIImageView *cover = [[UIImageView alloc] initWithImage:swapCoverImage];
-            cover.frame = self->contentView.bounds;
+            cover.frame = self.contentView.bounds;
             cover.autoresizingMask = UIViewAutoresizingFlexibleWidth |
                 UIViewAutoresizingFlexibleHeight;
             cover.userInteractionEnabled = NO;
-            [self->contentView addSubview:cover];
+            [self.contentView addSubview:cover];
             self->mfSwapTransitionCover = cover;
             // 兜底：万一新场景迟迟不发布（开失败等），1.2s 后强制淡出防永久遮挡
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
