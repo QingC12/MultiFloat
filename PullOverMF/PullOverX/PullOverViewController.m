@@ -401,6 +401,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     PODockedWindow *mfStripMorphWindow;    // 冻结保留的贴片（还原动画接管前不摘除）
     UIImage *mfStripMorphSnapshot;         // 贴片快照（实时片 = 现抓视图截图；退路 = snapshotImage）
     CGRect mfStripMorphFromRect;           // 贴片此刻在窗口里的矩形（变形起点）
+    BOOL mfPinAppSkipOpenDelay;            // 【0.6.12】贴片还原免 0.3s 开门延迟（快照静止期减半）
+    BOOL mfCardAppearPopActive;            // 【0.6.12】打开 Q 弹窗口（弹簧持有 transform，重估让路）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -1028,12 +1030,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.11 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.12 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.11 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.12 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2758,7 +2760,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self removeKeyboardZoomSuspension:POKeyboardZoomSuspensionDragging];
             // 【0.6.10】贴片还原 Q 弹窗口：本次弹簧持有 transform，缩放重估跳过一次
             //   （否则会在弹簧中途把 transform 拉回 Identity，Q 弹被截断）。
-            if (![self mfStripRestoreBounceActive]) {
+            //   【0.6.12】圆盘打开 Q 弹窗口同理让路。
+            if (![self mfStripRestoreBounceActive] && !self->mfCardAppearPopActive) {
                 [self reevaluateCardScaleAnimated:YES source:POCardScaleTransitionSourceReconcile];
             }
         }
@@ -2990,8 +2993,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     //   完成后手柄做一次 Q 弹脉冲（吸收反馈）。手柄中心即吸收靶点（rail 中点 = 触发条位置）。
     CGPoint absorbTarget = handleScrollView.center;
 
-    [UIView animateWithDuration:PO_SCALED_PROGRAMMATIC_CLOSE_DURATION
+    // 【0.6.12 用户 log52】吸收动画弹簧化：匀加速 EaseIn 改欠阻尼弹簧（0.78）——
+    //   卡片吸向触发条时带一点过冲回弹（缩到比 0.12 略小再弹回），与呼出侧
+    //   "从触发条长出来" 的弹性首尾呼应。
+    [UIView animateWithDuration:0.42
                           delay:0
+         usingSpringWithDamping:0.78
+          initialSpringVelocity:0.4
                         options:(UIViewAnimationOptionCurveEaseIn |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -3201,7 +3209,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.11 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.12 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3596,10 +3604,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         overlay.userInteractionEnabled = NO;
         [hostWindow addSubview:overlay];
         CGRect finalRect = [weakContainer convertRect:weakContainer.bounds toView:hostWindow];
+        // 【0.6.12】飞行弹簧再欠一点阻尼（0.62→0.58）：过冲更明显，落位淡接更顺
         [UIView animateWithDuration:0.52
                               delay:0.0
-             usingSpringWithDamping:0.62
-              initialSpringVelocity:0.4
+             usingSpringWithDamping:0.58
+              initialSpringVelocity:0.5
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
@@ -3622,29 +3631,40 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     keyboardZoomContainer.alpha = 0.0;
     // 【0.6.10 用户指令】贴片还原主窗（屏上无主窗、单贴片场景）＝ 淡入 + **Q 弹放大**：
     //   从 0.88 起弹簧弹到 1.0（阻尼 0.5 一定过冲一次再收），不再是干巴巴的原位淡入。
-    //   只对贴片还原生效 —— 圆盘打开保持 0.6.7 定稿的纯淡入不动。
     //   只在"还原到基准尺寸"时启用：restoreScale≠1 时后续 applyCardScaleTarget 会接管
     //   transform，中途叠加弹簧会互相打架。
+    // 【0.6.12 用户 log52】圆盘打开同样 Q 弹：基准尺寸时从 0.95 起弹簧弹到 1.0
+    //   （阻尼 0.6，轻微过冲），配合淡入——观感"从指尖冒出来再弹实"。非基准尺寸
+    //   （还原带档位）保持纯淡入，transform 交给 applyCardScaleTarget。
     BOOL stripRestoreBounce = [self mfStripRestoreBounceActive];
+    BOOL ringOpenPop = !stripRestoreBounce &&
+        fabs(appliedCardScale - 1.0) <= PO_CARD_SCALE_EPSILON;
+    BOOL transformPop = stripRestoreBounce || ringOpenPop;
     if (stripRestoreBounce) {
         keyboardZoomContainer.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    } else if (ringOpenPop) {
+        keyboardZoomContainer.transform = CGAffineTransformMakeScale(0.95, 0.95);
     }
+    self->mfCardAppearPopActive = transformPop;
     [UIView animateWithDuration:0.5
                           delay:0.0
-         usingSpringWithDamping:stripRestoreBounce ? 0.5 : 0.74
-          initialSpringVelocity:stripRestoreBounce ? 0.7 : 0.5
+         usingSpringWithDamping:stripRestoreBounce ? 0.5 : 0.6
+          initialSpringVelocity:stripRestoreBounce ? 0.7 : 0.6
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
         self->keyboardZoomContainer.alpha = 1.0;
-        if (stripRestoreBounce) {
+        if (transformPop) {
             self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
         }
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
-    } completion:nil];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.11 淡入 0.5s %@，阴影浮起 %.2f）",
-          stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0" : @"纯淡入",
+    } completion:^(__unused BOOL finished) {
+        self->mfCardAppearPopActive = NO;   // 弹簧窗口关闭，后续缩放重估恢复正常
+    }];
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.12 淡入 0.5s %@，阴影浮起 %.2f）",
+          stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
+                             : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入"),
           CONTENT_SHADOW_OPACITY * progress);
 }
 
@@ -4043,7 +4063,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.11 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.12 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4556,12 +4576,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             w.tileView = tile;
             if (animated) {
                 // 【0.6.5】入条动画弹簧化（欠阻尼 → 有一点 Q 弹回位，不再匀速生硬）
+                //   【0.6.12】阻尼再降 0.68→0.58、初速 0.5→0.65：过冲更明显（更 Q 弹）
                 tile.alpha = 0;
                 tile.transform = CGAffineTransformMakeTranslation(toRight ? 34.0 : -34.0, 0);
-                [UIView animateWithDuration:0.45
+                [UIView animateWithDuration:0.48
                                       delay:0.0
-                     usingSpringWithDamping:0.68
-                      initialSpringVelocity:0.5
+                     usingSpringWithDamping:0.58
+                      initialSpringVelocity:0.65
                                     options:(UIViewAnimationOptionCurveEaseOut |
                                              UIViewAnimationOptionAllowUserInteraction)
                                  animations:^{
@@ -4571,10 +4592,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             }
         } else if (!CGRectEqualToRect(w.tileView.frame, frame)) {
             if (animated) {
-                [UIView animateWithDuration:0.3
+                // 【0.6.12】换位弹簧欠阻尼化（0.82→0.7）：多片增删时让位带回弹
+                [UIView animateWithDuration:0.34
                                       delay:0.0
-                     usingSpringWithDamping:0.82
-                      initialSpringVelocity:0.3
+                     usingSpringWithDamping:0.7
+                      initialSpringVelocity:0.4
                                     options:UIViewAnimationOptionCurveEaseOut
                                  animations:^{
                     w.tileView.frame = frame;
@@ -4672,6 +4694,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     mfStripPendingRestore = w;
     mfStripRestoreGeneration += 1;
+    // 【0.6.12 用户 log52】变形路径免 0.3s 开门延迟：pinApp 的延迟开门会让快照静止期
+    //   多出 0.3s（用户实测"先看 1 秒图片"）。面板已关死（isPanelTransitioning 已挡），
+    //   立即开门是安全的——贴片点击 → 飞行全程 ≤0.6s。
+    self->mfPinAppSkipOpenDelay = (panelState != POPanelStateOpen);
+    [self pinAppWithBundleId:w.bundleId];
+    self->mfPinAppSkipOpenDelay = NO;
     if (self->mfStripMorphWindow == w) {
         // 【0.6.11】变形接管：跳过立即摘除（贴片冻结在原地，等卡片就位后无缝补位）
         MFLog(@"[strip][morph] 跳过立即摘除：%@ 由变形动画接管", w.bundleId);
@@ -5309,8 +5337,19 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 -(void)keyboardWillShow:(NSNotification *)notification{
     [self updateKeyboardAnimationFromNotification:notification];
-    mfUserCardScaleOverride = 0;   // 【0.3.11】键盘弹出 = 恢复自动缩放（避让优先于手动档位）
-    mfManualCardScaleLatched = NO; // 【0.4.12】键盘避让同样优先于"缩放保持"
+    // 【0.6.12 用户 log52 重点排查】键盘弹出不再无条件清用户缩放档位：
+    //   0.3.11 的本意是"键盘避让优先于手动档位"，但自动避让缩放只在
+    //   LandscapeShellPortraitHosted 上下文 + landscapeKeyboardZoom 开启时才真正接管
+    //   （resolvedCardScale 里 override 之外唯一非 1.0 的来源）。竖屏 iPhone 上这个条件
+    //   恒为 NO → 清了档位后 resolvedCardScale 回落 1.0 ⇒ 卡片被写回基准 =
+    //   "放大后弹键盘就恢复默认比例"。现在只有自动避让真正会接管时才让位。
+    BOOL keyboardAutoZoomTakesOver =
+        [self currentCardScaleContext] == POCardScaleContextLandscapeShellPortraitHosted &&
+        [[POApplicationHelper settings][@"landscapeKeyboardZoom"] boolValue];
+    if (keyboardAutoZoomTakesOver) {
+        mfUserCardScaleOverride = 0;   // 【0.3.11】键盘弹出 = 恢复自动缩放（避让优先于手动档位）
+        mfManualCardScaleLatched = NO; // 【0.4.12】键盘避让同样优先于"缩放保持"
+    }
     if (panelState == POPanelStateOpen && hostSession.state == POHostSessionStateLive &&
         hostSession.currentGeneration != 0) {
         [[ContextHostManager sharedInstance]
@@ -5509,6 +5548,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
     [hostSession prepareBundleId:bundleId];
     NSUInteger openGeneration = ++deferredOpenGeneration;
+    // 【0.6.12】贴片还原（连续变形）走免延迟快道：0.3s 延迟本是给"关→开"过渡留缓冲，
+    //   变形路径面板已关死、贴片快照正在等卡片，多等 0.3s = 快照静止期直接拉长一半。
+    if (self->mfPinAppSkipOpenDelay) {
+        self->mfPinAppSkipOpenDelay = NO;
+        if (openGeneration == self->deferredOpenGeneration &&
+            self->panelState == POPanelStateClosed &&
+            [self->pinnedBundleId isEqualToString:bundleId]) {
+            [self open];
+        }
+        return;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (openGeneration == self->deferredOpenGeneration &&

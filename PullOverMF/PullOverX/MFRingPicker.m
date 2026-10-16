@@ -2607,8 +2607,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     dial.path = path.CGPath;
     // 【0.3.27 用户 log36】底盘更透：0.12 白 / 0.55 alpha → 0.10 白 / 0.30 alpha
     //   （用户："圆盘的背景颜色可以再透明一点，这样在白色背景下不会显得特别黑"）
-    dial.fillColor = [UIColor colorWithWhite:0.10 alpha:0.30].CGColor;
-    dial.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+    // 【0.6.12 用户 log52】浅色模式下底盘还是显眼：alpha 0.30 → 0.16、描边 0.28 → 0.18
+    dial.fillColor = [UIColor colorWithWhite:0.10 alpha:0.16].CGColor;
+    dial.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.18].CGColor;
     dial.lineWidth = 1.0;
     [ringRoot.layer addSublayer:dial];
     self.dialLayer = dial;
@@ -3252,7 +3253,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.11 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.12 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -5095,7 +5096,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.11 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.12 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
