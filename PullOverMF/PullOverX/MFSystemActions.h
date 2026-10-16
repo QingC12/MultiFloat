@@ -34,3 +34,13 @@ NSArray<NSDictionary<NSString *, NSString *> *> *MFSystemActionEditorEntries(voi
 /// 否则圆盘本身会被截进图里（传 0.35 稳妥）。
 /// 全过程 @try 保护：失败只在日志里写明"试了哪些候选、结果如何"，绝不影响插件其它功能。
 void MFSystemActionPerform(NSString *actionId, NSTimeInterval delay);
+
+/// 【0.6.14】录屏进行中？（圆盘录屏图标右上角红点徽章用；我方记账 + 系统 isRecording 对齐）
+BOOL MFSystemActionRecordIsActive(void);
+
+/// 【0.6.14】圆盘展开时调用：向系统 isRecording 对齐录屏状态
+///（用户从控制中心手动停录时，红点随之熄灭）
+void MFSystemActionRecordSyncState(void);
+
+/// 【0.6.14】注册录屏状态观察者（主线程回调）：录屏开/关变化时圆盘弹提示条 + 刷红点
+void MFSystemActionSetRecordStateObserver(void (^observer)(BOOL active));

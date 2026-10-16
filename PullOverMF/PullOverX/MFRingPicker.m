@@ -1583,6 +1583,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)onEditorOrderStripTap:(UITapGestureRecognizer *)tap;
 - (void)relayoutEditorGridAnimated:(BOOL)animated;
 - (void)rebuildEditorRingPreview;
+// 【0.6.14 用户 log54-①】录屏状态提示（图标红点徽章 + 开/关提示条）
+- (void)mfApplyRecordBadge;
+- (void)mfShowRecordToastActive:(BOOL)active;
 @end
 
 #pragma mark - 容器（展开态）：点空白收起
@@ -2379,6 +2382,31 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             MFLog(@"[ring] 呼出即贴真图标：%lu/%lu（不再有首字母占位阶段）",
                   (unsigned long)filled, (unsigned long)self.iconButtons.count);
         }
+
+        // 【0.6.14 用户 log54-①】录屏状态：展开即向系统 isRecording 对齐 + 贴红点徽章；
+        //   观察者首次呼出时注册（开/关变化 → 提示条 + 红点刷新）。
+        static dispatch_once_t recordObserverOnce;
+        dispatch_once(&recordObserverOnce, ^{
+            __weak typeof(self) weakSelf = self;
+            MFSystemActionSetRecordStateObserver(^(BOOL active) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (strongSelf == nil) {
+                    return;
+                }
+                [strongSelf mfShowRecordToastActive:active];
+                [strongSelf mfApplyRecordBadge];
+            });
+            MFLog(@"[ring] 0.6.14 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+        });
+        MFSystemActionRecordSyncState();
+        [self mfApplyRecordBadge];
+
+        // 【0.6.14 用户 log54-③】呼出跟手期间整盘**栅格化**：跟手阶段每帧都在改
+        //   transform/center，不栅格化时每次都要重排版整个圆盘（底盘层 + N 个图标按钮），
+        //   图标多时就是掉帧来源；栅格化后每帧只合成一张缓存位图 = 丝滑跟手。
+        //   固定（latch）时关掉，恢复实时渲染（选中高亮要逐图标变化）。
+        self.ringRoot.layer.shouldRasterize = YES;
+        self.ringRoot.layer.rasterizationScale = UIScreen.mainScreen.scale;
     } @catch (NSException *exception) {
         MFLog(@"[ring] !! 展开异常：%@", exception);
         [self hide];
@@ -2542,6 +2570,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.ringDwellGeneration += 1;   // 撤掉"停留自动固定"计时器
     self.ringLatched = YES;
     self.ringIntroProgress = 1.0;
+    // 【0.6.14】固定后恢复实时渲染：呼出跟手期的整盘栅格化撤掉（选中高亮要逐图标变化）
+    self.ringRoot.layer.shouldRasterize = NO;
     // 记录"固定那一刻手指在哪"：手指还没动之前不产生选中，避免刚固定就误开某个 App
     self.latchFingerPoint = self.lastFingerPoint;
     self.hasLatchFinger = YES;
@@ -2868,6 +2898,87 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     return filled;
 }
 
+#pragma mark - 【0.6.14 用户 log54-①】录屏状态提示
+
+#define MF_RING_RECORD_BADGE_TAG 35861
+#define MF_RING_RECORD_TOAST_TAG 35862
+
+/// 录屏图标右上角红点徽章：录制中亮红点，空闲熄灭。
+/// 状态源 = MFSystemActionRecordIsActive()（我方记账 + 系统 isRecording 对齐）。
+- (void)mfApplyRecordBadge {
+    for (UIButton *button in self.iconButtons) {
+        if (button.superview == nil) {
+            continue;
+        }
+        NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
+        BOOL isRecord = [bundleId isKindOfClass:[NSString class]] &&
+            [bundleId isEqualToString:@"mfsys.record"];
+        UIView *badge = [button viewWithTag:MF_RING_RECORD_BADGE_TAG];
+        if (!isRecord) {
+            if (badge != nil) {
+                [badge removeFromSuperview];
+            }
+            continue;
+        }
+        BOOL active = MFSystemActionRecordIsActive();
+        if (active && badge == nil) {
+            CGFloat side = button.bounds.size.width;
+            UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(side - 11.0, 2.0, 9.0, 9.0)];
+            dot.tag = MF_RING_RECORD_BADGE_TAG;
+            dot.backgroundColor = [UIColor colorWithRed:0.92 green:0.20 blue:0.20 alpha:1.0];
+            dot.layer.cornerRadius = 4.5;
+            dot.layer.borderColor = [UIColor whiteColor].CGColor;
+            dot.layer.borderWidth = 1.5;
+            dot.userInteractionEnabled = NO;
+            [button addSubview:dot];
+            MFLog(@"[ring] 录屏红点亮起（录制中）");
+        } else if (!active && badge != nil) {
+            [badge removeFromSuperview];
+            MFLog(@"[ring] 录屏红点熄灭（空闲）");
+        }
+    }
+}
+
+/// 录屏开/关提示条：宿主窗口顶部居中弹出，1.6s 自动淡出（连续触发不叠加）。
+- (void)mfShowRecordToastActive:(BOOL)active {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self mfShowRecordToastActive:active]; });
+        return;
+    }
+    UIWindow *window = self.hostWindow;
+    if (window == nil) {
+        return;
+    }
+    UIView *previous = [window viewWithTag:MF_RING_RECORD_TOAST_TAG];
+    if (previous != nil) {
+        [previous removeFromSuperview];
+    }
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 0.0, 176.0, 40.0)];
+    toast.tag = MF_RING_RECORD_TOAST_TAG;
+    toast.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.88];
+    toast.layer.cornerRadius = 20.0;
+    toast.layer.masksToBounds = YES;
+    toast.textAlignment = NSTextAlignmentCenter;
+    toast.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+    toast.text = active ? @"● 录屏已开始" : @"录屏已停止";
+    toast.textColor = active
+        ? [UIColor colorWithRed:1.0 green:0.45 blue:0.45 alpha:1.0]
+        : [UIColor colorWithWhite:1.0 alpha:0.85];
+    toast.center = CGPointMake(window.center.x, 96.0);
+    toast.alpha = 0.0;
+    [window addSubview:toast];
+    [UIView animateWithDuration:0.18 animations:^{ toast.alpha = 1.0; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.24
+                              animations:^{ toast.alpha = 0.0; }
+                              completion:^(__unused BOOL finished) {
+            [toast removeFromSuperview];
+        }];
+    });
+    MFLog(@"[ring] 录屏提示条：%@", active ? @"已开始" : @"已停止");
+}
+
 /// 延后抓取真图标（非呼出路径用：内容刷新、编辑器等）。危险动作 ⇒ 立闸门，走完并存活才撤。
 - (void)scheduleIconFillWithGeneration:(NSUInteger)generation {
     [self scheduleIconFillWithGeneration:generation delay:0.05];
@@ -2920,6 +3031,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.ringRoot.center = center;
     MFLog(@"[ring] 圆盘内容已刷新：%lu 个图标", (unsigned long)self.iconButtons.count);
     [self scheduleIconFillWithGeneration:self.buildGeneration];
+    [self mfApplyRecordBadge];   // 【0.6.14】重建后补录屏红点徽章
 }
 
 #pragma mark - 圆盘应用编辑器（0.2.1）
@@ -3253,7 +3365,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.13 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.14 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -5111,7 +5223,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.13 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.14 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);

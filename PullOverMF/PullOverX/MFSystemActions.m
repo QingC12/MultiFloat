@@ -740,6 +740,196 @@ static id MFSystemActionSingletonInstance(NSString *className, NSString *label) 
     return nil;
 }
 
+#pragma mark - 【0.6.14】录屏状态（圆盘红点徽章 / 提示条用）
+
+static BOOL gMFSystemActionRecordActive = NO;      // 我方视角的录屏开关状态（系统 isRecording 优先）
+static void (^gMFRecordStateObserver)(BOOL active); // 圆盘注册的观察者（toast + 徽章刷新）
+static Class gMFRecordOwnerClass = Nil;            // 录屏 API 宿主类缓存（selector 指纹扫描一次）
+
+BOOL MFSystemActionRecordIsActive(void) {
+    return gMFSystemActionRecordActive;
+}
+
+void MFSystemActionSetRecordStateObserver(void (^observer)(BOOL active)) {
+    @try {
+        gMFRecordStateObserver = [observer copy];
+    } @catch (__unused NSException *exception) {
+        gMFRecordStateObserver = nil;
+    }
+}
+
+/// 状态落账 + 通知圆盘（主线程回调；状态没变时静默返回）
+static void MFSystemActionRecordApplyState(BOOL active, NSString *reason) {
+    if (gMFSystemActionRecordActive == active) {
+        return;
+    }
+    gMFSystemActionRecordActive = active;
+    MFLog(@"[sysact] 录屏状态 → %@（%@）", active ? @"录制中" : @"空闲", reason);
+    void (^obs)(BOOL) = gMFRecordStateObserver;
+    if (obs != nil) {
+        dispatch_async(dispatch_get_main_queue(), ^{ obs(active); });
+    }
+}
+
+/// 录屏 API 宿主类 = 拥有 `startSystemRecordingWithMicrophoneEnabled:handler:` 的类。
+/// 【0.6.14 实证】TrollOpen（同类多浮窗插件）dylib 里就调这几个 selector：
+///   startSystemRecordingWithMicrophoneEnabled:handler: / stopSystemRecording: / isRecording
+/// —— iOS 17 的录屏宿主类**名字里没有 recording**（log54 扫描证据：9 个名字带
+/// ScreenRecording 的类全都不是宿主），所以按 selector 指纹全类扫描才是正路。扫一次缓存。
+static Class MFSystemActionRecordOwnerClass(void) {
+    if (gMFRecordOwnerClass != Nil) {
+        return gMFRecordOwnerClass;
+    }
+    @try {
+        SEL startSelector = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        Class owner = Nil;
+        for (unsigned int i = 0; i < classCount; i++) {
+            if (class_getInstanceMethod(classes[i], startSelector) != NULL) {
+                owner = classes[i];
+                MFLog(@"[sysact] 录屏：selector 指纹命中宿主类 %@", NSStringFromClass(classes[i]));
+                break;
+            }
+        }
+        if (classes != NULL) {
+            free(classes);
+        }
+        gMFRecordOwnerClass = owner;
+        return owner;
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 录屏宿主类扫描异常：%@", exception);
+        return Nil;
+    }
+}
+
+/// 录屏宿主实例：单例族优先；都没有才 alloc/init（类已被 selector 指纹精确锁定，
+/// 风险远小于 0.6.11 那种"名字像就 alloc/init"的盲扫——且全程 @try）。
+static id MFSystemActionRecordOwnerInstance(Class owner) {
+    if (owner == Nil) {
+        return nil;
+    }
+    for (NSString *getter in @[ @"sharedInstance", @"mainInstance", @"defaultInstance" ]) {
+        SEL selector = NSSelectorFromString(getter);
+        if ([owner respondsToSelector:selector]) {
+            @try {
+                id instance = ((id (*)(id, SEL))objc_msgSend)(owner, selector);
+                if (instance != nil) {
+                    return instance;
+                }
+            } @catch (__unused NSException *exception) {
+            }
+        }
+    }
+    @try {
+        id instance = [[owner alloc] init];
+        if (instance != nil) {
+            MFLog(@"[sysact] 录屏：宿主类 %@ 走 alloc/init 实例", NSStringFromClass(owner));
+        }
+        return instance;
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 录屏宿主 alloc/init 异常：%@", exception);
+        return nil;
+    }
+}
+
+/// 读系统侧 isRecording（宿主类没有该 selector 时返回 -1 = 未知）
+static int MFSystemActionRecordSystemState(id instance) {
+    if (instance == nil || ![instance respondsToSelector:@selector(isRecording)]) {
+        return -1;
+    }
+    @try {
+        return ((BOOL (*)(id, SEL))objc_msgSend)(instance, @selector(isRecording)) ? 1 : 0;
+    } @catch (__unused NSException *exception) {
+        return -1;
+    }
+}
+
+/// 圆盘展开时对齐系统状态（用户可能从控制中心手动停了录屏）
+void MFSystemActionRecordSyncState(void) {
+    Class owner = MFSystemActionRecordOwnerClass();
+    if (owner == Nil) {
+        return;
+    }
+    int state = MFSystemActionRecordSystemState(MFSystemActionRecordOwnerInstance(owner));
+    if (state >= 0) {
+        MFSystemActionRecordApplyState(state == 1, @"系统 isRecording 对齐");
+    }
+}
+
+/// no-op handler 块（start/stop 的 handler 参数；被调方传什么都吞掉，防签名差异崩）
+static void MFSystemActionRecordNoopHandler(__unused id result) {
+}
+
+/// 录屏开关主路（0.6.14）：TrollOpen 实证 selector 直调，类型精确安全：
+///   startSystemRecordingWithMicrophoneEnabled:(BOOL)handler:(id)
+///   stopSystemRecording:(id)
+static BOOL MFSystemActionToggleScreenRecordingModern(void) {
+    Class owner = MFSystemActionRecordOwnerClass();
+    if (owner == Nil) {
+        MFLog(@"[sysact] 录屏：selector 指纹未命中宿主类（走旧候选路）");
+        return NO;
+    }
+    id instance = MFSystemActionRecordOwnerInstance(owner);
+    if (instance == nil) {
+        MFLog(@"[sysact] 录屏：宿主类 %@ 拿不到实例（走旧候选路）", NSStringFromClass(owner));
+        return NO;
+    }
+    int systemState = MFSystemActionRecordSystemState(instance);
+    BOOL active = (systemState >= 0) ? (systemState == 1) : gMFSystemActionRecordActive;
+    MFLog(@"[sysact] 录屏：宿主 %@ 当前状态=%@，执行%@",
+          NSStringFromClass(owner),
+          systemState < 0 ? @"未知(用我方缓存)" : (active ? @"录制中" : @"空闲"),
+          active ? @"停止" : @"开始");
+    void (^handler)(id) = ^(id result) {
+        MFSystemActionRecordNoopHandler(result);
+    };
+    @try {
+        if (active) {
+            SEL stopSelector = @selector(stopSystemRecording:);
+            if ([instance respondsToSelector:stopSelector]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(instance, stopSelector, handler);
+                MFSystemActionRecordApplyState(NO, @"stopSystemRecording 已调");
+                MFLog(@"[sysact] 录屏：已停止（stopSystemRecording:）");
+                return YES;
+            }
+            MFLog(@"[sysact] 录屏：宿主不响应 stopSystemRecording:");
+            return NO;
+        }
+        SEL startSelector = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
+        if ([instance respondsToSelector:startSelector]) {
+            // 麦克风默认关（贴系统录屏按钮的默认行为；要带麦后续再暴露开关）
+            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(instance, startSelector, NO, handler);
+            MFLog(@"[sysact] 录屏：已发起（startSystemRecordingWithMicrophoneEnabled:NO）");
+            // 启动是异步的：立刻读一次，0.6s 后再核一次（弹窗确认/直接开录都会回写 isRecording）
+            int immediate = MFSystemActionRecordSystemState(instance);
+            if (immediate >= 0) {
+                MFSystemActionRecordApplyState(immediate == 1, @"start 后即时 isRecording");
+            } else {
+                MFSystemActionRecordApplyState(YES, @"start 已调（系统状态不可读，按已开始记账）");
+            }
+            Class ownerClass = owner;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    id ownerInstance = MFSystemActionRecordOwnerInstance(ownerClass);
+                    int state = MFSystemActionRecordSystemState(ownerInstance);
+                    if (state >= 0) {
+                        MFSystemActionRecordApplyState(state == 1, @"start 后 0.6s isRecording 复核");
+                    }
+                } @catch (__unused NSException *exception) {
+                }
+            });
+            return YES;
+        }
+        MFLog(@"[sysact] 录屏：宿主不响应 startSystemRecordingWithMicrophoneEnabled:handler:");
+        return NO;
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 录屏直调异常：%@", exception);
+        return NO;
+    }
+}
+
 #pragma mark - 动作③：录屏（【0.6.11 用户指令】）
 
 /// 录屏开关（iOS 11+ 的"屏幕录制"由 SpringBoard 侧录制器执行）。
@@ -747,6 +937,10 @@ static id MFSystemActionSingletonInstance(NSString *className, NSString *label) 
 /// （扫所有名字含 ScreenRecording 的类与含 record 字样的方法，结果进日志，
 ///   用户回传日志即可钉死本机真实 API）。
 static BOOL MFSystemActionToggleScreenRecording(void) {
+    // 【0.6.14 主路】TrollOpen 实证 selector 指纹直调（类型精确，无野指针风险）
+    if (MFSystemActionToggleScreenRecordingModern()) {
+        return YES;
+    }
     NSArray<NSString *> *knownClasses = @[
         @"SBCCScreenRecordingControlsModule",
         @"SBCCScreenRecordingModule",
