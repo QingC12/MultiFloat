@@ -3,6 +3,7 @@
 #import "headers.h"
 
 @class ContextHostManager;
+@class POSceneSession;   // 【M1/S1】会话作用域状态容器（S2 起按 bundleId 成组）
 
 @protocol ContextHostManagerExternalSceneDelegate <NSObject>
 @optional
@@ -40,6 +41,18 @@ hostedPresentationContentDidBecomeUnavailableForBundleId:(NSString *)bundleId
 @property (nonatomic, readonly) UIInterfaceOrientation hostedInterfaceOrientation;
 @property (nonatomic, assign) UIInterfaceOrientation presentationInterfaceOrientation;
 + (instancetype)sharedInstance;
+
+// ---- 【M1/S2】多会话注册表（基础设施）----
+// POSceneSession 承载「单个托管窗口」的状态；本组 API 承载「会话集合」本身。
+// 本步只登记 1 个会话（primarySession）⇒ 对外行为与改造前完全一致；M2 起按 bundleId 真正多开。
+- (POSceneSession *)existingSessionForBundleId:(NSString *)bundleId;
+- (POSceneSession *)sessionForBundleId:(NSString *)bundleId;
+- (void)registerSession:(POSceneSession *)session forBundleId:(NSString *)bundleId;
+- (void)recycleSessionForBundleId:(NSString *)bundleId;
+- (NSArray<NSString *> *)knownSessionBundleIds;
+- (id<ContextHostManagerExternalSceneDelegate>)sceneDelegateForBundleId:(NSString *)bundleId;
+- (void)setSceneDelegate:(id<ContextHostManagerExternalSceneDelegate>)delegate
+             forBundleId:(NSString *)bundleId;
 
 + (NSString *)sceneIdentityStringFromSettings:(id)settings;
 + (NSString *)privateSceneIdentityStringFromSettings:(id)settings;

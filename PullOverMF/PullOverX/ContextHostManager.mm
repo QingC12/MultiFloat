@@ -726,6 +726,18 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 // 下方原 @property 声明全部由转发访问器实现（见 @implementation 内同名 getter/setter），
 // 因此这些状态实际存储在 primarySession 上，调用点一行未改。
 @property (nonatomic, strong) POSceneSession *primarySession;
+// 【M1/S2】多会话注册表 —— 跨会话共享的「表」，与 pinnedLive* 同性质，不搬进 POSceneSession。
+// 本步只登记 1 个会话（primarySession）⇒ 行为零变化；M2 起按 bundleId 真正多开。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, POSceneSession *> *sessionsByBundleId;
+@property (nonatomic, strong) NSMapTable<NSString *, id> *sceneDelegatesByBundleId;   // bundleId -> 外部 delegate（weak value）
+- (void)registerSession:(POSceneSession *)session forBundleId:(NSString *)bundleId;
+- (POSceneSession *)existingSessionForBundleId:(NSString *)bundleId;
+- (POSceneSession *)sessionForBundleId:(NSString *)bundleId;
+- (void)recycleSessionForBundleId:(NSString *)bundleId;
+- (NSArray<NSString *> *)knownSessionBundleIds;
+- (id<ContextHostManagerExternalSceneDelegate>)sceneDelegateForBundleId:(NSString *)bundleId;
+- (void)setSceneDelegate:(id<ContextHostManagerExternalSceneDelegate>)delegate forBundleId:(NSString *)bundleId;
+- (id<ContextHostManagerExternalSceneDelegate>)mf_delegateForScene:(FBScene *)scene;
 @property (nonatomic, strong) FBScene *hostedScene;
 @property (nonatomic, strong) FBSceneLayerManager *hostedLayerManager;
 @property (nonatomic, strong) FBSceneHostManager *hostedFallbackHostManager;
@@ -830,7 +842,12 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
                                            attempt:(NSUInteger)attempt;
 @end
 
-@implementation ContextHostManager
+@implementation ContextHostManager {
+    // 【M1/S2】sceneDelegate 单槽的后备存储。
+    // 该属性改为手写存取器（对外语义不变），setter 顺手把 delegate 登记进「当前会话的 bundleId 槽位」，
+    // 为 M2 的多会话回调路由铺路。
+    __weak id<ContextHostManagerExternalSceneDelegate> _mfLegacySceneDelegate;
+}
 
 static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
                                        NSArray<FBSceneLayer *> *rhs) {
@@ -865,8 +882,159 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         _primarySession = [POSceneSession new];
         MFLog(@"[session] 0.6.18 会话状态对象化（S1）：primarySession 已创建（会话作用域状态 %lu 项，多片表仍在本类）",
               (unsigned long)44);
+
+        // 【M1/S2】多会话注册表：容器 + 登记 primarySession。
+        // 本步仍只有 1 个会话 ⇒ 所有新入口都只会取回 primarySession，行为与改造前一致。
+        _sessionsByBundleId = [NSMutableDictionary dictionary];
+        _sceneDelegatesByBundleId = [NSMapTable mapTableWithKeyOptions:(NSPointerFunctionsStrongMemory |
+                                                                      NSPointerFunctionsObjectPersonality)
+                                                         valueOptions:NSPointerFunctionsWeakMemory];
+        [self registerSession:_primarySession forBundleId:nil];
+        MFLog(@"[session] 0.6.19 多会话注册表就位（S2）：已登记 1 个会话（primarySession），按 bundleId 路由 delegate 可用（本步仍单会话）");
     }
     return self;
+}
+
+#pragma mark - 【M1 / S2】多会话注册表与按 bundleId 的 delegate 路由
+//
+// S1 把「单个托管窗口」的状态集中到了 POSceneSession；本步补上「会话集合」本身：
+//   · sessionsByBundleId        —— bundleId → 会话（跨会话共享的表，同 pinnedLive* 性质）
+//   · sceneDelegatesByBundleId  —— bundleId → 外部 delegate（weak，避免反向持有 UI）
+//   · mf_delegateForScene:      —— 回调路由统一入口：按「事件所属 scene」找它的 bundleId，
+//                                  再取该会话的 delegate；找不到就回落到单槽 self.sceneDelegate。
+//
+// 本步 **仍只登记 1 个会话**（primarySession），且所有原回调点在单窗下回落结果不变
+// ⇒ 行为零变化。M2 起才真正按 bundleId 多开、并让 POHostSessionController 改用
+// setSceneDelegate:forBundleId: 注册，届时路由自动生效。
+//
+static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
+
+- (void)registerSession:(POSceneSession *)session forBundleId:(NSString *)bundleId {
+    if (!session) {
+        return;
+    }
+    NSString *key = bundleId.length ? bundleId : kMFPrimarySessionKey;
+    NSMutableDictionary<NSString *, POSceneSession *> *table = self.sessionsByBundleId;
+    if (!table) {
+        return;
+    }
+    if (table[key] == session) {
+        return;
+    }
+    table[key] = session;
+}
+
+- (POSceneSession *)existingSessionForBundleId:(NSString *)bundleId {
+    if (bundleId.length == 0) {
+        return self.primarySession;
+    }
+    return self.sessionsByBundleId[bundleId];
+}
+
+- (POSceneSession *)sessionForBundleId:(NSString *)bundleId {
+    if (bundleId.length == 0) {
+        return self.primarySession;
+    }
+    POSceneSession *existing = self.sessionsByBundleId[bundleId];
+    if (existing) {
+        return existing;
+    }
+    // 主会话尚未认领 bundleId（单窗）：直接认领 —— 结果与 S1 只有 primarySession 时一致。
+    POSceneSession *primary = self.primarySession;
+    if (primary && (primary.hostedBundleId.length == 0 ||
+                    [primary.hostedBundleId isEqualToString:bundleId])) {
+        [self registerSession:primary forBundleId:bundleId];
+        return primary;
+    }
+    // 【S3 预留】走到这里意味着「主会话已绑定别的 bundleId」。本步没有任何调用方会触发
+    //（单窗下 sessionForBundleId: 只被诊断调用），M2/S3 接入停靠窗后才启用。
+    POSceneSession *fresh = [POSceneSession new];
+    [self registerSession:fresh forBundleId:bundleId];
+    MFLog(@"[session][diag] 新建会话（S2 预留路）：bid=%@，已登记 %lu 个", bundleId,
+          (unsigned long)self.sessionsByBundleId.count);
+    return fresh;
+}
+
+- (void)recycleSessionForBundleId:(NSString *)bundleId {
+    if (bundleId.length == 0) {
+        return;
+    }
+    POSceneSession *session = self.sessionsByBundleId[bundleId];
+    if (!session || session == self.primarySession) {
+        return;   // 主会话不回收（单窗阶段由 VC 生命周期管理，对应 S3 的解耦）
+    }
+    [self.sessionsByBundleId removeObjectForKey:bundleId];
+    [self.sceneDelegatesByBundleId removeObjectForKey:bundleId];
+    MFLog(@"[session] 回收会话：bid=%@，剩余 %lu 个", bundleId,
+          (unsigned long)self.sessionsByBundleId.count);
+}
+
+- (NSArray<NSString *> *)knownSessionBundleIds {
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    for (NSString *key in self.sessionsByBundleId) {
+        if ([key isEqualToString:kMFPrimarySessionKey]) {
+            continue;
+        }
+        [ids addObject:key];
+    }
+    return ids;
+}
+
+- (id<ContextHostManagerExternalSceneDelegate>)sceneDelegateForBundleId:(NSString *)bundleId {
+    if (bundleId.length) {
+        id routed = [self.sceneDelegatesByBundleId objectForKey:bundleId];
+        if (routed) {
+            return (id<ContextHostManagerExternalSceneDelegate>)routed;
+        }
+    }
+    return self.sceneDelegate;   // 兼容回落：单槽（S2 阶段它就是唯一 delegate）
+}
+
+- (void)setSceneDelegate:(id<ContextHostManagerExternalSceneDelegate>)delegate
+             forBundleId:(NSString *)bundleId {
+    if (bundleId.length == 0) {
+        self.sceneDelegate = delegate;
+        return;
+    }
+    if (delegate) {
+        [self.sceneDelegatesByBundleId setObject:delegate forKey:bundleId];
+    } else {
+        [self.sceneDelegatesByBundleId removeObjectForKey:bundleId];
+    }
+}
+
+// ---- sceneDelegate：单槽实现保留（对外语义一字未改），
+//      setter 顺手把 delegate 登记进「当前会话的 bundleId 槽位」，为 M2 路由铺路。
+- (id<ContextHostManagerExternalSceneDelegate>)sceneDelegate {
+    return _mfLegacySceneDelegate;
+}
+
+- (void)setSceneDelegate:(id<ContextHostManagerExternalSceneDelegate>)sceneDelegate {
+    _mfLegacySceneDelegate = sceneDelegate;
+    NSString *bid = self.hostedBundleId;
+    if (bid.length == 0) {
+        return;
+    }
+    if (sceneDelegate) {
+        [self.sceneDelegatesByBundleId setObject:sceneDelegate forKey:bid];
+    } else {
+        [self.sceneDelegatesByBundleId removeObjectForKey:bid];
+    }
+}
+
+// 回调路由统一入口（S2 起原回调点改走这里；单窗下回落结果不变）。
+- (id<ContextHostManagerExternalSceneDelegate>)mf_delegateForScene:(FBScene *)scene {
+    NSString *bid = nil;
+    if (scene && (self.hostedScene == scene || self.publishedScene == scene)) {
+        bid = self.hostedBundleId;
+    }
+    if (bid.length) {
+        id routed = [self.sceneDelegatesByBundleId objectForKey:bid];
+        if (routed) {
+            return (id<ContextHostManagerExternalSceneDelegate>)routed;
+        }
+    }
+    return self.sceneDelegate;
 }
 
 #pragma mark - 【M1 / S1】会话作用域状态转发访问器（状态在 POSceneSession，接口未变）
@@ -1538,7 +1706,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
             strongManager.hostedInterfaceOrientation != desiredOrientation) {
             return;
         }
-        id<ContextHostManagerExternalSceneDelegate> delegate = strongManager.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [strongManager mf_delegateForScene:scene];
         if ([delegate respondsToSelector:@selector(contextManager:scene:hostedInterfaceOrientationDidChange:systemAnimationParameters:hostGeneration:)]) {
             [delegate contextManager:strongManager
                                scene:scene
@@ -2021,7 +2189,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
             UIView *hostView = [hostManager hostViewForRequester:kPORequester enableAndOrderFront:YES];
             if (hostView) {
                 self.hostedFallbackHostManager = hostManager;
-                id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+                id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
                 if ([delegate respondsToSelector:@selector(contextManager:scene:sceneStackDidChange:hostGeneration:)]) {
                     [delegate contextManager:self scene:scene sceneStackDidChange:hostView hostGeneration:generation];
                 }
@@ -2144,7 +2312,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         UIView *hostView = [hostManager hostViewForRequester:kPORequester enableAndOrderFront:YES];
         if (hostView) {
             self.hostedFallbackHostManager = hostManager;
-            id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+            id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
             if ([delegate respondsToSelector:@selector(contextManager:scene:sceneStackDidChange:hostGeneration:)]) {
                 [delegate contextManager:self scene:scene sceneStackDidChange:hostView hostGeneration:generation];
             }
@@ -2736,7 +2904,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         CGSize logicalSize = POIsConcreteInterfaceOrientation(sourceOrientation)
             ? POHostedCanvasSizeForOrientation(sourceOrientation)
             : CGSizeZero;
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [self sceneDelegateForBundleId:bundleId];
         if ((logicalSize.width <= 0 || logicalSize.height <= 0) &&
             [delegate respondsToSelector:@selector(contextManagerPreferredSceneStackSize:)]) {
             logicalSize = [delegate contextManagerPreferredSceneStackSize:self];
@@ -3159,7 +3327,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
 
     CGSize hostedCanvas = CGSizeZero;
-    id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+    id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
     if ([delegate respondsToSelector:@selector(contextManagerPreferredSceneStackSize:)]) {
         hostedCanvas = [delegate contextManagerPreferredSceneStackSize:self];
     }
@@ -3381,7 +3549,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     if (shouldRebaseSourceToBase) {
         self.pendingRuntimeOrientationNotification = observedOrientation;
         self.pendingRuntimeOrientationNotificationGeneration = generation;
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
         if ([delegate respondsToSelector:@selector(contextManager:scene:hostedInterfaceOrientationDidChange:systemAnimationParameters:hostGeneration:)]) {
             [delegate contextManager:self
                                scene:scene
@@ -3392,7 +3560,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
             [self canonicalizeHostedSourceForCurrentOrientationWithGeneration:generation];
         }
     } else {
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
         if ([delegate respondsToSelector:@selector(contextManager:scene:hostedInterfaceOrientationDidChange:systemAnimationParameters:hostGeneration:)]) {
             [delegate contextManager:self
                                scene:scene
@@ -3548,7 +3716,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
 
     CGSize targetStackSize = CGSizeZero;
-    id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+    id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
     if ([delegate respondsToSelector:@selector(contextManagerPreferredSceneStackSize:)]) {
         targetStackSize = [delegate contextManagerPreferredSceneStackSize:self];
     }
@@ -3780,7 +3948,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
     BOOL sceneValid = ![scene respondsToSelector:@selector(isValid)] || [(id)scene isValid];
     if (!sceneValid) {
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
         if ([delegate respondsToSelector:@selector(contextManager:sceneDidBecomeInvalid:hostGeneration:)]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!self.isForegroundLeaseActive || self.hostedScene != scene ||
@@ -3823,7 +3991,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
                                 keyboardSceneStack:&keyboardSceneStack
                                            hasKeyboardLayerOut:&hasKeyboardLayer];
 
-    id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+    id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:scene];
     if (sceneStack.subviews.count == 0) {
         if ([delegate respondsToSelector:@selector(contextManager:scene:externalSceneStackDidChange:containsKeyboardLayer:hostGeneration:)]) {
             [delegate contextManager:self
@@ -3880,7 +4048,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         if (self.ios26HostedContentUnavailableNotified) {
             return;
         }
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
+        id<ContextHostManagerExternalSceneDelegate> delegate = [self mf_delegateForScene:self.hostedScene];
         if ([delegate respondsToSelector:@selector(contextManager:scene:hostedPresentationContentDidBecomeUnavailableForBundleId:hostGeneration:)]) {
             self.ios26HostedContentUnavailableNotified = YES;
             [delegate contextManager:self
