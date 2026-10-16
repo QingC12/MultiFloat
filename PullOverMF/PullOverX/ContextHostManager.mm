@@ -757,7 +757,6 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 @property (nonatomic, assign) CGRect systemHostedOriginalFrame;
 @property (nonatomic, assign) BOOL systemHostedInitialFrameApplied;
 @property (nonatomic, assign) BOOL systemHostedServerFrameCanonicalized;
-@property (nonatomic, assign) BOOL hostedSceneFrameOverrideApplied;   // 【0.4.18】胖屏画布覆盖中（释放租约前必须还原）
 @property (nonatomic, copy) NSString *pendingRemnantReconnectBundleId;
 @property (nonatomic, copy) NSString *remnantReconnectClaimBundleId;
 @property (nonatomic, copy) NSString *ownedCanonicalSceneAwaitingLeaseBundleId;
@@ -2017,11 +2016,6 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     // 【0.4.0】放弃托管 ⇒ 立即撤销相机前台授权（否则退回桌面后那个 App 还留着后台相机权）
     POSetCameraForegroundGrantBundleIdentifier(nil);
     MFLog(@"[cam] 清空相机前台授权（放弃托管 %@）", hostedId ?: @"-");
-    // 【0.4.18】胖屏画布覆盖：释放前台租约前必须把 scene frame 还原成全屏画布，
-    // 否则 App 回到 SpringBoard（或被原生打开）后会停在胖屏小窗尺寸。
-    if (self.hostedSceneFrameOverrideApplied && scene) {
-        [self restoreHostedSceneFrameToPreferredSizeForScene:scene];
-    }
     self.foregroundLeaseActive = NO;
     self.activeLeaseGeneration = 0;
     [self releaseProcessAssertion];
@@ -3076,73 +3070,6 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         self.applyingHostedSettingsInternally = previousInternalMutation;
     } @catch (__unused NSException *exception) {
     }
-}
-
-/// 【0.4.18 用户 log43】胖屏内容自适应：把宿主 scene 的 frame 真实改成 size，App 按新比例
-/// 重新布局（Stheno Width×HeightFraction 同款）；size 为零 = 还原为全屏画布。
-/// 横竖方向与当前画布不一致时拒绝（防跨方向托管场景翻转错乱）。
-- (BOOL)applyHostedSceneFrameSize:(CGSize)size forBundleId:(NSString *)bundleId {
-    if (bundleId.length == 0 || !self.isForegroundLeaseActive || !self.hostedScene ||
-        ![self.hostedBundleId isEqualToString:bundleId]) {
-        return NO;
-    }
-    FBScene *scene = self.hostedScene;
-    BOOL restore = (size.width <= 0 || size.height <= 0);
-    CGSize target = size;
-    if (restore) {
-        id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
-        if ([delegate respondsToSelector:@selector(contextManagerPreferredSceneStackSize:)]) {
-            target = [delegate contextManagerPreferredSceneStackSize:self];
-        }
-        if (target.width <= 0 || target.height <= 0) {
-            return NO;
-        }
-    }
-    CGSize current = [self publishedSourceCanvasSizeForScene:scene];
-    if (current.width > 0 && current.height > 0 &&
-        (current.width > current.height) != (target.width > target.height)) {
-        MFLog(@"[scene] 胖屏画布拒绝（方向不一致：当前 %.0fx%.0f 目标 %.0fx%.0f）",
-              current.width, current.height, target.width, target.height);
-        return NO;
-    }
-    __block BOOL applied = NO;
-    [self mutateSettingsForScene:scene withBlock:^(id settings){
-        SEL frameSelector = NSSelectorFromString(@"setFrame:");
-        if ([settings respondsToSelector:frameSelector]) {
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(settings, frameSelector,
-                                                      (CGRect){ CGPointZero, target });
-            applied = YES;
-        }
-    }];
-    self.hostedSceneFrameOverrideApplied = applied && !restore;
-    if (applied) {
-        MFLog(@"[scene] 胖屏画布 → %@（%.0fx%.0f bid=%@）",
-              restore ? @"还原全屏" : @"胖屏重排", target.width, target.height, bundleId);
-    }
-    return applied;
-}
-
-/// 【0.4.18】把 scene frame 还原为全屏画布（发布/释放前调用，不查租约状态）。
-- (void)restoreHostedSceneFrameToPreferredSizeForScene:(FBScene *)scene {
-    if (!scene) {
-        return;
-    }
-    CGSize target = CGSizeZero;
-    id<ContextHostManagerExternalSceneDelegate> delegate = self.sceneDelegate;
-    if ([delegate respondsToSelector:@selector(contextManagerPreferredSceneStackSize:)]) {
-        target = [delegate contextManagerPreferredSceneStackSize:self];
-    }
-    if (target.width <= 0 || target.height <= 0) {
-        return;
-    }
-    [self mutateSettingsForScene:scene withBlock:^(id settings){
-        SEL frameSelector = NSSelectorFromString(@"setFrame:");
-        if ([settings respondsToSelector:frameSelector]) {
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(settings, frameSelector,
-                                                      (CGRect){ CGPointZero, target });
-        }
-    }];
-    self.hostedSceneFrameOverrideApplied = NO;
 }
 
 - (void)observeLayerManager:(FBSceneLayerManager *)layerManager{
