@@ -218,6 +218,13 @@ static const CFTimeInterval kPOOwnedSceneFallbackProcessDrainDelay = 0.12;
     });
 }
 
+- (BOOL)preserveActiveSessionAsLiveTile {
+    if (self.state != POHostSessionStateLive && self.state != POHostSessionStateActivating) {
+        return NO;
+    }
+    return [self.manager beginLiveTilePreservation];
+}
+
 - (void)beginClosingPreservingActiveLease {
     self.currentGeneration += 1;
     if (self.currentGeneration == 0) {

@@ -286,15 +286,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 #pragma mark - 【MF 0.6.0】停靠条贴片模型
 
-/// 停靠条里的一张贴片 = 一个被停靠的 App（快照制）。
+/// 停靠条里的一张贴片 = 一个被停靠的 App（0.6.0 快照制；0.6.1 起首片可实时保活）。
 @interface PODockedWindow : NSObject
 @property (nonatomic, copy) NSString *bundleId;
 @property (nonatomic, strong) UIImage *iconImage;      // App 图标（POApplicationHelper）
-@property (nonatomic, strong) UIImage *snapshotImage;  // 停靠瞬间的内容快照（可 nil → 贴片退化为图标）
+@property (nonatomic, strong) UIImage *snapshotImage;  // 停靠瞬间的内容快照（可 nil → 贴片退化为图标；实时片里作兜底 underlay）
 @property (nonatomic, assign) CGRect savedFrame;       // 停靠前的内容坐标 frame（点贴片还原用）
 @property (nonatomic, assign) CGFloat savedScale;      // 停靠前的缩放档位
 @property (nonatomic, assign) NSInteger side;          // 1=右条 -1=左条
 @property (nonatomic, strong) UIView *tileView;        // 反向引用（重排/移除用）
+@property (nonatomic, strong) UIView *liveContainerView; // 【0.6.1】实时内容容器（快照在下、实时视图在上、图标悬浮最上）
+@property (nonatomic, strong) UIView *liveStackView;   // 【0.6.1】寄存的 sceneStack 视图（非 nil = 实时保活中）
 @end
 @implementation PODockedWindow
 @end
@@ -394,6 +396,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfDockStripViewRight;       // 【0.6.0】右条容器（同上）
     NSUInteger mfStripRestoreGeneration; // 【0.6.0】贴片还原 frame 的代次（dispatch_after 防串扰）
     PODockedWindow *mfStripPendingRestore; // 【0.6.0】等待开完还原 frame 的贴片
+    NSUInteger mfLiveMountGeneration;   // 【0.6.1】实时内容延迟挂载的代次（防串扰）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -1021,12 +1024,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.0 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.1 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.0 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.1 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3140,7 +3143,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.0 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除）");
+    MFLog(@"[card] 0.6.1 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除 首片=实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3902,7 +3905,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.0 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.1 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4019,6 +4022,193 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return image;
 }
 
+#pragma mark - 【MF 0.6.1】实时贴片（保活一片，快照兜底）
+
+/// 进程内视图截图：sceneStack 宿主视图在本进程，drawViewHierarchy 可用（降级换帧用）。
+-(UIImage *)mfCaptureViewSnapshot:(UIView *)view{
+    if (!view || view.bounds.size.width <= 0 || view.bounds.size.height <= 0) {
+        return nil;
+    }
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:view.bounds.size];
+    __block UIImage *image = nil;
+    @try {
+        image = [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *ctx){
+            [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:NO];
+        }];
+    } @catch (__unused NSException *exception) {
+        image = nil;
+    }
+    return image;
+}
+
+/// 停靠/互换前布防：把当前主窗会话转成实时贴片（内含旧实时片降级——同时只保活一片）。
+-(BOOL)mfArmLiveTileForWindow:(PODockedWindow *)w{
+    if (!w) {
+        return NO;
+    }
+    [self mfDemotePinnedLiveTileIfAny];
+    BOOL armed = NO;
+    @try {
+        armed = [hostSession preserveActiveSessionAsLiveTile];
+    } @catch (__unused NSException *exception) {
+        armed = NO;
+    }
+    if (armed) {
+        ContextHostManager *manager = [ContextHostManager sharedInstance];
+        w.liveStackView = [manager pinnedLiveSceneStack];
+        if (!w.liveStackView) {
+            armed = NO;
+            [manager releasePinnedLiveTile];
+        }
+    }
+    return armed;
+}
+
+/// 同时只保活一片：有旧实时片 → 抓最后一帧当快照 → 拆保活。
+-(void)mfDemotePinnedLiveTileIfAny{
+    ContextHostManager *manager = [ContextHostManager sharedInstance];
+    if (![manager hasPinnedLiveTile]) {
+        return;
+    }
+    NSString *bid = [manager pinnedLiveBundleId] ?: @"";
+    UIView *stack = [manager pinnedLiveSceneStack];
+    UIImage *lastFrame = [self mfCaptureViewSnapshot:stack];
+    [manager releasePinnedLiveTile];
+    PODockedWindow *w = [self mfDockStripWindowForBundleId:bid];
+    if (w) {
+        [self mfTeardownLiveStackForWindow:w];
+        if (lastFrame) {
+            w.snapshotImage = lastFrame;
+            [self mfRefreshTileForWindow:w];
+        }
+        MFLog(@"[strip][live] 旧实时片降级为快照：%@（最后一帧%@）", bid,
+              lastFrame ? @"已截" : @"截取失败");
+    }
+}
+
+/// 拆除某贴片的实时挂载（回退快照 underlay）；寄存的 sceneStack 复位后脱管（可被发布链路重用）。
+-(void)mfTeardownLiveStackForWindow:(PODockedWindow *)w{
+    if (!w) {
+        return;
+    }
+    UIView *stack = w.liveStackView;
+    w.liveStackView = nil;
+    if (w.liveContainerView) {
+        w.liveContainerView.hidden = YES;
+    }
+    if (stack) {
+        stack.transform = CGAffineTransformIdentity;
+        stack.userInteractionEnabled = YES;
+        [stack removeFromSuperview];
+    }
+    if (contextView == stack) {
+        // 【0.6.1】防悬挂：卡片内容指针若还指着这枚视图，一并清掉
+        contextView = nil;
+    }
+}
+
+/// 把寄存的 sceneStack 挂进贴片（等比缩放 aspect-fill，触摸禁用）。
+-(void)mfMountLiveStackForWindow:(PODockedWindow *)w{
+    UIView *stack = w.liveStackView;
+    UIView *container = w.liveContainerView;
+    if (!stack || !container || stack.superview == container) {
+        return;
+    }
+    CGSize canvas = stack.bounds.size;
+    if (canvas.width <= 0 || canvas.height <= 0) {
+        canvas = CGSizeMake(430.0, 932.0);
+    }
+    CGFloat tileW = CGRectGetWidth(container.bounds);
+    CGFloat tileH = CGRectGetHeight(container.bounds);
+    if (tileW <= 0 || tileH <= 0) {
+        tileW = MF_DOCK_STRIP_TILE_W;
+        tileH = MF_DOCK_STRIP_TILE_W * 16.0 / 9.0;
+    }
+    CGFloat scale = MAX(tileW / canvas.width, tileH / canvas.height);
+    stack.transform = CGAffineTransformIdentity;
+    stack.bounds = (CGRect){CGPointZero, canvas};
+    stack.center = CGPointMake(tileW / 2.0, tileH / 2.0);
+    stack.transform = CGAffineTransformMakeScale(scale, scale);
+    stack.userInteractionEnabled = NO;
+    stack.hidden = NO;
+    stack.alpha = 1.0;
+    [container addSubview:stack];
+    container.hidden = NO;
+    if (contextView == stack) {
+        // 【0.6.1】视图已归贴片所有：置空 contextView，防止后续发布把它从贴片里摘走
+        contextView = nil;
+        presentationRetainedAfterRelease = NO;
+    }
+    MFLog(@"[strip][live] 实时内容挂载：%@ 画布 %.0fx%.0f 缩放 %.3f", w.bundleId,
+          canvas.width, canvas.height, scale);
+}
+
+/// 延迟挂载：等互换的发布收尾/关闭的租约释放走完（发布链路会把旧 contextView 摘下，正好让位）。
+-(void)mfScheduleLiveMountForWindow:(PODockedWindow *)w{
+    if (!w || !w.liveStackView) {
+        return;
+    }
+    NSUInteger generation = ++mfLiveMountGeneration;
+    NSString *bid = [w.bundleId copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != self->mfLiveMountGeneration || !w.liveStackView) {
+            return;
+        }
+        ContextHostManager *manager = [ContextHostManager sharedInstance];
+        if (![manager hasPinnedLiveTile] ||
+            ![manager.pinnedLiveBundleId isEqualToString:bid]) {
+            [self mfTeardownLiveStackForWindow:w];   // 已被开回主窗/旁路拆除
+            return;
+        }
+        if (w.tileView == nil) {
+            return;   // 贴片已被去重/淘汰移除，保活随 drop 拆除
+        }
+        [self mfMountLiveStackForWindow:w];
+    });
+}
+
+/// 发布回调对账：保活被旁路释放 / App 已回主窗 → 贴片回退快照。
+-(void)mfReconcileLiveTilesAfterPublish:(UIView *)publishedStack bundleId:(NSString *)bundleId{
+    ContextHostManager *manager = [ContextHostManager sharedInstance];
+    NSArray *sides = @[ mfDockStripLeft ?: @[], mfDockStripRight ?: @[] ];
+    for (NSArray *items in sides) {
+        for (PODockedWindow *w in items) {
+            if (!w.liveStackView) {
+                continue;
+            }
+            if ([w.bundleId isEqualToString:bundleId] && w.liveStackView == publishedStack) {
+                continue;   // 该 App 已回主窗；贴片由 pinApp 去重 drop 拆保活
+            }
+            if (![manager hasPinnedLiveTile] ||
+                ![manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
+                MFLog(@"[strip][live] 对账回退：%@ 保活已不在位 → 回退快照", w.bundleId);
+                [self mfTeardownLiveStackForWindow:w];
+            }
+        }
+    }
+}
+
+/// 【0.6.1】快照瞬态失败补救（log45：coolapk 首停失败）：0.6s 后再试一次，成功重建贴片。
+-(void)mfScheduleSnapshotRetryForWindow:(PODockedWindow *)w{
+    if (!w || w.snapshotImage || w.liveStackView) {
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!w || w.snapshotImage || w.liveStackView) {
+            return;
+        }
+        UIImage *image = [self mfCaptureCardContentSnapshotForBundleId:w.bundleId];
+        if (image) {
+            w.snapshotImage = image;
+            [self mfRefreshTileForWindow:w];
+            MFLog(@"[strip] 快照重试成功：%@", w.bundleId);
+        }
+    });
+}
+
 /// 主窗停靠 = 快照入停靠条并关闭主窗（App 进程保留在后台，点贴片重开走快开链路）。
 -(void)mfDockCardToStrip:(BOOL)toRight{
     if (panelState != POPanelStateOpen || [self isPanelTransitioning]) {
@@ -4035,15 +4225,22 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     w.bundleId = [bid copy];
     w.iconImage = [POApplicationHelper imageForBundleId:bid];
     w.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:bid];
+    BOOL live = [self mfArmLiveTileForWindow:w];   // 【0.6.1】先截快照再布防（布防不动租约，快照仍可用）
     w.savedFrame = keyboardZoomBaseFrame;
     w.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
     w.side = toRight ? 1 : -1;
-    MFLog(@"[strip] 主窗停靠：%@ 快照%@ → %@侧（停靠前 scale %.2f）", bid,
+    MFLog(@"[strip] 主窗停靠：%@ 快照%@ 实时%@ → %@侧（停靠前 scale %.2f）", bid,
           w.snapshotImage ? @"成功" : @"失败（贴片退化为图标）",
+          live ? @"保活" : @"不保活",
           toRight ? @"右" : @"左", w.savedScale);
     [self mfDockStripAddWindow:w];
     [self mfDockStripRebuildAnimated:YES];
-    [self close];   // 复用现成关闭动画；App 进程留后台，还原走 pinApp 快开
+    if (live) {
+        [self mfScheduleLiveMountForWindow:w];
+    } else {
+        [self mfScheduleSnapshotRetryForWindow:w];
+    }
+    [self close];   // 复用现成关闭动画；App 进程留后台（实时片保活渲染），还原走 pinApp 快开
 }
 
 -(void)mfDockStripAddWindow:(PODockedWindow *)w{
@@ -4066,6 +4263,15 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)mfDockStripDropWindow:(PODockedWindow *)w animated:(BOOL)animated{
     if (!w) {
         return;
+    }
+    // 【0.6.1】实时片先拆保活（App 留后台）、再把寄存视图摘出来——别随贴片动画一起销毁
+    if (w.liveStackView) {
+        ContextHostManager *manager = [ContextHostManager sharedInstance];
+        if ([manager hasPinnedLiveTile] &&
+            [manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
+            [manager releasePinnedLiveTile];
+        }
+        [self mfTeardownLiveStackForWindow:w];
     }
     [[self mfDockStripItemsForSide:w.side >= 0] removeObject:w];
     UIView *tile = w.tileView;
@@ -4115,6 +4321,29 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return nil;
 }
 
+-(PODockedWindow *)mfDockStripWindowForBundleId:(NSString *)bundleId{
+    if (bundleId.length == 0) {
+        return nil;
+    }
+    for (PODockedWindow *w in mfDockStripLeft) {
+        if ([w.bundleId isEqualToString:bundleId]) { return w; }
+    }
+    for (PODockedWindow *w in mfDockStripRight) {
+        if ([w.bundleId isEqualToString:bundleId]) { return w; }
+    }
+    return nil;
+}
+
+/// 用当前 snapshotImage 重建贴片视图（降级换帧/快照重试成功后用）。
+-(void)mfRefreshTileForWindow:(PODockedWindow *)w{
+    if (!w || !w.tileView) {
+        return;
+    }
+    [w.tileView removeFromSuperview];
+    w.tileView = nil;
+    [self mfDockStripRebuildAnimated:NO];
+}
+
 -(UIView *)mfDockStripTileForWindow:(PODockedWindow *)w{
     CGFloat tileH = MF_DOCK_STRIP_TILE_W * 16.0 / 9.0;
     UIView *tile = [[UIView alloc] initWithFrame:CGRectMake(0, 0, MF_DOCK_STRIP_TILE_W, tileH)];
@@ -4129,6 +4358,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     snapView.clipsToBounds = YES;
     snapView.image = w.snapshotImage;
     [tile addSubview:snapView];
+    // 【0.6.1】实时内容容器：盖在快照上（渲染成功即覆盖快照，失败/未挂载则露出快照兜底）
+    UIView *liveContainer = [[UIView alloc] initWithFrame:tile.bounds];
+    liveContainer.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    liveContainer.clipsToBounds = YES;
+    liveContainer.userInteractionEnabled = NO;   // 触摸穿透给贴片手势（点击/长按）
+    liveContainer.hidden = YES;
+    [tile addSubview:liveContainer];
+    w.liveContainerView = liveContainer;
     BOOL iconOnly = (w.snapshotImage == nil);
     CGFloat iconSize = iconOnly ? 30.0 : 20.0;
     UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake(
@@ -4238,13 +4475,28 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         current.bundleId = [hostSession.activeBundleId copy];
         current.iconImage = [POApplicationHelper imageForBundleId:current.bundleId];
         current.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:current.bundleId];
+        BOOL live = [self mfArmLiveTileForWindow:current];   // 【0.6.1】先截快照再布防（含旧实时片降级）
         current.savedFrame = keyboardZoomBaseFrame;
         current.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
         current.side = w.side;
         [self mfDockStripAddWindow:current];
         [self mfDockStripRebuildAnimated:YES];
-        MFLog(@"[strip] 互换：主窗 %@ 自动入条（%@侧），%@ 上主窗",
-              current.bundleId, current.side >= 0 ? @"右" : @"左", w.bundleId);
+        if (live) {
+            [self mfScheduleLiveMountForWindow:current];
+        } else {
+            [self mfScheduleSnapshotRetryForWindow:current];
+        }
+        MFLog(@"[strip] 互换：主窗 %@ 自动入条（%@侧 实时%d），%@ 上主窗",
+              current.bundleId, current.side >= 0 ? @"右" : @"左", live ? 1 : 0, w.bundleId);
+    }
+    // 【0.6.1】目标贴片若正保活：先拆保活再开（激活链路会重新拿租约与断言，scene 仍温热）
+    if (w.liveStackView) {
+        ContextHostManager *manager = [ContextHostManager sharedInstance];
+        if ([manager hasPinnedLiveTile] &&
+            [manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
+            [manager releasePinnedLiveTile];
+        }
+        [self mfTeardownLiveStackForWindow:w];
     }
     mfStripPendingRestore = w;
     mfStripRestoreGeneration += 1;
@@ -6197,6 +6449,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self restoreKeyboardZoomImmediately];
     keyboardZoomSuspensionReasons = POKeyboardZoomSuspensionNone;
     [self hidePresentationContainer];
+    [[ContextHostManager sharedInstance] releasePinnedLiveTile];   // 【0.6.1】整链失效 → 保活贴片一并拆除
     [hostSession invalidate];
     [[POSplitSessionController sharedInstance] end];
     [self cleanUpSubviews];
@@ -6419,6 +6672,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     if (![bundleId isEqualToString:pinnedBundleId]) {
         [self commitPinnedBundleId:bundleId];
     }
+    [self mfReconcileLiveTilesAfterPublish:sceneStack bundleId:bundleId];   // 【0.6.1】实时贴片对账
 
     if (keyboardStateHostGeneration != generation) {
         keyboardStateHostGeneration = generation;

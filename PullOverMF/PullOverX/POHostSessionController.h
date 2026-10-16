@@ -59,6 +59,10 @@ hostedPresentationContentDidBecomeUnavailableForBundleId:(NSString *)bundleId
 
 - (void)activateBundleId:(NSString *)bundleId;
 
+/// 【0.6.1】把当前活跃会话转成实时贴片（scene 保活 + 进程断言转移）。
+/// 须在释放租约/切换目标**之前**调用；成功后随后的租约释放会保活渲染。失败退快照路径。
+- (BOOL)preserveActiveSessionAsLiveTile;
+
 - (void)beginClosingPreservingActiveLease;
 
 - (void)releaseActiveSessionPreservingPresentation;

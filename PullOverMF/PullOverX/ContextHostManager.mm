@@ -766,6 +766,12 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 @property (nonatomic, assign) BOOL ios26HostedContentAwaitingInvalidation;
 @property (nonatomic, assign) BOOL ios26HostedContentUnavailableNotified;
 @property (nonatomic, assign) CFTimeInterval ios26HostedContentStableSince;
+// 【0.6.1】实时贴片保活槽（同一时刻只保活一片；布防/拆除见 beginLiveTilePreservation）
+@property (nonatomic, strong) FBScene *pinnedLiveScene;
+@property (nonatomic, copy) NSString *pinnedLiveBundleId;
+@property (nonatomic, strong) UIView *pinnedLiveSceneStackRef;   // 保活期间寄存的 sceneStack 视图（贴片挂载用）
+@property (nonatomic, strong) id pinnedLiveProcessAssertion;     // 从主租约转移来的进程断言（防挂起关键）
+@property (nonatomic, assign) int pinnedLivePID;
 - (void)acquireProcessAssertionForBundleId:(NSString *)bundleId;
 - (void)releaseProcessAssertion;
 - (int)pidForBundleId:(NSString *)bundleId;
@@ -1991,15 +1997,95 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
 }
 
+#pragma mark - 【0.6.1】实时贴片（保活一片）
+
+-(BOOL)hasPinnedLiveTile{
+    return self.pinnedLiveScene != nil || self.pinnedLiveProcessAssertion != nil;
+}
+
+-(UIView *)pinnedLiveSceneStack{
+    return self.pinnedLiveSceneStackRef;
+}
+
+/// 布防：把当前活跃会话（必须是自有托管场景）转进保活槽。
+/// 关键动作：进程断言**转移**（不 invalidate）——App 不被挂起、贴片内容持续渲染；
+/// scene 设置保持前台（租约释放路径对保活片跳过 setForeground:NO）。
+-(BOOL)beginLiveTilePreservation{
+    if (!self.isForegroundLeaseActive || !self.hostedScene ||
+        self.hostedBundleId.length == 0 || !self.publishedSceneStack) {
+        return NO;
+    }
+    if (self.hostedScene != self.ownedHostedScene) {
+        MFLog(@"[strip][live] 布防拒绝：%@ 非自有托管场景（系统场景不保活，退快照）",
+              self.hostedBundleId);
+        return NO;
+    }
+    if (self.pinnedLiveScene == self.hostedScene) {
+        // 重入布防（同一片）：换上新断言，旧的补一发释放防泄漏
+        id oldAssertion = self.pinnedLiveProcessAssertion;
+        self.pinnedLiveProcessAssertion = nil;
+        if (oldAssertion && [oldAssertion respondsToSelector:@selector(invalidate)]) {
+            @try {
+                [oldAssertion invalidate];
+            } @catch (__unused NSException *exception) {
+            }
+        }
+    } else if (self.pinnedLiveScene || self.pinnedLiveProcessAssertion) {
+        [self releasePinnedLiveTile];   // 换守：控制层应先做快照降级，这里兜底
+    }
+    self.pinnedLiveScene = self.hostedScene;
+    self.pinnedLiveBundleId = [self.hostedBundleId copy];
+    self.pinnedLiveSceneStackRef = self.publishedSceneStack;
+    if (self.processAssertion) {
+        self.pinnedLiveProcessAssertion = self.processAssertion;
+        self.processAssertion = nil;
+    }
+    self.pinnedLivePID = [self pidForBundleId:self.pinnedLiveBundleId];
+    MFLog(@"[strip][live] 实时贴片布防：%@（pid %d，断言%@）",
+          self.pinnedLiveBundleId, self.pinnedLivePID,
+          self.pinnedLiveProcessAssertion ? @"已转移" : @"无");
+    return YES;
+}
+
+/// 拆除保活（App 转后台但不杀进程不毁场景；断言释放）。
+-(void)releasePinnedLiveTile{
+    if (!self.hasPinnedLiveTile) {
+        return;
+    }
+    FBScene *scene = self.pinnedLiveScene;
+    NSString *bundleId = [self.pinnedLiveBundleId copy];
+    id assertion = self.pinnedLiveProcessAssertion;
+    self.pinnedLiveScene = nil;
+    self.pinnedLiveBundleId = nil;
+    self.pinnedLiveSceneStackRef = nil;
+    self.pinnedLiveProcessAssertion = nil;
+    self.pinnedLivePID = 0;
+    if (scene) {
+        @try {
+            [self setForeground:NO forScene:scene];
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    if (assertion && [assertion respondsToSelector:@selector(invalidate)]) {
+        @try {
+            [assertion invalidate];
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    MFLog(@"[strip][live] 实时贴片拆除：%@（断言%@）",
+          bundleId ?: @"-", assertion ? @"已释放" : @"无");
+}
+
 - (void)releaseForegroundLeaseForceBackgroundFormerHost:(BOOL)forceBackgroundFormerHost
                                       discardOwnedScene:(BOOL)discardOwnedScene{
     FBScene *scene = self.hostedScene;
     NSString *hostedId = [self.hostedBundleId copy];
+    BOOL livePin = scene != nil && scene == self.pinnedLiveScene;   // 【0.6.1】保活贴片：释放租约但保活渲染
     self.ios26HostedContentRecoveryPending = NO;
     self.ios26HostedContentRecoveryToken += 1;
     self.ios26HostedContentAwaitingInvalidation = NO;
     self.ios26HostedContentUnavailableNotified = NO;
-    if (forceBackgroundFormerHost || discardOwnedScene) {
+    if ((forceBackgroundFormerHost || discardOwnedScene) && !livePin) {
         [self invalidateIOS26PresentationContainersInSceneStack:self.publishedSceneStack];
     }
     if ([self.pendingRemnantReconnectBundleId isEqualToString:hostedId]) {
@@ -2049,7 +2135,8 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     NSString *frontId = [POApplicationHelper frontMostBundleId];
     BOOL hostedIsFrontmost = hostedId.length > 0 && frontId.length > 0 &&
         ([hostedId isEqualToString:frontId] || [frontId isEqualToString:hostedId]);
-    if (scene && (ownsScene || forceBackgroundFormerHost || !hostedIsFrontmost)) {
+    // 【0.6.1】保活贴片跳过 setForeground:NO——App 继续以为自己在前台，贴片内容才持续渲染
+    if (!livePin && scene && (ownsScene || forceBackgroundFormerHost || !hostedIsFrontmost)) {
         [self setForeground:NO forScene:scene];
     }
     if (ownsScene && discardOwnedScene) {
