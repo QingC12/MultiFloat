@@ -404,9 +404,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL mfPinAppSkipOpenDelay;            // 【0.6.12】贴片还原免 0.3s 开门延迟（快照静止期减半）
     CGRect mfRingOpenOriginRect;           // 【0.6.13】圆盘打开"图标展开"动画起点（选中图标的屏幕矩形）
     UIView *mfSwapTransitionCover;         // 【0.6.13】多贴片互换主窗的过渡盖片（旧画面截图，新场景发布后淡出）
-    UIImageView *mfStripMorphOverlay;      // 【0.6.14】飞行中的贴片快照 overlay（场景发布时与实时画面交叉淡化）
-    NSString *mfStripMorphOverlayBundleId; // 【0.6.14】overlay 对应的 App（场景发布校验用，防串台）
+    UIImageView *mfStripMorphOverlay;      // 【0.6.15】飞行中的贴片快照 overlay（场景发布时与实时画面交叉淡化）
+    NSString *mfStripMorphOverlayBundleId; // 【0.6.15】overlay 对应的 App（场景发布校验用，防串台）
     BOOL mfCardAppearPopActive;            // 【0.6.12】打开 Q 弹窗口（弹簧持有 transform，重估让路）
+    // 【0.6.15 用户 log55-②】键盘会话几何快照：弹出前捕获，收起时**精确还原到打开键盘前的位置**
+    //   （用户实测"开键盘自动移动、关键盘弹回默认位置"——不管 mover 是谁，净效果一律兜住；
+    //     快照/还原都打日志，若中间真有移卡行为，两行几何日志能揪出 mover）
+    CGRect mfPreKeyboardBaseFrame;         // 键盘弹出前的 keyboardZoomBaseFrame
+    BOOL mfPreKeyboardPinned;              // 键盘弹出前的 mfUserCardPositionPinned
+    CGFloat mfPreKeyboardScaleOverride;    // 键盘弹出前的用户缩放档位
+    BOOL mfPreKeyboardScaleLatched;        // 键盘弹出前的档位 latch
+    BOOL mfPreKeyboardCaptured;            // 本次键盘会话已捕获（一次会话只捕一次）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -1034,12 +1042,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.14 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.15 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.14 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.15 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3213,7 +3221,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.14 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.15 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3741,7 +3749,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     } completion:^(__unused BOOL finished) {
         self->mfCardAppearPopActive = NO;   // 弹簧窗口关闭，后续缩放重估恢复正常
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.14 淡入 0.5s %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.15 淡入 0.5s %@，阴影浮起 %.2f）",
           stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                              : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入"),
           CONTENT_SHADOW_OPACITY * progress);
@@ -4204,7 +4212,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.14 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.15 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4802,16 +4810,19 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             self->mfStripMorphWindow = nil;
             self->mfStripMorphSnapshot = nil;
             if (self->mfStripMorphOverlay != nil) {
-                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.14】残留飞行快照一并收掉
+                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】残留飞行快照一并收掉
                 self->mfStripMorphOverlay = nil;
                 self->mfStripMorphOverlayBundleId = nil;
             }
             [self mfDockStripDropWindow:stale animated:NO];
         }
-        BOOL scaleNeutral = fabs(w.savedScale - 1.0) <= PO_CARD_SCALE_EPSILON;   // 有缩放档位时后续重估会改 frame，变形不做
-        UIImage *morphImage = scaleNeutral ? [self mfCaptureViewSnapshot:w.tileView] : nil;
+        // 【0.6.15 用户 log55-③】不再按 savedScale 挑剔：0.6.11 的 scaleNeutral 门槛在
+        //   缩放档位被布局抖动带成 1.01 时（本机 epsilon=0.001）整条变形路被跳过 → 贴片
+        //   直接消失走普通淡入 + 快照静止期，用户看到的正是这条退化路。0.6.14 起变形有
+        //   场景发布触发交叉淡化 + 落位兜底强收，任何档位都安全 ⇒ 快照恒抓，变形恒布防。
+        UIImage *morphImage = [self mfCaptureViewSnapshot:w.tileView];
         if (morphImage == nil) {
-            morphImage = scaleNeutral ? w.snapshotImage : nil;
+            morphImage = w.snapshotImage;
         }
         UIWindow *tileWindow = w.tileView.window;
         if (morphImage != nil && tileWindow != nil) {
@@ -4868,7 +4879,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             self->mfStripMorphWindow = nil;
             self->mfStripMorphSnapshot = nil;
             if (self->mfStripMorphOverlay != nil) {
-                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.14】飞行快照一并收掉
+                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】飞行快照一并收掉
                 self->mfStripMorphOverlay = nil;
                 self->mfStripMorphOverlayBundleId = nil;
             }
@@ -4888,7 +4899,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 self->mfStripMorphWindow = nil;
                 self->mfStripMorphSnapshot = nil;
                 if (self->mfStripMorphOverlay != nil) {
-                    [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.14】飞行快照一并收掉
+                    [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】飞行快照一并收掉
                     self->mfStripMorphOverlay = nil;
                     self->mfStripMorphOverlayBundleId = nil;
                 }
@@ -5514,11 +5525,49 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     if (keyboardNotificationState != POKeyboardNotificationStateVisible) {
         keyboardZoomSuppressedForCurrentSession = NO;
+        // 【0.6.15】键盘会话开始：捕获当前几何（本会话内不管谁动了卡片，收起时都按这份还原）
+        if (!mfPreKeyboardCaptured) {
+            mfPreKeyboardCaptured = YES;
+            mfPreKeyboardBaseFrame = keyboardZoomBaseFrame;
+            mfPreKeyboardPinned = mfUserCardPositionPinned;
+            mfPreKeyboardScaleOverride = mfUserCardScaleOverride;
+            mfPreKeyboardScaleLatched = mfManualCardScaleLatched;
+            MFLog(@"[card][kbd] 键盘会话开始：捕获几何 base(%.0f,%.0f,%.0fx%.0f) pinned=%d 档位=%.2f",
+                  mfPreKeyboardBaseFrame.origin.x, mfPreKeyboardBaseFrame.origin.y,
+                  mfPreKeyboardBaseFrame.size.width, mfPreKeyboardBaseFrame.size.height,
+                  mfPreKeyboardPinned ? 1 : 0, mfPreKeyboardScaleOverride);
+        }
     }
     keyboardNotificationState = POKeyboardNotificationStateVisible;
     keyboardHideAnimationInFlight = NO;
     [self avoidClosedHandleForKeyboardWillShow:notification];
     [self reevaluateCardScaleAnimated:YES source:POCardScaleTransitionSourceKeyboard];
+}
+
+// 【0.6.15 用户 log55-②】键盘收起：按弹出前快照精确还原（位置/档位/pinned 一起回）
+//   修复"关键盘弹回默认位置"。放在 reevaluate 之后执行，保证覆盖它写的任何状态。
+-(void)mfRestorePreKeyboardGeometry{
+    if (!mfPreKeyboardCaptured) {
+        return;
+    }
+    mfPreKeyboardCaptured = NO;
+    BOOL moved = !CGRectEqualToRect(keyboardZoomBaseFrame, mfPreKeyboardBaseFrame) ||
+        mfUserCardPositionPinned != mfPreKeyboardPinned ||
+        fabs(mfUserCardScaleOverride - mfPreKeyboardScaleOverride) > PO_CARD_SCALE_EPSILON;
+    keyboardZoomBaseFrame = mfPreKeyboardBaseFrame;
+    mfUserCardPositionPinned = mfPreKeyboardPinned;
+    mfUserCardScaleOverride = mfPreKeyboardScaleOverride;
+    mfManualCardScaleLatched = mfPreKeyboardScaleLatched;
+    if (moved) {
+        [self applyLayoutPreservingHandlePosition:YES];
+        MFLog(@"[card][kbd] 键盘会话结束：几何被中途改动过 → 按弹出前快照还原 base(%.0f,%.0f,%.0fx%.0f) pinned=%d 档位=%.2f",
+              mfPreKeyboardBaseFrame.origin.x, mfPreKeyboardBaseFrame.origin.y,
+              mfPreKeyboardBaseFrame.size.width, mfPreKeyboardBaseFrame.size.height,
+              mfPreKeyboardPinned ? 1 : 0, mfPreKeyboardScaleOverride);
+    } else {
+        [self applyLayoutPreservingHandlePosition:YES];
+        MFLog(@"[card][kbd] 键盘会话结束：几何未被动过（无感还原）");
+    }
 }
 
 -(void)keyboardWillChangeFrame:(NSNotification *)notification{
@@ -5543,6 +5592,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     keyboardNotificationState = POKeyboardNotificationStateHidden;
     keyboardHideAnimationInFlight = YES;
     [self reevaluateCardScaleAnimated:YES source:POCardScaleTransitionSourceKeyboard];
+    // 【0.6.15】键盘收起 → 精确还原弹出前几何（修"关键盘弹回默认位置"）
+    [self mfRestorePreKeyboardGeometry];
     if ([[POApplicationHelper settings][@"keyboardAvoiding"] boolValue] && origOffset) {
         [handleScrollView setContentOffset:CGPointMake(0, [self clampedHandleOffset:origOffset.floatValue]) animated:YES];
         origOffset = nil;
@@ -5811,6 +5862,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [staleCover removeFromSuperview];
     }
     [self addKeyboardZoomSuspension:POKeyboardZoomSuspensionClosing];
+    mfPreKeyboardCaptured = NO;   // 【0.6.15】面板关闭作废键盘会话快照（防陈旧还原）
     [self dismissPresentedQuickSwitchMenuImmediately];
     if ([self canUseDirectScaledProgrammaticCloseAnimation]) {
         [self performDirectScaledProgrammaticCloseAnimation];
@@ -7198,7 +7250,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     showingCantHost = NO;
     [self.contentView bringSubviewToFront:contextView];
     [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
-    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.14】贴片变形：实时画面就绪 → 快照交叉淡出
+    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.15】贴片变形：实时画面就绪 → 快照交叉淡出
 
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 &&
         runtimeCategoryTransitionSnapshotActive && presentationSnapshotView &&
@@ -7272,7 +7324,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     [self reevaluateKeyboardZoomAnimated:YES];
     [self completeExternallyActivatedApplicationIfNeeded:bundleId];
     [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
-    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.14】贴片变形：实时画面就绪 → 快照交叉淡出
+    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.15】贴片变形：实时画面就绪 → 快照交叉淡出
 }
 
 -(void)hostSessionController:(POHostSessionController *)controller

@@ -740,7 +740,7 @@ static id MFSystemActionSingletonInstance(NSString *className, NSString *label) 
     return nil;
 }
 
-#pragma mark - 【0.6.14】录屏状态（圆盘红点徽章 / 提示条用）
+#pragma mark - 【0.6.15】录屏状态（圆盘红点徽章 / 提示条用）
 
 static BOOL gMFSystemActionRecordActive = NO;      // 我方视角的录屏开关状态（系统 isRecording 优先）
 static void (^gMFRecordStateObserver)(BOOL active); // 圆盘注册的观察者（toast + 徽章刷新）
@@ -774,29 +774,62 @@ static void MFSystemActionRecordApplyState(BOOL active, NSString *reason) {
 /// 录屏 API 宿主类 = 拥有 `startSystemRecordingWithMicrophoneEnabled:handler:` 的类。
 /// 【0.6.14 实证】TrollOpen（同类多浮窗插件）dylib 里就调这几个 selector：
 ///   startSystemRecordingWithMicrophoneEnabled:handler: / stopSystemRecording: / isRecording
-/// —— iOS 17 的录屏宿主类**名字里没有 recording**（log54 扫描证据：9 个名字带
-/// ScreenRecording 的类全都不是宿主），所以按 selector 指纹全类扫描才是正路。扫一次缓存。
+/// 【0.6.15 用户 log55 实证】0.6.14 取"第一个响应的类"命中 UIKeyboardCandidateViewStyle
+///   ——一个键盘候选栏样式类，居然三件套全响应 ⇒ 高度怀疑某注入 dylib 在 NSObject
+///   （或公共基类）上加了分类，全类皆响应、首个中签。本版：
+///     1) 全候选列出来（类名 + IMP），最多 12 个；
+///     2) NSObject 响应检测（分类实锤）+ IMP 同源性对比；
+///     3) 只选 IMP **不等于** 幻影 IMP 的类（自有实现），并优先非 UI* 前缀。
 static Class MFSystemActionRecordOwnerClass(void) {
     if (gMFRecordOwnerClass != Nil) {
         return gMFRecordOwnerClass;
     }
     @try {
         SEL startSelector = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
+        SEL stopSelector = @selector(stopSystemRecording:);
+        SEL isRecSelector = @selector(isRecording);
         unsigned int classCount = 0;
         Class *classes = objc_copyClassList(&classCount);
-        Class owner = Nil;
+        Method nsMethod = class_getInstanceMethod([NSObject class], startSelector);
+        IMP nsIMP = nsMethod ? method_getImplementation(nsMethod) : NULL;
+        if (nsMethod != NULL) {
+            MFLog(@"[sysact] 录屏：!! NSObject 自身响应 start selector（IMP %p）——有注入分类挂在公共基类上，全类皆\"响应\"，首个中签全是幻影", nsIMP);
+        }
+        Class picked = Nil;
+        int responderCount = 0;
         for (unsigned int i = 0; i < classCount; i++) {
-            if (class_getInstanceMethod(classes[i], startSelector) != NULL) {
-                owner = classes[i];
-                MFLog(@"[sysact] 录屏：selector 指纹命中宿主类 %@", NSStringFromClass(classes[i]));
-                break;
+            Method m = class_getInstanceMethod(classes[i], startSelector);
+            if (m == NULL) {
+                continue;
+            }
+            responderCount++;
+            if (responderCount <= 12) {
+                MFLog(@"[sysact] 录屏：候选[%d] %@ IMP=%p%s", responderCount,
+                      NSStringFromClass(classes[i]), method_getImplementation(m),
+                      (nsIMP != NULL && method_getImplementation(m) == nsIMP) ? @"（=NSObject 分类幻影）" : @"");
+            }
+            if (picked != Nil) {
+                continue;   // 继续列清单，不提前停
+            }
+            // 排除幻影：自有 IMP；三件套齐全优先；非 UI* 前缀优先（键盘/UIKit 类大概率无关）
+            if (nsIMP != NULL && method_getImplementation(m) == nsIMP) {
+                continue;
+            }
+            NSString *name = NSStringFromClass(classes[i]);
+            BOOL hasStop = class_getInstanceMethod(classes[i], stopSelector) != NULL;
+            BOOL hasIsRec = class_getInstanceMethod(classes[i], isRecSelector) != NULL;
+            BOOL uiPrefix = [name hasPrefix:@"UI"] || [name hasPrefix:@"_UI"];
+            if (hasStop && hasIsRec && !uiPrefix) {
+                picked = classes[i];
             }
         }
         if (classes != NULL) {
             free(classes);
         }
-        gMFRecordOwnerClass = owner;
-        return owner;
+        MFLog(@"[sysact] 录屏：指纹扫描完成，响应类 %d 个，自有实现候选 %@",
+              responderCount, picked != Nil ? NSStringFromClass(picked) : @"无");
+        gMFRecordOwnerClass = picked;
+        return picked;
     } @catch (NSException *exception) {
         MFLog(@"[sysact] !! 录屏宿主类扫描异常：%@", exception);
         return Nil;
@@ -857,17 +890,72 @@ void MFSystemActionRecordSyncState(void) {
     }
 }
 
-/// no-op handler 块（start/stop 的 handler 参数；被调方传什么都吞掉，防签名差异崩）
-static void MFSystemActionRecordNoopHandler(__unused id result) {
+/// start/stop 的 handler 参数：被调方传什么都收，但**把内容打进日志**——
+///   完成/错误信息（如权限拒绝、广播配置失败）都会从这里露出来（0.6.15 诊断网）
+static void MFSystemActionRecordNoopHandler(id result) {
+    if (result == nil) {
+        MFLog(@"[sysact] 录屏：handler 回调（无附加信息）");
+        return;
+    }
+    @try {
+        NSString *desc = [result description];
+        if (desc.length > 300) {
+            desc = [desc substringToIndex:300];
+        }
+        MFLog(@"[sysact] 录屏：handler 回调：%@", desc);
+    } @catch (__unused NSException *exception) {
+        MFLog(@"[sysact] 录屏：handler 回调（不可描述的结果）");
+    }
+}
+
+/// 【0.6.15 诊断网】把最有嫌疑的 Siri 动作/触发类的方法表整表 dump（每类一次）：
+///   SADeviceControlStartScreenRecording / SADeviceControlStopScreenRecording /
+///   ATXScreenRecordingTrigger / ARScreenRecording / BMScreenRecording
+/// —— log54 扫描发现的 9 个 ScreenRecording 类里这 5 个最有戏，方法名+类型编码
+///   齐了下一轮就能精确直调，不再盲猜。
+static void MFSystemActionDumpRecordCandidateMethods(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSArray<NSString *> *interesting = @[
+            @"SADeviceControlStartScreenRecording",
+            @"SADeviceControlStopScreenRecording",
+            @"ATXScreenRecordingTrigger",
+            @"ARScreenRecording",
+            @"BMScreenRecording",
+        ];
+        for (NSString *className in interesting) {
+            Class cls = NSClassFromString(className);
+            if (cls == Nil) {
+                MFLog(@"[sysact] 录屏诊断：类 %@ 不存在", className);
+                continue;
+            }
+            for (int meta = 0; meta < 2; meta++) {
+                Class target = meta ? object_getClass(cls) : cls;
+                unsigned int count = 0;
+                Method *list = class_copyMethodList(target, &count);
+                MFLog(@"[sysact] 录屏诊断：%@ %s方法 %u 个", className, meta ? "类" : "实例", count);
+                for (unsigned int i = 0; i < count && i < 40; i++) {
+                    SEL sel = method_getName(list[i]);
+                    const char *types = method_getTypeEncoding(list[i]);
+                    MFLog(@"[sysact]   · %@ (%s)", NSStringFromSelector(sel), types ? types : "?");
+                }
+                if (list != NULL) {
+                    free(list);
+                }
+            }
+        }
+    });
 }
 
 /// 录屏开关主路（0.6.14）：TrollOpen 实证 selector 直调，类型精确安全：
 ///   startSystemRecordingWithMicrophoneEnabled:(BOOL)handler:(id)
 ///   stopSystemRecording:(id)
 static BOOL MFSystemActionToggleScreenRecordingModern(void) {
+    // 【0.6.15 诊断网】候选类方法表整表 dump（每类一次，进程生命周期内只打一轮）
+    MFSystemActionDumpRecordCandidateMethods();
     Class owner = MFSystemActionRecordOwnerClass();
     if (owner == Nil) {
-        MFLog(@"[sysact] 录屏：selector 指纹未命中宿主类（走旧候选路）");
+        MFLog(@"[sysact] 录屏：指纹扫描无自有实现候选（走旧候选路）");
         return NO;
     }
     id instance = MFSystemActionRecordOwnerInstance(owner);
