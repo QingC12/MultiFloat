@@ -1107,9 +1107,9 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
 - (UIInterfaceOrientation)presentationInterfaceOrientation {
     return [self.primarySession presentationInterfaceOrientation];
 }
-- (void)setPresentationInterfaceOrientation:(UIInterfaceOrientation)value {
-    [self.primarySession setPresentationInterfaceOrientation:value];
-}
+// 注意：presentationInterfaceOrientation 的 setter 在本文件上方**已手写**（含 iOS 26 呈现重排逻辑），
+// 此处只补 getter。★ 不要再生成转发 setter —— 会与手写实现重复（同一 @implementation 内重复实现
+// 同一 selector 属隐患：真实实现可能被遮蔽，从而跳过 iOS 26 重排分支）。
 
 // ---- 重连与 iOS26 恢复组 ----
 - (NSString *)pendingRemnantReconnectBundleId {
