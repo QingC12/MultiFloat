@@ -2007,19 +2007,19 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     return self.pinnedLiveSceneStackRef;
 }
 
-/// 布防：把当前活跃会话（必须是自有托管场景）转进保活槽。
-/// 关键动作：进程断言**转移**（不 invalidate）——App 不被挂起、贴片内容持续渲染；
-/// scene 设置保持前台（租约释放路径对保活片跳过 setForeground:NO）。
+/// 布防：把当前活跃会话转进保活槽。
+/// 【0.6.2】不再要求"自有场景"——本机（iOS 17）浮窗内 App 全部走"接管系统现成场景"路径
+/// （probeSceneForBundleId → activateScene，ownedHostedScene 恒空），0.6.1 的自有检查导致
+/// 保活从未生效。接管场景同样保活：进程断言转移（不 invalidate，App 不被挂起）+
+/// 租约释放路径跳过 setForeground:NO（App 继续以为自己在前台，贴片持续渲染）。
+/// 已知边界：保活的是系统 canonical 场景，用户按 Home 回桌面时系统会正常把它转后台
+/// → 贴片定格为最后一帧（快照兜底显示），属预期行为不视为故障。
 -(BOOL)beginLiveTilePreservation{
     if (!self.isForegroundLeaseActive || !self.hostedScene ||
         self.hostedBundleId.length == 0 || !self.publishedSceneStack) {
         return NO;
     }
-    if (self.hostedScene != self.ownedHostedScene) {
-        MFLog(@"[strip][live] 布防拒绝：%@ 非自有托管场景（系统场景不保活，退快照）",
-              self.hostedBundleId);
-        return NO;
-    }
+    BOOL ownsHostedScene = self.hostedScene == self.ownedHostedScene;
     if (self.pinnedLiveScene == self.hostedScene) {
         // 重入布防（同一片）：换上新断言，旧的补一发释放防泄漏
         id oldAssertion = self.pinnedLiveProcessAssertion;
@@ -2041,9 +2041,10 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         self.processAssertion = nil;
     }
     self.pinnedLivePID = [self pidForBundleId:self.pinnedLiveBundleId];
-    MFLog(@"[strip][live] 实时贴片布防：%@（pid %d，断言%@）",
+    MFLog(@"[strip][live] 实时贴片布防：%@（pid %d 断言%@ 场景=%@）",
           self.pinnedLiveBundleId, self.pinnedLivePID,
-          self.pinnedLiveProcessAssertion ? @"已转移" : @"无");
+          self.pinnedLiveProcessAssertion ? @"已转移" : @"无",
+          ownsHostedScene ? @"自有" : @"接管");
     return YES;
 }
 
@@ -2123,7 +2124,8 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     self.pendingRuntimeOrientationNotification = UIInterfaceOrientationUnknown;
     self.pendingRuntimeOrientationNotificationGeneration = 0;
     self.forceNextPublishedSceneStackRebuild = NO;
-    BOOL shouldRestoreSystemSnapshot = !ownsScene &&
+    // 【0.6.2】保活贴片不做系统快照恢复——恢复会把接管前 settings 写回，可能动保活片前台契约
+    BOOL shouldRestoreSystemSnapshot = !livePin && !ownsScene &&
         (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion == 15 ||
          forceBackgroundFormerHost || discardOwnedScene);
     BOOL restoredSystemSnapshot = shouldRestoreSystemSnapshot &&
