@@ -644,12 +644,13 @@ static BOOL MFSystemActionInvokeAdaptive(id target, SEL selector, NSString *labe
             ((void (*)(id, SEL))objc_msgSend)(target, selector);
         } else if (registers == 3) {
             uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
-            ((void (*)(id, SEL, id))objc_msgSend)(target, selector, (id)scalar0);
+            // 【0.6.13】按 long 传参（寄存器值等价），绕开 ARC 的 uintptr_t→id 禁转
+            ((void (*)(id, SEL, long))objc_msgSend)(target, selector, (long)scalar0);
         } else {
             uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
             uintptr_t scalar1 = (type1 == 'c' || type1 == 'B') ? (flagValue ? 1 : 0) : 0;
-            ((void (*)(id, SEL, id, id))objc_msgSend)(target, selector,
-                                                      (id)scalar0, (id)scalar1);
+            ((void (*)(id, SEL, long, long))objc_msgSend)(target, selector,
+                                                          (long)scalar0, (long)scalar1);
         }
         MFLog(@"[sysact] %@：命中（参数 %lu 个，类型 %c/%c）", label,
               (unsigned long)(registers - 2),
