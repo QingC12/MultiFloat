@@ -2,6 +2,23 @@
 //  MFRingPicker.m
 //  PullOverMF —— Stheno 风格「圆盘」呼出选择器（本 fork 新增）
 //
+//  ============================ 0.6.9 核心改动（与"左滑返回"类插件冲突修复）============================
+//  用户反馈：装了左滑返回（leftPan，注入所有 UIKit 进程、hook
+//  _UINavigationInteractiveTransition 的手势仲裁方法并给导航容器挂全屏 pan）后，
+//  有时在全屏 App 里呼不出圆盘。取证（analysis 过程）：
+//    · leftPan 把"自己的全屏 pan 抬成最高仲裁优先级"（hook 了
+//      gestureRecognizer:shouldBeRequiredToFailByGestureRecognizer: 等光束仲裁方法），
+//      贴边单指触摸一旦漏到 App 进程就被它吃掉 → 返回上一页而不是呼出圆盘；
+//    · 我们注入不到 App 进程（只注 SpringBoard），单指贴边这条路上没有仲裁权可抢。
+//  修法（triggr 1.5 同款思路：双指边缘滑入，App 端单指手势从规则上抢不走）：
+//  ① **双指贴边呼出**：新增 min=max=2 的边缘识别器（type=基号+1，仍在既有放行 hook
+//     范围内，**零新增 hook**）。双指起步时所有单指识别器强制 Failed —— leftPan 的
+//     全屏 pan、系统返回手势都是单指起步，双指呼出必中。
+//  ② **单指让位规则**（MFRingEdgeRecognizer.touchesBegan 覆写）：圆盘未展开时手指超编
+//     主动 Failed（单指版被双指压住让位）；展开跟手阶段多指搭手不打断（0.2.11 教训）。
+//  ③ **起手区加深**：单指 20 → 28pt、双指 40pt —— App 自己的返回手势只认屏缘约 20pt，
+//     加深不侵占它；带内贴边起手更容易被我们收到。开关：mfRingTwoFingerSummon（默认开）。
+//
 //  ============================ 0.4.12 核心改动（用户 log38）============================
 //  用户原话："关于添加arc功能，按照方案A推进，可以只添加截屏和翻译"（另有一条 bug：
 //  "我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小" ——
@@ -4016,6 +4033,33 @@ void MFRingSummonFromSystemGestureAtPoint(CGPoint point) {
 // 自定义手势 type 号：取一个离系统自己 type 数字很远的值（triggr 同款）
 static const unsigned long long MFRingEdgeGestureType = 0x7467000ULL;
 
+// 【0.6.9】双指贴边呼出的识别器（triggr 1.5 同款思路）：
+//   单指贴边呼出会被 App 内的返回手势（系统交互返回 / 左滑返回类插件 hook 过仲裁的
+//   全屏 pan）抢走触摸 —— 双指起步时所有单指识别器按 UIKit 规则强制 Failed，
+//   而双指版 min=max=2 谁也抢不走。双指版 type = 基号+1，
+//   仍在 MFRingIsEdgeGestureType() 的放行范围内（零新增 hook）。
+@interface MFRingEdgeRecognizer : UIScreenEdgePanGestureRecognizer
+@property (nonatomic, assign) NSUInteger mfFingers;   // 期望手指数（1=单指 / 2=双指）
+@end
+
+@implementation MFRingEdgeRecognizer
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesBegan:touches withEvent:event];
+    if (self.mfFingers == 0) {
+        self.mfFingers = 1;
+    }
+    // 手指超编（单指版来了第三根 / 双指版来了第三根）→ 圆盘未展开时主动让位：
+    //   单指版被双指压住就 Failed，把触摸让给双指版；展开（跟手选中）阶段多指搭手
+    //   不打断 —— 跟手触摸流绝不能中途饿死（0.2.11 教训）。
+    if (event.allTouches.count > self.mfFingers) {
+        if (![MFRingPicker shared].expanded) {
+            self.state = UIGestureRecognizerStateFailed;
+        }
+        return;
+    }
+}
+@end
+
 // 自定义 type 的放行判定（PullOverX.mm 的 hook 会引用这个范围）
 BOOL MFRingIsEdgeGestureType(unsigned long long type) {
     return type >= MFRingEdgeGestureType && type < MFRingEdgeGestureType + 4ULL;
@@ -4153,8 +4197,9 @@ void MFRingInstallEdgePanGesture(void) {
         dispatch_async(dispatch_get_main_queue(), ^{ MFRingInstallEdgePanGesture(); });
         return;
     }
-    static BOOL installed = NO;
-    if (installed) {
+    static BOOL installedSingle = NO;
+    static BOOL installedDouble = NO;
+    if (installedSingle && installedDouble) {
         return;
     }
     @try {
@@ -4200,30 +4245,57 @@ void MFRingInstallEdgePanGesture(void) {
         if (edgeTarget == nil) {
             edgeTarget = [[MFRingEdgePanTarget alloc] init];
         }
-        UIScreenEdgePanGestureRecognizer *recognizer =
-            [[UIScreenEdgePanGestureRecognizer alloc] initWithTarget:edgeTarget
-                                                              action:@selector(mfEdgeSlid:)
-                                                                type:(long long)2
-                                                             options:(unsigned long long)0];
-        recognizer.edges = edge;
-        recognizer.minimumNumberOfTouches = 1;
-        recognizer.maximumNumberOfTouches = 1;
-        // 【0.2.11】cancelsTouchesInView 必须为 YES（UIGestureRecognizer 默认值）：
-        //   0.2.8 设 NO 的代价（log16 实证）= 系统把触摸同时喂给前台 App —— 用户拖着
-        //   圆盘、App 页面跟着滚，我们的识别器事件流被饿死 ⇒ 全屏悬停稀疏、松手无选中。
-        //   YES = 识别器 Began 即独占触摸：App 不滚、事件流完整（triggr 默认同款）。
-        //   delaysTouchesBegan 保持 NO：桌面长按编辑器入口靠静止按下（Possible 不拦截）。
-        recognizer.cancelsTouchesInView = YES;
-        recognizer.delaysTouchesBegan = NO;
-        recognizer.delaysTouchesEnded = NO;
-        if ([recognizer respondsToSelector:@selector(_setEdgeRegionSize:)]) {
-            [recognizer _setEdgeRegionSize:20.0];   // 起手区贴边 20pt（triggr 同款）
+        // 【0.6.9】起手区 20 → 28/40：App 自己的返回手势只认屏缘约 20pt，加深起手区
+        //   不侵占它；带内贴边起手更容易被我们收到（对 leftPan/左滑返回类插件是增益）。
+        if (!installedSingle) {
+            MFRingEdgeRecognizer *recognizer =
+                [[MFRingEdgeRecognizer alloc] initWithTarget:edgeTarget
+                                                      action:@selector(mfEdgeSlid:)
+                                                        type:(long long)2
+                                                     options:(unsigned long long)0];
+            recognizer.edges = edge;
+            recognizer.mfFingers = 1;
+            recognizer.minimumNumberOfTouches = 1;
+            recognizer.maximumNumberOfTouches = 1;
+            if ([recognizer respondsToSelector:@selector(_setEdgeRegionSize:)]) {
+                [recognizer _setEdgeRegionSize:28.0];   // 单指起手区贴边 28pt（0.2.x 为 20）
+            }
+            // 【0.2.11】cancelsTouchesInView 必须为 YES（UIGestureRecognizer 默认值）：
+            //   0.2.8 设 NO 的代价（log16 实证）= 系统把触摸同时喂给前台 App —— 用户拖着
+            //   圆盘、App 页面跟着滚，我们的识别器事件流被饿死 ⇒ 全屏悬停稀疏、松手无选中。
+            //   YES = 识别器 Began 即独占触摸：App 不滚、事件流完整（triggr 默认同款）。
+            //   delaysTouchesBegan 保持 NO：桌面长按编辑器入口靠静止按下（Possible 不拦截）。
+            recognizer.cancelsTouchesInView = YES;
+            recognizer.delaysTouchesBegan = NO;
+            recognizer.delaysTouchesEnded = NO;
+            ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
+                                                                      recognizer, MFRingEdgeGestureType);
+            installedSingle = YES;
         }
-        ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
-                                                                  recognizer, MFRingEdgeGestureType);
-        installed = YES;
-        MFLog(@"[ring] 0.3.19 边缘手势已注册：SBSystemGestureManager edge=%@ type=%llu（全屏 App 内贴边滑出呼出）",
-              edgeName, (unsigned long long)MFRingEdgeGestureType);
+        // 【0.6.9】双指贴边呼出：单指被 App 内返回手势（含左滑返回类插件）抢走时的
+        //   确定性兜底 —— 双指起步时单指识别器全部 Failed，双指版无可争议。
+        if (!installedDouble && MFRingBool(@"mfRingTwoFingerSummon", YES)) {
+            MFRingEdgeRecognizer *recognizer =
+                [[MFRingEdgeRecognizer alloc] initWithTarget:edgeTarget
+                                                      action:@selector(mfEdgeSlid:)
+                                                        type:(long long)2
+                                                     options:(unsigned long long)0];
+            recognizer.edges = edge;
+            recognizer.mfFingers = 2;
+            recognizer.minimumNumberOfTouches = 2;
+            recognizer.maximumNumberOfTouches = 2;
+            if ([recognizer respondsToSelector:@selector(_setEdgeRegionSize:)]) {
+                [recognizer _setEdgeRegionSize:40.0];   // 双指是明确意图，起手区更宽
+            }
+            recognizer.cancelsTouchesInView = YES;
+            recognizer.delaysTouchesBegan = NO;
+            recognizer.delaysTouchesEnded = NO;
+            ((void (*)(id, SEL, id, unsigned long long))objc_msgSend)(manager, addSelector,
+                                                                      recognizer, MFRingEdgeGestureType + 1ULL);
+            installedDouble = YES;
+        }
+        MFLog(@"[ring] 0.6.9 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+              installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
     }
