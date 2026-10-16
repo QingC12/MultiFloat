@@ -461,9 +461,9 @@
 #define MF_RING_EDITOR_DONE      991015   // 「完成」按钮
 #define MF_RING_EDITOR_MAX_APPS  200      // 编辑器最多列出多少个 App（防爆）
 // 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
+// 【0.6.8 用户 log51 后】编辑器重做（简约/快捷/效率）：设置区折叠进「触发条」按钮；
+//   排序条改长按拖拽（◀ ▶ 逐格点击已删）。
 #define MF_RING_EDITOR_ORDER_INDEX   991016   // 排序条格子左上角序号
-#define MF_RING_EDITOR_ORDER_BACK    991017   // 排序条格子「◀ 前移」
-#define MF_RING_EDITOR_ORDER_FORWARD 991018   // 排序条格子「▶ 后移」
 #define MF_RING_ORDER_CELL_W 76.0             // 排序条格子宽
 #define MF_RING_ORDER_CELL_H 102.0            // 排序条格子高
 #define MF_RING_ORDER_CELL_GAP 6.0            // 格子间距
@@ -1271,6 +1271,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIScrollView *editorOrderScroll;     // 排序条滚动容器
 @property (nonatomic, strong) NSMutableArray<UIView *> *editorOrderCells;  // 排序条格子
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *editorAppNames;  // bundleID→显示名（枚举时一次性取好）
+// 【0.6.8 用户指令】编辑器重做：设置折叠 + 拖拽排序
+@property (nonatomic, strong) UIView *triggerSettingsBox;          // 触发条设置折叠容器（默认收起）
+@property (nonatomic, assign) BOOL editorSettingsExpanded;         // 设置区当前展开？
+@property (nonatomic, strong) UIButton *editorSettingsToggle;      // 「触发条 ▸/▾」切换按钮
+@property (nonatomic, assign) CGFloat editorContentBaseTop;        // 折叠态内容起始 Y（设置区下方基线）
+@property (nonatomic, strong) UIView *editorOrderDraggingCell;     // 拖拽中的排序格子（layout 跳过它）
+@property (nonatomic, assign) NSUInteger editorOrderDragIndex;     // 拖拽中格子的当前 index
+@property (nonatomic, assign) CGFloat editorOrderDragGrabOffset;   // 按下点相对格子中心的偏移
 // 【0.3.22】触发条自调（用户 log31：触发条要能自己控制大小；且右侧屏幕中段也会呼出 ⇒ 容易误触）
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
@@ -1351,9 +1359,13 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)rebuildEditorOrderStrip;
 - (void)layoutEditorOrderCellsAnimated:(BOOL)animated;
 - (void)applyEditorOrderCellDecorations:(UIView *)cell index:(NSUInteger)index total:(NSUInteger)total;
-- (void)onEditorOrderMove:(UIButton *)button;
-- (void)moveEditorOrderBundleId:(NSString *)bundleId by:(NSInteger)delta;
-// 【0.3.22】触发条几何自调（编辑器顶部滑杆）
+// 【0.6.8 用户指令】拖拽排序（长按提起 → 跟手换位 → 松手落位）
+- (void)onEditorOrderDrag:(UILongPressGestureRecognizer *)gesture;
+- (void)moveEditorOrderCellFromIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex;
+// 【0.6.8 用户指令】设置区折叠
+- (void)layoutEditorContentAnimated:(BOOL)animated;
+- (void)onEditorSettingsToggle:(UIButton *)sender;
+// 【0.3.22】触发条几何自调（编辑器顶部滑杆，装进折叠容器）
 - (void)buildTriggerSettingsInPanel:(UIView *)panel top:(CGFloat)top;
 - (void)onTriggerSliderChanged:(UISlider *)slider;
 - (void)refreshTriggerGeometryAfterPrefsChange;
@@ -2752,11 +2764,26 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [(self.hostContainerView ?: window) addSubview:panel];
     self.editorPanel = panel;
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 46.0, width - 130.0, 30.0)];
-    title.text = @"选择圆盘中的应用";
+    // 【0.6.8 用户指令】顶栏一行化（简约）：标题 + 计数徽章 + 「触发条」折叠按钮 + 「完成」。
+    //   触发条自调区是低频操作，默认收起——首屏直接是排序条 + App 网格（快捷/效率）。
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 46.0, 150.0, 30.0)];
+    title.text = @"圆盘应用";
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:19.0];
     [panel addSubview:title];
+
+    UIButton *settingsToggle = [UIButton buttonWithType:UIButtonTypeCustom];
+    settingsToggle.frame = CGRectMake(width - 190.0, 44.0, 92.0, 34.0);
+    settingsToggle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+    settingsToggle.layer.cornerRadius = 17.0;
+    settingsToggle.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    [settingsToggle setTitle:@"触发条 ▸" forState:UIControlStateNormal];
+    [settingsToggle setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [settingsToggle addTarget:self action:@selector(onEditorSettingsToggle:)
+             forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:settingsToggle];
+    self.editorSettingsToggle = settingsToggle;
+    self.editorSettingsExpanded = NO;
 
     UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
     done.tag = MF_RING_EDITOR_DONE;
@@ -2775,11 +2802,19 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [panel addSubview:countLabel];
     self.editorCountLabel = countLabel;
 
-    // 【0.3.26】触发条自调区（用户 log31：触发条大小/位置要能自己控制）
-    const CGFloat settingsTop = 96.0;
+    // 【0.6.8】触发条自调区（用户 log31）装进折叠容器：收起 = 不占首屏；展开 = 下方内容整体下移。
+    //   预览高亮也装进容器（收起时一并隐藏，几何用 convertRect 相对 superview 自动对齐）。
+    const CGFloat settingsTop = 100.0;
     const CGFloat rowHeight = 32.0;
     const CGFloat settingsRows = 3.0;
-    [self buildTriggerSettingsInPanel:panel top:settingsTop];
+    const CGFloat settingsBoxHeight = settingsRows * rowHeight + 20.0;   // 3 行滑杆 + 提示行
+    UIView *settingsBox = [[UIView alloc] initWithFrame:CGRectMake(0.0, settingsTop, width, settingsBoxHeight)];
+    settingsBox.hidden = YES;
+    settingsBox.userInteractionEnabled = YES;
+    [panel addSubview:settingsBox];
+    self.triggerSettingsBox = settingsBox;
+    [self buildTriggerSettingsInPanel:settingsBox top:0.0];
+    self.editorContentBaseTop = settingsTop;
 
     // 【0.3.26】bundleID → 显示名（枚举时已取好，排序条 rebuild 时只查表，不再碰 SB 私有数据）
     NSMutableDictionary<NSString *, NSString *> *nameTable = [NSMutableDictionary dictionary];
@@ -2790,26 +2825,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
     self.editorAppNames = nameTable;
 
-    // 【0.3.26 用户 log35】「已添加」排序条（横滑）：按**圆盘真实顺序**列出已添加的 App，
-    //   每格 ◀ / ▶ 各点一下 = 前移 / 后移一格 ⇒ 直接决定圆盘上图标的位置（顺序 = ringApps 顺序）。
-    const CGFloat orderTitleTop = settingsTop + settingsRows * rowHeight + 26.0;
-    UILabel *orderTitle = [[UILabel alloc]
-        initWithFrame:CGRectMake(18.0, orderTitleTop, width - 36.0, 16.0)];
-    orderTitle.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
-    orderTitle.font = [UIFont systemFontOfSize:11.5];
-    [panel addSubview:orderTitle];
-    self.editorOrderTitle = orderTitle;
-
-    const CGFloat orderStripHeight = 104.0;
+    // 【0.3.26 → 0.6.8 用户指令】「已添加」排序条：**长按拖拽排序**（跟手换位 + 让位动画 +
+    //   边缘自动滚），◀ ▶ 逐格点击已删——简约且高效。
     UIScrollView *orderScroll = [[UIScrollView alloc]
-        initWithFrame:CGRectMake(0.0, orderTitleTop + 18.0, width, orderStripHeight)];
+        initWithFrame:CGRectMake(0.0, 0.0, width, 104.0)];
     orderScroll.backgroundColor = [UIColor clearColor];
     orderScroll.opaque = NO;
     orderScroll.showsHorizontalScrollIndicator = NO;
     orderScroll.alwaysBounceHorizontal = YES;
-    // 点 ◀ ▶ 要立刻响应（默认 delaysContentTouches=YES 会延迟 ~150ms 判滚动）；
-    // canCancelContentTouches 保持默认 YES ⇒ 起点在按钮上时横向拖动照样能滚排序条。
     orderScroll.delaysContentTouches = NO;
+    UILongPressGestureRecognizer *drag = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onEditorOrderDrag:)];
+    drag.minimumPressDuration = 0.25;
+    drag.allowableMovement = CGFLOAT_MAX;
+    [orderScroll addGestureRecognizer:drag];
     [panel addSubview:orderScroll];
     self.editorOrderScroll = orderScroll;
     [self rebuildEditorOrderStrip];   // 首次按 editorSelection 的顺序铺好（含真图标/首字母占位）
@@ -2822,6 +2851,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     scroll.tag = MF_RING_EDITOR_SCROLL;
     [panel addSubview:scroll];
     self.editorScroll = scroll;
+    [self layoutEditorContentAnimated:NO];   // 【0.6.8】按折叠态统一排排序条/网格位置
 
     const NSUInteger columns = 4;
     const CGFloat sideInset = 8.0;
@@ -3162,7 +3192,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 /// 按 `editorSelection`（= 圆盘真实顺序）**重建**排序条：序号 + 图标 + 名称 + ◀ ▶。
 /// 顺带说明：圆盘上图标的位置就是这个顺序（`ringApps` 数组顺序），点「完成」即写盘生效。
 /// ⚠️ 只做"加/减成员"后的重建；单纯换位置走 layoutEditorOrderCellsAnimated:（保留格子身份，
-///    能看见"哪个 App 挪到哪儿"），见 moveEditorOrderBundleId:by:。
+///    能看见"哪个 App 挪到哪儿"）。【0.6.8】◀ ▶ 已删，换位走拖拽 moveEditorOrderCellFromIndex:toIndex:。
 - (void)rebuildEditorOrderStrip {
     UIScrollView *strip = self.editorOrderScroll;
     if (strip == nil) {
@@ -3227,25 +3257,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         nameLabel.numberOfLines = 2;
         [cell addSubview:nameLabel];
 
-        // ◀ 前移 / ▶ 后移：点一下挪一格（到头那一侧变暗且不响应）
-        NSArray<NSNumber *> *arrowTags = @[ @(MF_RING_EDITOR_ORDER_BACK), @(MF_RING_EDITOR_ORDER_FORWARD) ];
-        NSArray<NSString *> *arrowTitles = @[ @"◀", @"▶" ];
-        for (NSUInteger arrow = 0; arrow < arrowTags.count; arrow++) {
-            UIButton *step = [UIButton buttonWithType:UIButtonTypeCustom];
-            step.frame = CGRectMake((arrow == 0) ? 5.0 : (cellW - 33.0), cellH - 21.0, 28.0, 18.0);
-            step.tag = arrowTags[arrow].integerValue;
-            step.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.16];
-            step.layer.cornerRadius = 6.0;
-            step.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
-            [step setTitle:arrowTitles[arrow] forState:UIControlStateNormal];
-            [step setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-            [step addTarget:self action:@selector(onEditorOrderMove:)
-           forControlEvents:UIControlEventTouchUpInside];
-            objc_setAssociatedObject(step, &kMFRingBundleIdKey, bundleId,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [cell addSubview:step];
-        }
-
+        // 【0.6.8 用户指令】◀ ▶ 逐格按钮已删——排序改长按拖拽（跟手换位，一步到位）。
         [strip addSubview:cell];
         [self.editorOrderCells addObject:cell];
         [self applyEditorOrderCellDecorations:cell index:index total:ordered.count];
@@ -3253,12 +3265,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
     strip.contentSize = CGSizeMake(inset * 2.0 + (CGFloat)ordered.count * (cellW + gap),
                                    cellH + 2.0);
-    if (self.editorOrderTitle != nil) {
-        self.editorOrderTitle.text = (ordered.count > 0)
-            ? [NSString stringWithFormat:@"已添加 %lu 个 · 从左到右 = 圆盘顺序（◀ ▶ 调位置，完成即生效）",
-                                         (unsigned long)ordered.count]
-            : @"已添加 0 个：点下方图标加入，再用 ◀ ▶ 调圆盘顺序";
-    }
+    // 【0.6.8】提示并入计数行（排序条标题已随简约化移除，editorOrderTitle 不再创建）。
 
     // 图标：命中缓存是瞬时的；没命中先显示首字母，由 fillEditorIcons: 就近补齐
     if (self.editorPanel != nil && !gMFRingDegraded && MFRingBool(@"mfRingFetchIcons", YES)
@@ -3267,7 +3274,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                     fromIndex:0
                    generation:self.editorIconGeneration];
     }
-    MFLog(@"[ring] 排序条已重建：%lu 个（从左到右 = 圆盘顺序）", (unsigned long)ordered.count);
+    MFLog(@"[ring] 排序条已重建：%lu 个（从左到右 = 圆盘顺序，长按拖动调整）", (unsigned long)ordered.count);
 }
 
 /// 按数组顺序摆好每个格子（frame + 序号 + ◀▶ 可用状态）。
@@ -3277,6 +3284,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     void (^layout)(void) = ^{
         for (NSUInteger index = 0; index < cells.count; index++) {
             UIView *cell = cells[index];
+            if (cell == self.editorOrderDraggingCell) {
+                // 【0.6.8】拖拽中的格子位置由手势跟手控制，layout 只刷新序号装饰
+                [self applyEditorOrderCellDecorations:cell index:index total:cells.count];
+                continue;
+            }
             CGRect frame = cell.frame;
             frame.origin.x = MF_RING_ORDER_INSET + (CGFloat)index * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
             cell.frame = frame;
@@ -3306,60 +3318,153 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
-/// 序号 + 两侧箭头可用状态（第 1 个不能前移、最后一个不能后移）
+/// 序号徽章（【0.6.8】◀▶ 可用状态已随拖拽排序移除，装饰只剩序号）。
 - (void)applyEditorOrderCellDecorations:(UIView *)cell index:(NSUInteger)index total:(NSUInteger)total {
     if (cell == nil) {
         return;
     }
+    (void)total;
     UILabel *order = (UILabel *)[cell viewWithTag:MF_RING_EDITOR_ORDER_INDEX];
-    order.text = [NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)];
-    BOOL canBack = (index > 0);
-    BOOL canForward = (index + 1 < total);
-    UIButton *back = (UIButton *)[cell viewWithTag:MF_RING_EDITOR_ORDER_BACK];
-    back.enabled = canBack;
-    back.alpha = canBack ? 1.0 : 0.30;
-    UIButton *forward = (UIButton *)[cell viewWithTag:MF_RING_EDITOR_ORDER_FORWARD];
-    forward.enabled = canForward;
-    forward.alpha = canForward ? 1.0 : 0.30;
+    if (order != nil) {
+        order.text = [NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)];
+    }
 }
 
-/// 点排序条格子里的 ◀ / ▶（两个按钮都走这里，用 tag 区分方向）
-- (void)onEditorOrderMove:(UIButton *)button {
-    NSString *bundleId = objc_getAssociatedObject(button, &kMFRingBundleIdKey);
-    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+#pragma mark - 【0.6.8 用户指令】排序条长按拖拽（简约/快捷/效率：一步到位，替代 ◀ ▶ 逐格点）
+
+/// 长按拖拽排序：Began 提起 → Changed 跟手 + 跨格换位 + 边缘自动滚 → Ended 弹簧落位。
+/// 数据同步 = editorSelection（remove + insert，即圆盘真实顺序）；视图 = cells 数组同步插入 +
+/// layoutEditorOrderCellsAnimated 让位（铁律：交换/移动引用 + 只重排 frame，绝不整段重建）。
+- (void)onEditorOrderDrag:(UILongPressGestureRecognizer *)gesture {
+    UIScrollView *strip = self.editorOrderScroll;
+    if (strip == nil || self.editorOrderCells.count == 0) {
         return;
     }
-    NSInteger delta = (button.tag == MF_RING_EDITOR_ORDER_BACK) ? -1 : 1;
-    [self moveEditorOrderBundleId:bundleId by:delta];
+    CGPoint touchInStrip = [gesture locationInView:strip];
+
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        // 定位按下点所在格子（内容坐标比对）
+        CGFloat contentX = touchInStrip.x + strip.contentOffset.x;
+        NSUInteger hit = NSNotFound;
+        for (NSUInteger index = 0; index < self.editorOrderCells.count; index++) {
+            UIView *cell = self.editorOrderCells[index];
+            if (contentX >= CGRectGetMinX(cell.frame) && contentX <= CGRectGetMaxX(cell.frame)) {
+                hit = index;
+                break;
+            }
+        }
+        if (hit == NSNotFound) {
+            return;   // 按在空隙上：忽略（不进入拖拽）
+        }
+        UIView *cell = self.editorOrderCells[hit];
+        self.editorOrderDraggingCell = cell;
+        self.editorOrderDragIndex = hit;
+        self.editorOrderDragGrabOffset = contentX - CGRectGetMidX(cell.frame);
+        strip.scrollEnabled = NO;   // 拖拽期间禁滚动（手势接管水平位移；边缘自动滚自己推进）
+        [strip addSubview:cell];    // 提到最上层（盖住让位的邻居）
+        cell.transform = CGAffineTransformMakeScale(1.12, 1.12);
+        cell.alpha = 0.95;
+        cell.layer.shadowColor = [UIColor blackColor].CGColor;
+        cell.layer.shadowOpacity = 0.55;
+        cell.layer.shadowRadius = 10.0;
+        cell.layer.shadowOffset = CGSizeMake(0.0, 3.0);
+        [self mfRingHapticLight];
+        MFLog(@"[ring] 拖拽排序开始：%@（第 %lu 位）",
+              objc_getAssociatedObject(cell, &kMFRingBundleIdKey) ?: @"?", (unsigned long)(hit + 1));
+        return;
+    }
+
+    UIView *dragCell = self.editorOrderDraggingCell;
+    if (dragCell == nil) {
+        return;
+    }
+    NSUInteger dragIndex = self.editorOrderDragIndex;
+
+    if (gesture.state == UIGestureRecognizerStateChanged) {
+        // 跟手：center.x = 触点内容坐标 - 提起偏移（y 保持行中心不动）
+        CGFloat contentX = touchInStrip.x + strip.contentOffset.x;
+        CGPoint center = dragCell.center;
+        center.x = contentX - self.editorOrderDragGrabOffset;
+        dragCell.center = center;
+
+        // 目标 index：拖拽格子的中心点划过哪格的中心，就插到哪格
+        NSUInteger target = 0;
+        for (NSUInteger k = 0; k < self.editorOrderCells.count; k++) {
+            if (k == dragIndex) {
+                continue;
+            }
+            CGFloat neighborMidX = CGRectGetMidX(self.editorOrderCells[k].frame);
+            if (center.x > neighborMidX) {
+                target = k + 1;
+            }
+        }
+        if (target >= self.editorOrderCells.count) {
+            target = self.editorOrderCells.count - 1;
+        }
+        if (target != dragIndex) {
+            [self moveEditorOrderCellFromIndex:dragIndex toIndex:target];
+        }
+
+        // 边缘自动滚：触点进入左右 34pt 边缘带则每事件推进/回退 8pt
+        CGFloat maxOffset = MAX(0.0, strip.contentSize.width - CGRectGetWidth(strip.bounds));
+        if (touchInStrip.x < 34.0 && strip.contentOffset.x > 0.0) {
+            strip.contentOffset = CGPointMake(MAX(0.0, strip.contentOffset.x - 8.0), 0.0);
+        } else if (touchInStrip.x > CGRectGetWidth(strip.bounds) - 34.0 &&
+                   strip.contentOffset.x < maxOffset) {
+            strip.contentOffset = CGPointMake(MIN(maxOffset, strip.contentOffset.x + 8.0), 0.0);
+        }
+        return;
+    }
+
+    if (gesture.state == UIGestureRecognizerStateEnded ||
+        gesture.state == UIGestureRecognizerStateCancelled) {
+        strip.scrollEnabled = YES;
+        self.editorOrderDraggingCell = nil;
+        NSUInteger finalIndex = dragIndex;
+        UIView * __weak weakCell = dragCell;
+        CGRect homeFrame = dragCell.frame;
+        homeFrame.origin.x = MF_RING_ORDER_INSET + (CGFloat)finalIndex *
+            (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+        dragCell.frame = homeFrame;   // model 值先落位（动画从这个 home 弹回）
+        dragCell.transform = CGAffineTransformMakeScale(1.12, 1.12);
+        [UIView animateWithDuration:0.42
+                              delay:0.0
+             usingSpringWithDamping:0.55
+              initialSpringVelocity:0.3
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:^{
+            weakCell.transform = CGAffineTransformIdentity;
+            weakCell.alpha = 1.0;
+            weakCell.layer.shadowOpacity = 0.0;
+        } completion:nil];
+        [self mfRingHapticLight];
+        NSString *bid = objc_getAssociatedObject(dragCell, &kMFRingBundleIdKey) ?: @"?";
+        MFLog(@"[ring] 拖拽排序完成：%@ → 第 %lu 位（共 %lu 个，点完成写盘生效）",
+              bid, (unsigned long)(finalIndex + 1), (unsigned long)self.editorOrderCells.count);
+    }
 }
 
-/// 真正的顺序调整：`NSMutableOrderedSet` 的 remove + insert(at:)，再交换两个格子的位置引用、
-/// 动画重排（不重建视图 ⇒ 被挪的 App 带着图标滑到新位置）。
-/// ⚠️ 顺序就是 `ringApps` 的顺序 —— 下次呼出圆盘时图标位置照此排列。
-- (void)moveEditorOrderBundleId:(NSString *)bundleId by:(NSInteger)delta {
+/// 换位：editorSelection 与 cells 数组同步 remove + insert，再让位动画重排（不重建视图）。
+- (void)moveEditorOrderCellFromIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex {
     NSMutableOrderedSet<NSString *> *selection = self.editorSelection;
-    if (selection == nil || bundleId.length == 0 || delta == 0) {
-        return;
-    }
-    NSUInteger index = [selection indexOfObject:bundleId];
-    if (index == NSNotFound) {
-        return;
-    }
-    NSInteger target = (NSInteger)index + ((delta > 0) ? 1 : -1);
-    if (target < 0 || target >= (NSInteger)selection.count) {
-        return;   // 已经在队首 / 队尾
-    }
-    [selection removeObject:bundleId];
-    [selection insertObject:bundleId atIndex:(NSUInteger)target];
-    MFLog(@"[ring] 排序条：%@ 第 %lu 位 -> 第 %ld 位（圆盘顺序共 %lu 个）",
-          bundleId, (unsigned long)(index + 1), (long)(target + 1),
-          (unsigned long)selection.count);
-
     NSMutableArray<UIView *> *cells = self.editorOrderCells;
-    if (cells.count > MAX(index, (NSUInteger)target)) {
-        [cells exchangeObjectAtIndex:index withObjectAtIndex:(NSUInteger)target];
+    if (selection == nil || cells == nil ||
+        fromIndex >= cells.count || toIndex >= cells.count || fromIndex == toIndex) {
+        return;
     }
-    [self layoutEditorOrderCellsAnimated:YES];
+    NSString *bundleId = selection.array[fromIndex];
+    [selection removeObject:bundleId];
+    [selection insertObject:bundleId atIndex:toIndex];
+    UIView *cell = cells[fromIndex];
+    [cells removeObjectAtIndex:fromIndex];
+    [cells insertObject:cell atIndex:toIndex];
+    self.editorOrderDragIndex = toIndex;
+    [self layoutEditorOrderCellsAnimated:YES];   // 拖拽中的格子被 layout 跳过（位置跟手）
+}
+
+- (void)mfRingHapticLight {
     @try {
         UIImpactFeedbackGenerator *feedback =
             [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
@@ -3368,12 +3473,78 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
+#pragma mark - 【0.6.8 用户指令】编辑器设置折叠（简约：低频设置不占首屏）
+
+/// 统一内容布局：折叠态排序条从 100pt 起；展开态从设置区底（100+116）起。
+/// 网格 frame 跟随排序条底；一次排好，动画过渡。
+- (void)layoutEditorContentAnimated:(BOOL)animated {
+    UIView *panel = self.editorPanel;
+    if (panel == nil) {
+        return;
+    }
+    CGFloat width = CGRectGetWidth(panel.bounds);
+    CGFloat height = CGRectGetHeight(panel.bounds);
+    if (width <= 0.0 || height <= 0.0) {
+        return;
+    }
+    CGFloat contentTop = self.editorContentBaseTop;
+    if (self.editorSettingsExpanded && self.triggerSettingsBox != nil) {
+        contentTop = CGRectGetMaxY(self.triggerSettingsBox.frame) + 14.0;
+    }
+    void (^layout)(void) = ^{
+        self.editorOrderScroll.frame = CGRectMake(0.0, contentTop, width, 104.0);
+        CGFloat gridTop = CGRectGetMaxY(self.editorOrderScroll.frame) + 6.0;
+        self.editorScroll.frame = CGRectMake(0.0, gridTop, width, MAX(120.0, height - gridTop));
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.26
+                              delay:0.0
+             usingSpringWithDamping:0.85
+              initialSpringVelocity:0.3
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState)
+                         animations:layout
+                         completion:nil];
+    } else {
+        layout();
+    }
+}
+
+/// 「触发条」按钮：展开/收起设置区（含高亮预览），下方内容弹簧跟随。
+- (void)onEditorSettingsToggle:(UIButton *)sender {
+    BOOL expand = !self.editorSettingsExpanded;
+    self.editorSettingsExpanded = expand;
+    self.triggerSettingsBox.hidden = NO;   // 展开动画需要先可见（收起在动画完成块里藏）
+    [sender setTitle:(expand ? @"触发条 ▾" : @"触发条 ▸") forState:UIControlStateNormal];
+    sender.backgroundColor = [UIColor colorWithWhite:1.0 alpha:expand ? 0.26 : 0.14];
+    if (expand) {
+        self.triggerSettingsBox.alpha = 0.0;
+        [self refreshTriggerGeometryAfterPrefsChange];   // 展开时刷新预览位置/数值
+    }
+    [self layoutEditorContentAnimated:YES];
+    [UIView animateWithDuration:0.26
+                          delay:0.0
+         usingSpringWithDamping:0.85
+          initialSpringVelocity:0.3
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        self.triggerSettingsBox.alpha = expand ? 1.0 : 0.0;
+    } completion:^(__unused BOOL finished) {
+        if (!expand) {
+            self.triggerSettingsBox.hidden = YES;
+        }
+    }];
+    MFLog(@"[ring] 编辑器设置区：%@", expand ? @"展开（触发条自调）" : @"收起");
+}
+
 - (void)refreshEditorCount {
     UILabel *label = self.editorCountLabel;
     if (label == nil) {
         return;
     }
-    label.text = [NSString stringWithFormat:@"已选 %lu 个（最多 %lu 个）· 点图标加入/移出",
+    label.text = [NSString stringWithFormat:
+                  @"已选 %lu 个（最多 %lu 个）· 点图标加入/移出 · 长按顶部条拖动排序",
                   (unsigned long)self.editorSelection.count, (unsigned long)MFRingMaxIcons()];
 }
 
