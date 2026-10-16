@@ -1024,12 +1024,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.9 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.10 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.9 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.10 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2752,7 +2752,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         if ([self isPanelFullyOpen]) {
             [self removeKeyboardZoomSuspension:POKeyboardZoomSuspensionDragging];
-            [self reevaluateCardScaleAnimated:YES source:POCardScaleTransitionSourceReconcile];
+            // 【0.6.10】贴片还原 Q 弹窗口：本次弹簧持有 transform，缩放重估跳过一次
+            //   （否则会在弹簧中途把 transform 拉回 Identity，Q 弹被截断）。
+            if (![self mfStripRestoreBounceActive]) {
+                [self reevaluateCardScaleAnimated:YES source:POCardScaleTransitionSourceReconcile];
+            }
         }
     } else {
         [scrollView setContentOffset:CGPointZero animated:NO];
@@ -3193,7 +3197,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.9 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.10 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3526,6 +3530,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 /// 【0.3.24 用户 log33】"所有的悬浮窗手势操作都没有动画" —— 拖动时给卡片"抬起/落下"的观感：
 /// 阴影加深（0.28 → 0.42）+ 半径放大（8 → 18），松手弹簧收回。Stheno 里"上手即浮起"就是这个味道。
+/// 【0.6.10 用户指令】拖动跟手流畅度：抬起期间把阴影层**栅格化缓存** —— 18pt 大半径模糊
+/// 阴影默认每帧随容器移动重渲染（4K 屏上是 GPU 大头，表现为拖动"一顿一顿"）；栅格化后
+/// 模糊只算一次、每帧只搬位图。松手撤掉栅格化（避免缩放/停靠变尺寸时用旧缓存发糊）。
 -(void)mfSetCardDragLift:(BOOL)lifting{
     if (shadowView == nil) {
         return;
@@ -3534,6 +3541,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat baseOpacity = CONTENT_SHADOW_OPACITY * progress;
     CGFloat opacity = lifting ? MAX(baseOpacity, MF_CARD_LIFT_SHADOW_OPACITY) : baseOpacity;
     CGFloat radius = lifting ? 18.0 : 8.0;
+    shadowView.layer.shouldRasterize = lifting;
+    shadowView.layer.rasterizationScale = UIScreen.mainScreen.scale;
+    // 【0.6.10】卡内白色柔光勾边（0.4.15）同样带 10pt 模糊阴影 → 拖动期间一并栅格化
+    if (mfCardGlowView != nil) {
+        mfCardGlowView.layer.shouldRasterize = lifting;
+        mfCardGlowView.layer.rasterizationScale = UIScreen.mainScreen.scale;
+    }
     [UIView animateWithDuration:lifting ? 0.16 : 0.26
                           delay:0.0
          usingSpringWithDamping:0.9
@@ -3557,19 +3571,40 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     keyboardZoomContainer.alpha = 0.0;
     CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     self->shadowView.layer.shadowOpacity = 0;
-    [UIView animateWithDuration:0.4
+    // 【0.6.10 用户指令】贴片还原主窗（屏上无主窗、单贴片场景）＝ 淡入 + **Q 弹放大**：
+    //   从 0.88 起弹簧弹到 1.0（阻尼 0.5 一定过冲一次再收），不再是干巴巴的原位淡入。
+    //   只对贴片还原生效 —— 圆盘打开保持 0.6.7 定稿的纯淡入不动。
+    //   只在"还原到基准尺寸"时启用：restoreScale≠1 时后续 applyCardScaleTarget 会接管
+    //   transform，中途叠加弹簧会互相打架。
+    BOOL stripRestoreBounce = [self mfStripRestoreBounceActive];
+    if (stripRestoreBounce) {
+        keyboardZoomContainer.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    }
+    [UIView animateWithDuration:0.5
                           delay:0.0
-         usingSpringWithDamping:0.74
-          initialSpringVelocity:0.5
+         usingSpringWithDamping:stripRestoreBounce ? 0.5 : 0.74
+          initialSpringVelocity:stripRestoreBounce ? 0.7 : 0.5
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
         self->keyboardZoomContainer.alpha = 1.0;
+        if (stripRestoreBounce) {
+            self->keyboardZoomContainer.transform = CGAffineTransformIdentity;
+        }
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
     } completion:nil];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.9 淡入 0.4s，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.10 淡入 0.5s %@，阴影浮起 %.2f）",
+          stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0" : @"纯淡入",
           CONTENT_SHADOW_OPACITY * progress);
+}
+
+/// 【0.6.10】本次打开是否为"贴片还原到基准尺寸"（Q 弹窗口）。finishPanelSnapToOpenState
+/// 用同一判定跳过 reevaluateCardScale —— 否则缩放重估会在弹簧中途把 transform 拉回 Identity。
+-(BOOL)mfStripRestoreBounceActive{
+    return (mfStripPendingRestore != nil &&
+        fabs(mfStripPendingRestore.savedScale - 1.0) <= PO_CARD_SCALE_EPSILON &&
+        fabs(appliedCardScale - 1.0) <= PO_CARD_SCALE_EPSILON);
 }
 
 /// 【0.3.13】底部热区：pan 自由移动（X+Y 跟手，松手停在哪就是哪，不吸附）。
@@ -3959,7 +3994,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.9 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.10 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }

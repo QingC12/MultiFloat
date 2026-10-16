@@ -481,6 +481,7 @@
 // 【0.6.8 用户 log51 后】编辑器重做（简约/快捷/效率）：设置区折叠进「触发条」按钮；
 //   排序条改长按拖拽（◀ ▶ 逐格点击已删）。
 #define MF_RING_EDITOR_ORDER_INDEX   991016   // 排序条格子左上角序号
+#define MF_RING_EDITOR_ROW_CHEVRON   991017   // 一级菜单行右侧箭头（布局时定位）
 #define MF_RING_ORDER_CELL_W 76.0             // 排序条格子宽
 #define MF_RING_ORDER_CELL_H 102.0            // 排序条格子高
 #define MF_RING_ORDER_CELL_GAP 6.0            // 格子间距
@@ -1119,6 +1120,153 @@ static MFRingGeometry MFRingCurrentGeometry(CGRect bounds) {
     return MFRingComputeGeometry(bounds, gMFRingCount);
 }
 
+// 【0.6.10】圆盘槽位计算 —— 呼出布局算法的纯函数版（等距双圈求解 / 单圈收敛 / 退路分配 /
+// 内圈错半格，全部与真实呼出一致），编辑器实时预览用它画出"圆盘真实排布"。
+typedef struct {
+    CGFloat angleDegrees;   // -90 = 正上方起，顺时针
+    CGFloat radius;
+} MFRingSlotPos;
+
+static NSUInteger MFRingComputeRingSlots(CGRect hostBounds, NSUInteger count, CGFloat rotation,
+                                         MFRingSlotPos *outSlots, NSUInteger maxSlots) {
+    if (outSlots == NULL || maxSlots == 0 || count == 0) {
+        return 0;
+    }
+    MFRingGeometry geo = MFRingComputeGeometry(hostBounds, count);
+    NSUInteger want = MIN(count, maxSlots);
+    CGFloat outerRadius = geo.outerRadius;
+    CGFloat iconSize = geo.iconSize;
+    CGFloat step = geo.step;
+    CGFloat innerRatio = geo.innerRatio;
+    CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);
+
+    // ① 规划每圈半径/容量（由外到内）—— 同呼出布局 ①
+    NSMutableArray<NSNumber *> *ringRadii = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *ringCaps = [NSMutableArray array];
+    for (NSUInteger ring = 0; ring < geo.rings; ring++) {
+        CGFloat ringRadius = (ring == 0) ? outerRadius
+                                         : [ringRadii[ring - 1] doubleValue] * innerRatio;
+        if (ring > 0 && ringRadius < iconSize * 1.15) {
+            break;
+        }
+        [ringRadii addObject:@(ringRadius)];
+        [ringCaps addObject:@(MAX(floor((2.0 * M_PI * ringRadius) / step), 1.0))];
+    }
+    NSUInteger rings = ringRadii.count;
+
+    // ② 单圈收敛判定 —— 同呼出布局 ②
+    CGFloat snugAll = (CGFloat)want * step / (2.0 * M_PI);
+    if (want <= [ringCaps[0] unsignedIntegerValue] || snugAll <= outerRadius * 1.15) {
+        if (rings > 1) {
+            [ringRadii removeObjectsInRange:NSMakeRange(1, rings - 1)];
+            [ringCaps removeObjectsInRange:NSMakeRange(1, rings - 1)];
+            rings = 1;
+        }
+    } else {
+        while (rings > 1 && [ringCaps[rings - 1] unsignedIntegerValue] < 3) {
+            [ringRadii removeLastObject];
+            [ringCaps removeLastObject];
+            rings--;
+        }
+    }
+    NSUInteger totalCap = 0;
+    for (NSNumber *cap in ringCaps) {
+        totalCap += [cap unsignedIntegerValue];
+    }
+    if (want > totalCap && totalCap > 0) {
+        want = totalCap;
+    }
+
+    // ③ 等距双圈求解 —— 同呼出布局 ③
+    NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
+    for (NSUInteger ring = 0; ring < rings; ring++) {
+        [perRing addObject:@(0)];
+    }
+    NSMutableArray<NSNumber *> *drawnRadii = [NSMutableArray arrayWithCapacity:rings];
+    BOOL solvedEqualSpacing = NO;
+    if (rings >= 2) {
+        CGFloat minInnerRadius = iconSize * 1.15;
+        NSUInteger maxInner = (NSUInteger)MAX(floor((2.0 * M_PI * minInnerRadius) / step), 1.0);
+        CGFloat bestSpacing = 0.0;
+        CGFloat bestOuterRadius = 0.0;
+        NSUInteger bestInner = 0;
+        NSUInteger bestOuter = 0;
+        for (NSUInteger nIn = MIN(maxInner, want - 1); nIn >= 1; nIn--) {
+            NSUInteger nOut = want - nIn;
+            if (nOut <= nIn) {
+                break;
+            }
+            CGFloat rOutMin = minInnerRadius * ((CGFloat)nOut / (CGFloat)nIn);
+            CGFloat rOutMax = MIN(1.6 * step * ((CGFloat)nOut / (2.0 * M_PI)),
+                                  outerRadius * 1.5);
+            if (rOutMin > rOutMax) {
+                continue;
+            }
+            CGFloat rOut = MIN(outerRadius, rOutMax);
+            if (rOut < rOutMin) {
+                rOut = rOutMin;
+            }
+            CGFloat spacing = (2.0 * M_PI * rOut) / (CGFloat)nOut;
+            if (bestInner == 0 || spacing < bestSpacing) {
+                bestSpacing = spacing;
+                bestOuterRadius = rOut;
+                bestInner = nIn;
+                bestOuter = nOut;
+            }
+        }
+        if (bestInner > 0) {
+            perRing[0] = @(bestOuter);
+            perRing[1] = @(bestInner);
+            [drawnRadii addObject:@(bestOuterRadius)];
+            [drawnRadii addObject:@(bestOuterRadius * ((CGFloat)bestInner / (CGFloat)bestOuter))];
+            if (rings > 2) {
+                rings = 2;
+            }
+            solvedEqualSpacing = YES;
+        }
+    }
+    if (!solvedEqualSpacing) {
+        // 退路：外圈先铺满，剩余进内圈；内圈半径按个数自适应 —— 同呼出布局退路
+        NSUInteger left = want;
+        for (NSInteger ring = (NSInteger)rings - 1; ring >= 0 && left > 0; ring--) {
+            NSUInteger cap = [ringCaps[(NSUInteger)ring] unsignedIntegerValue];
+            NSUInteger take = MIN(cap, left);
+            perRing[(NSUInteger)ring] = @(take);
+            left -= take;
+        }
+        CGFloat outerCount = MAX((CGFloat)[perRing[0] doubleValue], 1.0);
+        for (NSUInteger ring = 0; ring < rings; ring++) {
+            CGFloat drawn = [ringRadii[ring] doubleValue];
+            if (ring == 0 && rings == 1) {
+                CGFloat snug = (CGFloat)want * step / (2.0 * M_PI);
+                drawn = MIN(MAX(snug, iconSize * 1.15), outerRadius * 1.35);
+            }
+            if (ring > 0) {
+                CGFloat innerCount = (CGFloat)[perRing[ring] doubleValue];
+                if (innerCount > 0.5) {
+                    drawn = MIN(MAX(outerRadius * (innerCount / outerCount), outerRadius * 0.42), drawn);
+                }
+            }
+            [drawnRadii addObject:@(drawn)];
+        }
+    }
+
+    // ④ 逐圈产出槽位（内圈错半格）—— 同呼出布局 ⑤
+    NSUInteger placed = 0;
+    for (NSUInteger ring = 0; ring < rings && placed < want; ring++) {
+        CGFloat iconRadius = [drawnRadii[ring] doubleValue];
+        NSUInteger ringCount = [perRing[ring] unsignedIntegerValue];
+        for (NSUInteger slot = 0; slot < ringCount && placed < want; slot++, placed++) {
+            CGFloat stagger = (ring % 2 == 1) ? (180.0 / (CGFloat)MAX(ringCount, (NSUInteger)1)) : 0.0;
+            outSlots[placed].angleDegrees = startAngle + stagger
+                + 360.0 * (CGFloat)slot / (CGFloat)MAX(ringCount, (NSUInteger)1)
+                + rotation;
+            outSlots[placed].radius = iconRadius;
+        }
+    }
+    return placed;
+}
+
 #pragma mark - 触摸到达诊断（0.2.2）
 
 /// 【0.2.2 诊断】"触摸到底有没有到达我们窗口"—— 一次测试就能定性的关键日志。
@@ -1296,6 +1444,24 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIView *editorOrderDraggingCell;     // 拖拽中的排序格子（layout 跳过它）
 @property (nonatomic, assign) NSUInteger editorOrderDragIndex;     // 拖拽中格子的当前 index
 @property (nonatomic, assign) CGFloat editorOrderDragGrabOffset;   // 按下点相对格子中心的偏移
+// 【0.6.10 用户指令】编辑器二级菜单：一级只留菜单行（应用管理/触发条/其他选项），
+//   全部 App 收进二级「应用管理」（已添加 / 未添加 两个 tab）；已添加 tab 顶部有
+//   圆盘实时预览 —— 拖动排序/加/减成员时图标位置即时跟随，所见即圆盘真实排布。
+@property (nonatomic, strong) NSArray<NSDictionary<NSString *, NSString *> *> *editorApps;  // 枚举结果留存（二级页数据源）
+@property (nonatomic, strong) UIView *editorMenuBox;               // 一级菜单容器
+@property (nonatomic, strong) UIView *editorAppsBox;               // 二级「应用管理」页容器
+@property (nonatomic, assign) BOOL editorLevel2Visible;            // 当前在二级页？
+@property (nonatomic, assign) BOOL editorTabAdded;                 // 二级页当前 tab：YES=已添加 / NO=未添加
+@property (nonatomic, strong) UIView *editorPreviewBox;            // 圆盘实时预览容器（已添加 tab 顶部）
+@property (nonatomic, strong) UIView *otherSettingsBox;            // 「其他选项」折叠容器
+@property (nonatomic, assign) BOOL editorOtherExpanded;            // 其他选项当前展开？
+@property (nonatomic, strong) UILabel *editorRadiusValueLabel;     // 圆盘大小滑杆数值标签
+@property (nonatomic, strong) UIButton *editorRowApps;             // 一级行：应用管理
+@property (nonatomic, strong) UIButton *editorRowTrigger;          // 一级行：触发条
+@property (nonatomic, strong) UIButton *editorRowOther;            // 一级行：其他选项
+@property (nonatomic, strong) UIButton *editorBackButton;          // 二级页返回按钮
+@property (nonatomic, strong) UIButton *editorTabAddedButton;      // 分段按钮：已添加
+@property (nonatomic, strong) UIButton *editorTabAllButton;        // 分段按钮：未添加
 // 【0.3.22】触发条自调（用户 log31：触发条要能自己控制大小；且右侧屏幕中段也会呼出 ⇒ 容易误触）
 @property (nonatomic, strong) UIView *triggerPreviewView;      // 编辑器开着时的触发条高亮预览
 @property (nonatomic, strong) NSMutableArray<UILabel *> *triggerValueLabels;  // 三根滑杆的数值标签
@@ -1379,8 +1545,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 // 【0.6.8 用户指令】拖拽排序（长按提起 → 跟手换位 → 松手落位）
 - (void)onEditorOrderDrag:(UILongPressGestureRecognizer *)gesture;
 - (void)moveEditorOrderCellFromIndex:(NSUInteger)fromIndex toIndex:(NSUInteger)toIndex;
-// 【0.6.8 用户指令】设置区折叠
-- (void)layoutEditorContentAnimated:(BOOL)animated;
+// 【0.6.8 用户指令】设置区折叠（0.6.10 起布局走 layoutEditorMenuAnimated）
 - (void)onEditorSettingsToggle:(UIButton *)sender;
 // 【0.3.22】触发条几何自调（编辑器顶部滑杆，装进折叠容器）
 - (void)buildTriggerSettingsInPanel:(UIView *)panel top:(CGFloat)top;
@@ -1390,6 +1555,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected;
 - (void)refreshEditorCount;
 - (void)closeEditorSaving:(BOOL)saving;
+// 【0.6.10 用户指令】二级菜单 + 圆盘实时预览
+- (UIButton *)makeEditorMenuRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle;
+- (void)layoutEditorMenuAnimated:(BOOL)animated;
+- (void)layoutEditorAppsAnimated:(BOOL)animated;
+- (void)showEditorLevel2:(BOOL)level2;
+- (void)onEditorRowAppsTapped:(UIButton *)sender;
+- (void)onEditorBackTapped:(UIButton *)sender;
+- (void)onEditorTabChanged:(UIButton *)sender;
+- (void)onEditorOtherToggle:(UIButton *)sender;
+- (void)onEditorOtherSwitchChanged:(UISwitch *)switchView;
+- (void)onEditorRadiusSliderChanged:(UISlider *)slider;
+- (void)onEditorOrderStripTap:(UITapGestureRecognizer *)tap;
+- (void)relayoutEditorGridAnimated:(BOOL)animated;
+- (void)rebuildEditorRingPreview;
 @end
 
 #pragma mark - 容器（展开态）：点空白收起
@@ -2755,7 +2934,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self buildEditorPanelWithApps:apps];
 }
 
-/// 构建全屏编辑面板：标题 + 计数 + 网格（图标/名称/勾选角标）+「完成」。
+/// 构建全屏编辑面板（【0.6.10 用户指令】二级菜单版）：
+///   一级 = 三行菜单（应用管理 / 触发条 / 其他选项），保证主菜单简洁不满；
+///   二级「应用管理」= 已添加（圆盘实时预览 + 拖拽排序条）/ 未添加（网格点按加入）两个 tab；
+///   已添加排序时预览即时跟随 —— 所见即圆盘真实排布。
 - (void)buildEditorPanelWithApps:(NSArray<NSDictionary<NSString *, NSString *> *> *)apps {
     UIWindow *window = self.hostWindow;
     if (window == nil) {
@@ -2771,6 +2953,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         MFLog(@"[ring] !! 编辑器：宿主尺寸无效，放弃");
         return;
     }
+    self.editorApps = apps;
 
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, height)];
     panel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.87];
@@ -2781,26 +2964,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [(self.hostContainerView ?: window) addSubview:panel];
     self.editorPanel = panel;
 
-    // 【0.6.8 用户指令】顶栏一行化（简约）：标题 + 计数徽章 + 「触发条」折叠按钮 + 「完成」。
-    //   触发条自调区是低频操作，默认收起——首屏直接是排序条 + App 网格（快捷/效率）。
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 46.0, 150.0, 30.0)];
-    title.text = @"圆盘应用";
+    title.text = @"圆盘";
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont boldSystemFontOfSize:19.0];
     [panel addSubview:title];
-
-    UIButton *settingsToggle = [UIButton buttonWithType:UIButtonTypeCustom];
-    settingsToggle.frame = CGRectMake(width - 190.0, 44.0, 92.0, 34.0);
-    settingsToggle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
-    settingsToggle.layer.cornerRadius = 17.0;
-    settingsToggle.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
-    [settingsToggle setTitle:@"触发条 ▸" forState:UIControlStateNormal];
-    [settingsToggle setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [settingsToggle addTarget:self action:@selector(onEditorSettingsToggle:)
-             forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:settingsToggle];
-    self.editorSettingsToggle = settingsToggle;
-    self.editorSettingsExpanded = NO;
 
     UIButton *done = [UIButton buttonWithType:UIButtonTypeCustom];
     done.tag = MF_RING_EDITOR_DONE;
@@ -2813,25 +2981,145 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [done addTarget:self action:@selector(onEditorDone:) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:done];
 
-    UILabel *countLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 78.0, width - 36.0, 18.0)];
-    countLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
-    countLabel.font = [UIFont systemFontOfSize:11.5];
-    [panel addSubview:countLabel];
-    self.editorCountLabel = countLabel;
+    // ---- 一级菜单（0.6.10：只有三行，其余全收进二级页）----
+    UIView *menuBox = [[UIView alloc] initWithFrame:CGRectMake(0.0, 92.0, width, height - 92.0)];
+    menuBox.backgroundColor = [UIColor clearColor];
+    [panel addSubview:menuBox];
+    self.editorMenuBox = menuBox;
 
-    // 【0.6.8】触发条自调区（用户 log31）装进折叠容器：收起 = 不占首屏；展开 = 下方内容整体下移。
-    //   预览高亮也装进容器（收起时一并隐藏，几何用 convertRect 相对 superview 自动对齐）。
-    const CGFloat settingsTop = 100.0;
+    UIButton *rowApps = [self makeEditorMenuRowWithTitle:@"应用管理"
+                                                subtitle:@"添加应用 · 拖动排序 · 实时预览圆盘"];
+    [rowApps addTarget:self action:@selector(onEditorRowAppsTapped:)
+      forControlEvents:UIControlEventTouchUpInside];
+    [menuBox addSubview:rowApps];
+    self.editorRowApps = rowApps;
+
+    UIButton *rowTrigger = [self makeEditorMenuRowWithTitle:@"触发条"
+                                                   subtitle:@"长度 · 位置 · 呼出灵敏度"];
+    [rowTrigger addTarget:self action:@selector(onEditorSettingsToggle:)
+         forControlEvents:UIControlEventTouchUpInside];
+    [menuBox addSubview:rowTrigger];
+    self.editorRowTrigger = rowTrigger;
+
+    UIButton *rowOther = [self makeEditorMenuRowWithTitle:@"其他选项"
+                                                 subtitle:@"双指呼出 · 圆盘大小 · 图标抓取"];
+    [rowOther addTarget:self action:@selector(onEditorOtherToggle:)
+      forControlEvents:UIControlEventTouchUpInside];
+    [menuBox addSubview:rowOther];
+    self.editorRowOther = rowOther;
+
+    // 【0.6.8】触发条自调区：折叠容器改挂一级菜单盒（0.6.10 行号由 layoutEditorMenuAnimated 统一排）
     const CGFloat rowHeight = 32.0;
     const CGFloat settingsRows = 3.0;
     const CGFloat settingsBoxHeight = settingsRows * rowHeight + 20.0;   // 3 行滑杆 + 提示行
-    UIView *settingsBox = [[UIView alloc] initWithFrame:CGRectMake(0.0, settingsTop, width, settingsBoxHeight)];
+    UIView *settingsBox = [[UIView alloc] initWithFrame:CGRectMake(12.0, 0.0, width - 24.0, settingsBoxHeight)];
     settingsBox.hidden = YES;
     settingsBox.userInteractionEnabled = YES;
-    [panel addSubview:settingsBox];
+    [menuBox addSubview:settingsBox];
     self.triggerSettingsBox = settingsBox;
     [self buildTriggerSettingsInPanel:settingsBox top:0.0];
-    self.editorContentBaseTop = settingsTop;
+    self.editorSettingsExpanded = NO;
+
+    // 【0.6.10】其他选项折叠容器（默认收起）：双指呼出开关 / 圆盘大小滑杆 / 图标抓取开关
+    const CGFloat otherBoxHeight = 3.0 * 44.0 + 12.0;
+    UIView *otherBox = [[UIView alloc] initWithFrame:CGRectMake(12.0, 0.0, width - 24.0, otherBoxHeight)];
+    otherBox.hidden = YES;
+    otherBox.userInteractionEnabled = YES;
+    otherBox.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+    otherBox.layer.cornerRadius = 14.0;
+    [menuBox addSubview:otherBox];
+    self.otherSettingsBox = otherBox;
+
+    NSArray<NSString *> *switchTitles = @[ @"双指贴边呼出（全屏 App 内必中）", @"抓取真实应用图标" ];
+    NSArray<NSString *> *switchKeys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons" ];
+    for (NSUInteger index = 0; index < switchTitles.count; index++) {
+        CGFloat rowY = (CGFloat)index * 44.0 + 6.0;
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(16.0, rowY, otherBox.bounds.size.width - 96.0, 32.0)];
+        name.text = switchTitles[index];
+        name.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+        name.font = [UIFont systemFontOfSize:13.0];
+        [otherBox addSubview:name];
+        UISwitch *toggle = [[UISwitch alloc] initWithFrame:CGRectZero];
+        toggle.tag = (NSInteger)index + 1;
+        toggle.on = MFRingBool(switchKeys[index], YES);
+        toggle.onTintColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+        toggle.frame = CGRectMake(otherBox.bounds.size.width - 68.0, rowY + 0.5, 51.0, 31.0);
+        [toggle addTarget:self action:@selector(onEditorOtherSwitchChanged:)
+         forControlEvents:UIControlEventValueChanged];
+        [otherBox addSubview:toggle];
+    }
+    CGFloat radiusRowY = 2.0 * 44.0 + 6.0;
+    UILabel *radiusName = [[UILabel alloc] initWithFrame:CGRectMake(16.0, radiusRowY, 96.0, 32.0)];
+    radiusName.text = @"圆盘大小";
+    radiusName.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+    radiusName.font = [UIFont systemFontOfSize:13.0];
+    [otherBox addSubview:radiusName];
+    UISlider *radiusSlider = [[UISlider alloc] initWithFrame:CGRectMake(112.0, radiusRowY + 3.0,
+                                                                        otherBox.bounds.size.width - 200.0, 24.0)];
+    radiusSlider.minimumValue = 80.0;
+    radiusSlider.maximumValue = 240.0;
+    radiusSlider.value = (float)MAX(80.0, MFRingNumber(@"mfRingRadius", 150.0));
+    radiusSlider.minimumTrackTintColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+    [radiusSlider addTarget:self action:@selector(onEditorRadiusSliderChanged:)
+         forControlEvents:UIControlEventValueChanged];
+    [otherBox addSubview:radiusSlider];
+    UILabel *radiusValue = [[UILabel alloc] initWithFrame:CGRectMake(otherBox.bounds.size.width - 78.0, radiusRowY, 62.0, 32.0)];
+    radiusValue.textAlignment = NSTextAlignmentRight;
+    radiusValue.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    radiusValue.font = [UIFont systemFontOfSize:11.0];
+    radiusValue.text = [NSString stringWithFormat:@"%.0f pt", radiusSlider.value];
+    [otherBox addSubview:radiusValue];
+    self.editorRadiusValueLabel = radiusValue;
+    self.editorOtherExpanded = NO;
+
+    // ---- 二级页「应用管理」容器 ----
+    UIView *appsBox = [[UIView alloc] initWithFrame:CGRectMake(0.0, 92.0, width, height - 92.0)];
+    appsBox.hidden = YES;
+    appsBox.userInteractionEnabled = YES;
+    [panel addSubview:appsBox];
+    self.editorAppsBox = appsBox;
+
+    UIButton *back = [UIButton buttonWithType:UIButtonTypeCustom];
+    back.frame = CGRectMake(12.0, 6.0, 96.0, 36.0);
+    back.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+    back.layer.cornerRadius = 18.0;
+    back.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+    back.contentEdgeInsets = UIEdgeInsetsMake(0.0, 10.0, 0.0, 0.0);
+    back.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [back setTitle:@"‹ 返回" forState:UIControlStateNormal];
+    [back setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [back addTarget:self action:@selector(onEditorBackTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [appsBox addSubview:back];
+    self.editorBackButton = back;
+
+    UIButton *tabAdded = [UIButton buttonWithType:UIButtonTypeCustom];
+    tabAdded.layer.cornerRadius = 16.0;
+    tabAdded.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    [tabAdded addTarget:self action:@selector(onEditorTabChanged:) forControlEvents:UIControlEventTouchUpInside];
+    [appsBox addSubview:tabAdded];
+    self.editorTabAddedButton = tabAdded;
+
+    UIButton *tabAll = [UIButton buttonWithType:UIButtonTypeCustom];
+    tabAll.layer.cornerRadius = 16.0;
+    tabAll.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    [tabAll addTarget:self action:@selector(onEditorTabChanged:) forControlEvents:UIControlEventTouchUpInside];
+    [appsBox addSubview:tabAll];
+    self.editorTabAllButton = tabAll;
+    self.editorTabAdded = YES;
+
+    UILabel *countLabel = [[UILabel alloc] initWithFrame:CGRectMake(18.0, 48.0, width - 36.0, 18.0)];
+    countLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.72];
+    countLabel.font = [UIFont systemFontOfSize:11.5];
+    [appsBox addSubview:countLabel];
+    self.editorCountLabel = countLabel;
+
+    // 圆盘实时预览容器（已添加 tab 顶部；排序/增删时即时刷新 = 圆盘真实排布）
+    UIView *previewBox = [[UIView alloc] initWithFrame:CGRectZero];
+    previewBox.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+    previewBox.layer.cornerRadius = 16.0;
+    previewBox.userInteractionEnabled = NO;
+    [appsBox addSubview:previewBox];
+    self.editorPreviewBox = previewBox;
 
     // 【0.3.26】bundleID → 显示名（枚举时已取好，排序条 rebuild 时只查表，不再碰 SB 私有数据）
     NSMutableDictionary<NSString *, NSString *> *nameTable = [NSMutableDictionary dictionary];
@@ -2844,6 +3132,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
     // 【0.3.26 → 0.6.8 用户指令】「已添加」排序条：**长按拖拽排序**（跟手换位 + 让位动画 +
     //   边缘自动滚），◀ ▶ 逐格点击已删——简约且高效。
+    //   【0.6.10】排序条挂进二级页；快速点按格子 = 移出圆盘（长按仍是拖拽，互不干扰）。
     UIScrollView *orderScroll = [[UIScrollView alloc]
         initWithFrame:CGRectMake(0.0, 0.0, width, 104.0)];
     orderScroll.backgroundColor = [UIColor clearColor];
@@ -2856,19 +3145,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     drag.minimumPressDuration = 0.25;
     drag.allowableMovement = CGFLOAT_MAX;
     [orderScroll addGestureRecognizer:drag];
-    [panel addSubview:orderScroll];
+    UITapGestureRecognizer *stripTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onEditorOrderStripTap:)];
+    [orderScroll addGestureRecognizer:stripTap];
+    [appsBox addSubview:orderScroll];
     self.editorOrderScroll = orderScroll;
     [self rebuildEditorOrderStrip];   // 首次按 editorSelection 的顺序铺好（含真图标/首字母占位）
 
-    CGFloat scrollTop = CGRectGetMaxY(orderScroll.frame) + 6.0;
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, scrollTop, width, MAX(120.0, height - scrollTop))];
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, 400.0)];
     scroll.backgroundColor = [UIColor clearColor];
     scroll.opaque = NO;
     scroll.alwaysBounceVertical = YES;
     scroll.tag = MF_RING_EDITOR_SCROLL;
-    [panel addSubview:scroll];
+    [appsBox addSubview:scroll];
     self.editorScroll = scroll;
-    [self layoutEditorContentAnimated:NO];   // 【0.6.8】按折叠态统一排排序条/网格位置
 
     const NSUInteger columns = 4;
     const CGFloat sideInset = 8.0;
@@ -2938,12 +3228,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         [self applyEditorCellVisual:cell selected:[selection containsObject:bundleId]];
     }
 
-    NSUInteger rows = (apps.count + columns - 1) / columns;
-    scroll.contentSize = CGSizeMake(width, (CGFloat)rows * cellH + 24.0);
+    // 【0.6.10】未添加 tab = 只列未加入的 App（分类）；首帧统一布局（一级菜单 / 二级页 / 网格 / 预览）
+    [self relayoutEditorGridAnimated:NO];
+    [self layoutEditorMenuAnimated:NO];
+    [self layoutEditorAppsAnimated:NO];
+    [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 编辑器已打开：%lu 个 App / %lu 行 × %lu 列，当前已选 %lu 个",
-          (unsigned long)apps.count, (unsigned long)rows, (unsigned long)columns,
-          (unsigned long)selection.count);
+    MFLog(@"[ring] 0.6.10 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+          (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
     if (MFRingBool(@"mfRingFetchIcons", YES) && !gMFRingDegraded) {
@@ -3190,7 +3482,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self applyEditorCellVisual:button selected:selected];
     [self refreshEditorCount];
     // 【0.3.26】加入 = 追加到圆盘顺序末尾；移出 = 从顺序里删掉 ⇒ 排序条跟着重建
+    // 【0.6.10】排序条重建末尾会连带刷新圆盘实时预览；未添加 tab 网格即时重排
     [self rebuildEditorOrderStrip];
+    [self relayoutEditorGridAnimated:YES];
 }
 
 - (void)applyEditorCellVisual:(UIView *)cell selected:(BOOL)selected {
@@ -3292,6 +3586,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                    generation:self.editorIconGeneration];
     }
     MFLog(@"[ring] 排序条已重建：%lu 个（从左到右 = 圆盘顺序，长按拖动调整）", (unsigned long)ordered.count);
+    // 【0.6.10】实时预览跟随成员变化（排序拖拽的换位走 moveEditorOrderCellFromIndex 单独刷新）
+    [self rebuildEditorRingPreview];
 }
 
 /// 按数组顺序摆好每个格子（frame + 序号 + ◀▶ 可用状态）。
@@ -3479,6 +3775,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [cells insertObject:cell atIndex:toIndex];
     self.editorOrderDragIndex = toIndex;
     [self layoutEditorOrderCellsAnimated:YES];   // 拖拽中的格子被 layout 跳过（位置跟手）
+    // 【0.6.10】实时预览跟随换位 —— 排序时能看到圆盘真实排布即时变化
+    [self rebuildEditorRingPreview];
 }
 
 - (void)mfRingHapticLight {
@@ -3490,28 +3788,70 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
-#pragma mark - 【0.6.8 用户指令】编辑器设置折叠（简约：低频设置不占首屏）
+#pragma mark - 【0.6.10 用户指令】二级菜单 + 圆盘实时预览
 
-/// 统一内容布局：折叠态排序条从 100pt 起；展开态从设置区底（100+116）起。
-/// 网格 frame 跟随排序条底；一次排好，动画过渡。
-- (void)layoutEditorContentAnimated:(BOOL)animated {
-    UIView *panel = self.editorPanel;
-    if (panel == nil) {
+/// 一级菜单行工厂：左标题 + 灰副标题 + 右侧 ›，浅底圆角（保持菜单简洁不拥挤）。
+- (UIButton *)makeEditorMenuRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle {
+    UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
+    row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+    row.layer.cornerRadius = 14.0;
+    row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    row.titleEdgeInsets = UIEdgeInsetsMake(-14.0, 16.0, 0.0, 0.0);
+    [row setTitle:title forState:UIControlStateNormal];
+    [row setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    row.titleLabel.font = [UIFont boldSystemFontOfSize:16.0];
+
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 36.0, 240.0, 18.0)];
+    sub.text = subtitle;
+    sub.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    sub.font = [UIFont systemFontOfSize:12.0];
+    sub.userInteractionEnabled = NO;
+    [row addSubview:sub];
+
+    UILabel *chevron = [[UILabel alloc] initWithFrame:CGRectMake(0.0, 0.0, 26.0, 64.0)];
+    chevron.tag = MF_RING_EDITOR_ROW_CHEVRON;
+    chevron.text = @"›";
+    chevron.textColor = [UIColor colorWithWhite:1.0 alpha:0.4];
+    chevron.font = [UIFont boldSystemFontOfSize:20.0];
+    chevron.textAlignment = NSTextAlignmentCenter;
+    chevron.userInteractionEnabled = NO;
+    [row addSubview:chevron];
+    return row;
+}
+
+/// 一级菜单统一布局：三行 + 两个可展开区（触发条 / 其他选项），展开的行下方内容整体下移。
+- (void)layoutEditorMenuAnimated:(BOOL)animated {
+    UIView *box = self.editorMenuBox;
+    if (box == nil) {
         return;
     }
-    CGFloat width = CGRectGetWidth(panel.bounds);
-    CGFloat height = CGRectGetHeight(panel.bounds);
-    if (width <= 0.0 || height <= 0.0) {
+    CGFloat w = CGRectGetWidth(box.bounds);
+    if (w <= 0.0) {
         return;
-    }
-    CGFloat contentTop = self.editorContentBaseTop;
-    if (self.editorSettingsExpanded && self.triggerSettingsBox != nil) {
-        contentTop = CGRectGetMaxY(self.triggerSettingsBox.frame) + 14.0;
     }
     void (^layout)(void) = ^{
-        self.editorOrderScroll.frame = CGRectMake(0.0, contentTop, width, 104.0);
-        CGFloat gridTop = CGRectGetMaxY(self.editorOrderScroll.frame) + 6.0;
-        self.editorScroll.frame = CGRectMake(0.0, gridTop, width, MAX(120.0, height - gridTop));
+        CGFloat y = 10.0;
+        CGFloat rowW = w - 24.0;
+        self.editorRowApps.frame = CGRectMake(12.0, y, rowW, 64.0);
+        [(UILabel *)[self.editorRowApps viewWithTag:MF_RING_EDITOR_ROW_CHEVRON]
+            setFrame:CGRectMake(rowW - 40.0, 0.0, 26.0, 64.0)];
+        y += 72.0;
+        self.editorRowTrigger.frame = CGRectMake(12.0, y, rowW, 64.0);
+        [(UILabel *)[self.editorRowTrigger viewWithTag:MF_RING_EDITOR_ROW_CHEVRON]
+            setFrame:CGRectMake(rowW - 40.0, 0.0, 26.0, 64.0)];
+        y += 72.0;
+        if (self.editorSettingsExpanded && self.triggerSettingsBox != nil) {
+            self.triggerSettingsBox.frame = CGRectMake(12.0, y, rowW, CGRectGetHeight(self.triggerSettingsBox.frame));
+            y += CGRectGetHeight(self.triggerSettingsBox.frame) + 10.0;
+        }
+        self.editorRowOther.frame = CGRectMake(12.0, y, rowW, 64.0);
+        [(UILabel *)[self.editorRowOther viewWithTag:MF_RING_EDITOR_ROW_CHEVRON]
+            setFrame:CGRectMake(rowW - 40.0, 0.0, 26.0, 64.0)];
+        y += 72.0;
+        if (self.editorOtherExpanded && self.otherSettingsBox != nil) {
+            self.otherSettingsBox.frame = CGRectMake(12.0, y, rowW, CGRectGetHeight(self.otherSettingsBox.frame));
+            y += CGRectGetHeight(self.otherSettingsBox.frame) + 10.0;
+        }
     };
     if (animated) {
         [UIView animateWithDuration:0.26
@@ -3527,18 +3867,343 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
 }
 
-/// 「触发条」按钮：展开/收起设置区（含高亮预览），下方内容弹簧跟随。
+/// 二级页统一布局：返回/分段/计数行固定；已添加 = 预览 + 排序条；未添加 = 网格。
+- (void)layoutEditorAppsAnimated:(BOOL)animated {
+    UIView *box = self.editorAppsBox;
+    if (box == nil) {
+        return;
+    }
+    CGFloat w = CGRectGetWidth(box.bounds);
+    CGFloat h = CGRectGetHeight(box.bounds);
+    if (w <= 0.0 || h <= 0.0) {
+        return;
+    }
+    void (^layout)(void) = ^{
+        self.editorBackButton.frame = CGRectMake(12.0, 6.0, 96.0, 36.0);
+        CGFloat tabW = 108.0;
+        self.editorTabAddedButton.frame = CGRectMake(w - tabW * 2.0 - 26.0, 8.0, tabW, 32.0);
+        self.editorTabAllButton.frame = CGRectMake(w - tabW - 14.0, 8.0, tabW, 32.0);
+        self.editorCountLabel.frame = CGRectMake(18.0, 48.0, w - 36.0, 18.0);
+        CGFloat y = 72.0;
+        BOOL added = self.editorTabAdded;
+        self.editorPreviewBox.hidden = !added;
+        self.editorOrderScroll.hidden = !added;
+        self.editorScroll.hidden = added;
+        if (added) {
+            CGFloat ph = MIN(320.0, h - y - 104.0 - 40.0);
+            self.editorPreviewBox.frame = CGRectMake(10.0, y, w - 20.0, MAX(160.0, ph));
+            y = CGRectGetMaxY(self.editorPreviewBox.frame) + 8.0;
+            self.editorOrderScroll.frame = CGRectMake(0.0, y, w, 104.0);
+        } else {
+            self.editorScroll.frame = CGRectMake(0.0, y, w, MAX(120.0, h - y));
+        }
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.26
+                              delay:0.0
+             usingSpringWithDamping:0.85
+              initialSpringVelocity:0.3
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState)
+                         animations:layout
+                         completion:nil];
+    } else {
+        layout();
+    }
+    [self refreshEditorTabVisual];
+}
+
+/// 一级 ↔ 二级 页面切换（淡入淡出 + 轻位移）。
+- (void)showEditorLevel2:(BOOL)level2 {
+    if (self.editorLevel2Visible == level2 || self.editorMenuBox == nil || self.editorAppsBox == nil) {
+        return;
+    }
+    self.editorLevel2Visible = level2;
+    if (level2) {
+        self.editorTabAdded = YES;   // 每次进二级页都落在「已添加」（排序是高频操作）
+        [self layoutEditorAppsAnimated:NO];
+        [self relayoutEditorGridAnimated:NO];
+        [self rebuildEditorRingPreview];
+    }
+    self.editorMenuBox.hidden = NO;
+    self.editorAppsBox.hidden = NO;
+    self.editorMenuBox.transform = CGAffineTransformIdentity;
+    self.editorAppsBox.transform = CGAffineTransformMakeTranslation(level2 ? -24.0 : 0.0, 0.0);
+    self.editorAppsBox.alpha = level2 ? 0.0 : 1.0;
+    [UIView animateWithDuration:0.24
+                          delay:0.0
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        self.editorMenuBox.alpha = level2 ? 0.0 : 1.0;
+        self.editorMenuBox.transform = CGAffineTransformMakeTranslation(level2 ? -24.0 : 0.0, 0.0);
+        self.editorAppsBox.alpha = level2 ? 1.0 : 0.0;
+        self.editorAppsBox.transform = CGAffineTransformIdentity;
+    } completion:^(__unused BOOL finished) {
+        self.editorMenuBox.hidden = level2;
+        self.editorAppsBox.hidden = !level2;
+        self.editorMenuBox.transform = CGAffineTransformIdentity;
+        self.editorAppsBox.transform = CGAffineTransformIdentity;
+    }];
+    MFLog(@"[ring] 编辑器切到%@", level2 ? @"二级页（应用管理）" : @"一级菜单");
+}
+
+- (void)onEditorRowAppsTapped:(UIButton *)sender {
+    (void)sender;
+    [self showEditorLevel2:YES];
+}
+
+- (void)onEditorBackTapped:(UIButton *)sender {
+    (void)sender;
+    [self showEditorLevel2:NO];
+}
+
+- (void)onEditorTabChanged:(UIButton *)sender {
+    BOOL added = (sender == self.editorTabAddedButton);
+    if (self.editorTabAdded == added) {
+        return;
+    }
+    self.editorTabAdded = added;
+    [self layoutEditorAppsAnimated:YES];
+    if (!added) {
+        [self relayoutEditorGridAnimated:NO];
+    }
+    MFLog(@"[ring] 应用管理切到 %@", added ? @"已添加" : @"未添加");
+}
+
+- (void)refreshEditorTabVisual {
+    BOOL added = self.editorTabAdded;
+    UIColor *active = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+    UIColor *idle = [UIColor colorWithWhite:1.0 alpha:0.12];
+    self.editorTabAddedButton.backgroundColor = added ? active : idle;
+    self.editorTabAllButton.backgroundColor = added ? idle : active;
+}
+
+/// 「其他选项」行：展开/收起（开关 + 圆盘大小滑杆）。
+- (void)onEditorOtherToggle:(UIButton *)sender {
+    BOOL expand = !self.editorOtherExpanded;
+    self.editorOtherExpanded = expand;
+    self.otherSettingsBox.hidden = NO;
+    sender.backgroundColor = [UIColor colorWithWhite:1.0 alpha:expand ? 0.16 : 0.06];
+    [self layoutEditorMenuAnimated:YES];
+    [UIView animateWithDuration:0.26
+                          delay:0.0
+         usingSpringWithDamping:0.85
+          initialSpringVelocity:0.3
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{
+        self.otherSettingsBox.alpha = expand ? 1.0 : 0.0;
+    } completion:^(__unused BOOL finished) {
+        if (!expand) {
+            self.otherSettingsBox.hidden = YES;
+        }
+    }];
+    MFLog(@"[ring] 其他选项：%@", expand ? @"展开" : @"收起");
+}
+
+/// 其他选项开关：tag 1 = 双指贴边呼出（重启 SpringBoard 生效）；tag 2 = 抓取真实图标（下次打开生效）。
+- (void)onEditorOtherSwitchChanged:(UISwitch *)switchView {
+    NSString *key = (switchView.tag == 1) ? @"mfRingTwoFingerSummon" : @"mfRingFetchIcons";
+    [MFRingDefaults() setObject:@(switchView.on) forKey:key];
+    [MFRingDefaults() synchronize];
+    MFLog(@"[ring] 其他选项：%@ -> %@（%@）",
+          key,
+          switchView.on ? @"开" : @"关",
+          switchView.tag == 1 ? @"重启 SpringBoard 后生效" : @"下次打开编辑器/呼出生效");
+}
+
+/// 圆盘大小滑杆（mfRingRadius）：下次呼出即生效（呼出时按配置半径重算几何）。
+- (void)onEditorRadiusSliderChanged:(UISlider *)slider {
+    MFRingSetNumber(@"mfRingRadius", slider.value);
+    self.editorRadiusValueLabel.text = [NSString stringWithFormat:@"%.0f pt", slider.value];
+    MFLog(@"[ring] 圆盘大小 -> %.0f pt（下次呼出生效）", slider.value);
+}
+
+/// 【0.6.10】已添加 tab：快速点按排序条格子 = 移出圆盘（长按仍是拖拽排序，互不干扰）。
+- (void)onEditorOrderStripTap:(UITapGestureRecognizer *)tap {
+    if (self.editorOrderDraggingCell != nil) {
+        return;   // 拖拽中不响应点按
+    }
+    UIScrollView *strip = self.editorOrderScroll;
+    if (strip == nil || self.editorOrderCells.count == 0) {
+        return;
+    }
+    CGFloat contentX = [tap locationInView:strip].x + strip.contentOffset.x;
+    UIView *hit = nil;
+    for (UIView *cell in self.editorOrderCells) {
+        if (contentX >= CGRectGetMinX(cell.frame) && contentX <= CGRectGetMaxX(cell.frame)) {
+            hit = cell;
+            break;
+        }
+    }
+    if (hit == nil) {
+        return;
+    }
+    NSString *bundleId = objc_getAssociatedObject(hit, &kMFRingBundleIdKey);
+    if (![bundleId isKindOfClass:[NSString class]] || bundleId.length == 0) {
+        return;
+    }
+    NSMutableOrderedSet<NSString *> *selection = self.editorSelection;
+    if (selection == nil || ![selection containsObject:bundleId]) {
+        return;
+    }
+    [selection removeObject:bundleId];
+    [self mfRingHapticLight];
+    MFLog(@"[ring] 点按排序条移出 %@（剩 %lu）", bundleId, (unsigned long)selection.count);
+    [self rebuildEditorOrderStrip];   // 末尾会连带刷新预览
+    [self relayoutEditorGridAnimated:YES];
+    [self refreshEditorCount];
+}
+
+/// 【0.6.10】未添加 tab 网格重排：只显示未加入的 App（加入/移出后即时重排 + 动画）。
+- (void)relayoutEditorGridAnimated:(BOOL)animated {
+    UIScrollView *scroll = self.editorScroll;
+    if (scroll == nil || self.editorCells == nil) {
+        return;
+    }
+    CGFloat w = CGRectGetWidth(scroll.bounds);
+    if (w <= 0.0) {
+        w = CGRectGetWidth(self.editorPanel.bounds);
+    }
+    if (w <= 0.0) {
+        return;
+    }
+    NSMutableSet<NSString *> *selected = [NSMutableSet setWithArray:self.editorSelection.array];
+    NSMutableArray<UIView *> *visible = [NSMutableArray array];
+    for (UIView *cell in self.editorCells) {
+        NSString *bundleId = objc_getAssociatedObject(cell, &kMFRingBundleIdKey);
+        BOOL isSelected = [selected containsObject:bundleId];
+        cell.hidden = isSelected;   // 未添加 tab 只列未加入的
+        if (!isSelected) {
+            [visible addObject:cell];
+        }
+    }
+    const NSUInteger columns = 4;
+    const CGFloat sideInset = 8.0;
+    const CGFloat cellW = floor((w - sideInset * 2.0) / (CGFloat)columns);
+    const CGFloat cellH = 100.0;
+    void (^layout)(void) = ^{
+        NSUInteger column = 0;
+        NSUInteger row = 0;
+        for (UIView *cell in visible) {
+            cell.frame = CGRectMake(sideInset + column * cellW, row * cellH, cellW, cellH);
+            column++;
+            if (column >= columns) {
+                column = 0;
+                row++;
+            }
+        }
+        NSUInteger totalRows = row + (column > 0 ? 1 : 0);
+        scroll.contentSize = CGSizeMake(w, (CGFloat)MAX(totalRows, 1) * cellH + 24.0);
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.18
+                              delay:0.0
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:layout
+                         completion:nil];
+    } else {
+        layout();
+    }
+}
+
+/// 【0.6.10】圆盘实时预览：按「呼出布局同一套算法」把当前已选顺序画成小圆盘。
+/// 排序拖拽 / 加减成员后即时刷新 —— 所见即圆盘真实排布；拖拽中的 App 蓝框高亮。
+- (void)rebuildEditorRingPreview {
+    UIView *box = self.editorPreviewBox;
+    if (box == nil) {
+        return;
+    }
+    for (UIView *view in [box.subviews copy]) {
+        [view removeFromSuperview];
+    }
+    CGRect bounds = box.bounds;
+    CGFloat w = CGRectGetWidth(bounds);
+    CGFloat h = CGRectGetHeight(bounds);
+    if (w <= 0.0 || h <= 0.0) {
+        return;
+    }
+    NSArray<NSString *> *ordered = self.editorSelection.array;
+    if (ordered.count == 0) {
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16.0, 0.0, w - 32.0, h)];
+        hint.text = @"圆盘还没有应用\n去「未添加」里点图标加入";
+        hint.textAlignment = NSTextAlignmentCenter;
+        hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.45];
+        hint.font = [UIFont systemFontOfSize:14.0];
+        hint.numberOfLines = 0;
+        [box addSubview:hint];
+        return;
+    }
+    CGRect hostBounds = self.hostBounds;
+    if (CGRectIsEmpty(hostBounds) && self.hostWindow != nil) {
+        hostBounds = self.hostWindow.bounds;
+    }
+    if (CGRectIsEmpty(hostBounds)) {
+        return;
+    }
+    MFRingGeometry geo = MFRingComputeGeometry(hostBounds, ordered.count);
+    MFRingSlotPos slots[MF_RING_EDITOR_MAX_APPS];
+    NSUInteger placed = MFRingComputeRingSlots(hostBounds, ordered.count, 0.0, slots, MF_RING_EDITOR_MAX_APPS);
+    CGFloat factor = MIN(w, h) / (2.0 * geo.extent) * 0.96;
+    CGPoint center = CGPointMake(w / 2.0, h / 2.0);
+
+    CGFloat dialR = geo.dialRadius * factor;
+    UIView *dial = [[UIView alloc] initWithFrame:CGRectMake(center.x - dialR, center.y - dialR,
+                                                            dialR * 2.0, dialR * 2.0)];
+    dial.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.85];
+    dial.layer.cornerRadius = dialR;
+    [box addSubview:dial];
+
+    NSString *draggingId = objc_getAssociatedObject(self.editorOrderDraggingCell, &kMFRingBundleIdKey);
+    CGFloat iconSize = geo.iconSize * factor;
+    for (NSUInteger index = 0; index < placed && index < ordered.count; index++) {
+        NSString *bundleId = ordered[index];
+        CGFloat angle = slots[index].angleDegrees * M_PI / 180.0;
+        CGFloat radius = slots[index].radius * factor;
+        UIImageView *iconView = [[UIImageView alloc]
+            initWithFrame:CGRectMake(center.x + radius * cos(angle) - iconSize / 2.0,
+                                     center.y + radius * sin(angle) - iconSize / 2.0,
+                                     iconSize, iconSize)];
+        UIImage *image = MFRingIconForBundleId(bundleId);
+        iconView.image = image;
+        iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+        iconView.layer.cornerRadius = iconSize / 2.0;
+        iconView.layer.masksToBounds = YES;
+        iconView.contentMode = UIViewContentModeScaleAspectFit;
+        if (draggingId != nil && [draggingId isEqualToString:bundleId]) {
+            iconView.layer.borderColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0].CGColor;
+            iconView.layer.borderWidth = 2.0;
+        } else {
+            iconView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+            iconView.layer.borderWidth = 1.0;
+        }
+        if (image == nil) {
+            UILabel *placeholder = [[UILabel alloc] initWithFrame:iconView.bounds];
+            placeholder.text = (bundleId.length > 0)
+                ? [[bundleId lastPathComponent] substringToIndex:1].uppercaseString : @"?";
+            placeholder.textAlignment = NSTextAlignmentCenter;
+            placeholder.textColor = [UIColor whiteColor];
+            placeholder.font = [UIFont boldSystemFontOfSize:iconSize * 0.4];
+            [iconView addSubview:placeholder];
+        }
+        [box addSubview:iconView];
+    }
+}
+
+/// 「触发条」行：展开/收起设置区（含高亮预览），行高亮跟随。
 - (void)onEditorSettingsToggle:(UIButton *)sender {
     BOOL expand = !self.editorSettingsExpanded;
     self.editorSettingsExpanded = expand;
     self.triggerSettingsBox.hidden = NO;   // 展开动画需要先可见（收起在动画完成块里藏）
-    [sender setTitle:(expand ? @"触发条 ▾" : @"触发条 ▸") forState:UIControlStateNormal];
-    sender.backgroundColor = [UIColor colorWithWhite:1.0 alpha:expand ? 0.26 : 0.14];
+    sender.backgroundColor = [UIColor colorWithWhite:1.0 alpha:expand ? 0.16 : 0.06];
     if (expand) {
         self.triggerSettingsBox.alpha = 0.0;
         [self refreshTriggerGeometryAfterPrefsChange];   // 展开时刷新预览位置/数值
     }
-    [self layoutEditorContentAnimated:YES];
+    [self layoutEditorMenuAnimated:YES];
     [UIView animateWithDuration:0.26
                           delay:0.0
          usingSpringWithDamping:0.85
@@ -3557,12 +4222,26 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 - (void)refreshEditorCount {
     UILabel *label = self.editorCountLabel;
+    NSUInteger selectedCount = self.editorSelection.count;
+    NSUInteger total = self.editorApps.count;
+    if (self.editorTabAddedButton != nil) {
+        [self.editorTabAddedButton setTitle:[NSString stringWithFormat:@"已添加 %lu",
+                                             (unsigned long)selectedCount]
+                                   forState:UIControlStateNormal];
+        [self.editorTabAddedButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    }
+    if (self.editorTabAllButton != nil) {
+        [self.editorTabAllButton setTitle:[NSString stringWithFormat:@"未添加 %lu",
+                                           (unsigned long)(total > selectedCount ? total - selectedCount : 0)]
+                                 forState:UIControlStateNormal];
+        [self.editorTabAllButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    }
     if (label == nil) {
         return;
     }
     label.text = [NSString stringWithFormat:
-                  @"已选 %lu 个（最多 %lu 个）· 点图标加入/移出 · 长按顶部条拖动排序",
-                  (unsigned long)self.editorSelection.count, (unsigned long)MFRingMaxIcons()];
+                  @"已选 %lu / %lu（上限 %lu）· 已添加页点图标移出 · 未添加页点图标加入",
+                  (unsigned long)selectedCount, (unsigned long)total, (unsigned long)MFRingMaxIcons()];
 }
 
 - (void)onEditorDone:(UIButton *)sender {
@@ -3596,6 +4275,21 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorOrderScroll = nil;
     self.editorOrderCells = nil;
     self.editorAppNames = nil;
+    self.editorApps = nil;            // 【0.6.10】二级页数据源随面板一起收
+    self.editorMenuBox = nil;
+    self.editorAppsBox = nil;
+    self.editorLevel2Visible = NO;
+    self.editorTabAdded = YES;
+    self.editorPreviewBox = nil;
+    self.otherSettingsBox = nil;
+    self.editorOtherExpanded = NO;
+    self.editorRowApps = nil;
+    self.editorRowTrigger = nil;
+    self.editorRowOther = nil;
+    self.editorBackButton = nil;
+    self.editorTabAddedButton = nil;
+    self.editorTabAllButton = nil;
+    self.editorRadiusValueLabel = nil;
     self.triggerPreviewView = nil;    // 【0.3.22】触发条预览随面板一起收
     self.triggerValueLabels = nil;
     [panel removeFromSuperview];
@@ -4294,7 +4988,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.9 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.10 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
