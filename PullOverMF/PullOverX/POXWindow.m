@@ -422,6 +422,12 @@ static CGAffineTransform POOrientationTransform(UIInterfaceOrientation orientati
     if (ringView != nil) {
         return ringView;
     }
+    // 【MF 0.6.0】侧边停靠条贴片：挂在窗口本体上（面板关闭时 root view alpha=0，不能挂 self.view），
+    // 命中优先于控制器路由——面板关着也要能点贴片换窗。
+    UIView *stripView = [controller dockStripHitTestViewForWindowPoint:point];
+    if (stripView != nil) {
+        return stripView;
+    }
     return [controller interactiveViewForWindowPoint:point event:event];
 }
 

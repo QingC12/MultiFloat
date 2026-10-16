@@ -35,6 +35,10 @@
 
 - (UIView *)interactiveViewForWindowPoint:(CGPoint)point event:(UIEvent *)event;
 
+// 【MF 0.6.0】侧边停靠条（多贴片小窗）：POXWindow 命中路由用
+-(NSUInteger)dockStripTileCount;
+-(UIView *)dockStripHitTestViewForWindowPoint:(CGPoint)point;
+
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIScrollView *handleScrollView;
 @property (nonatomic, strong) POHandle *handle;

@@ -90,6 +90,16 @@
 #define MF_CARD_DOCK_MIN_WIDTH 91.0
 #define MF_CARD_DOCK_MAX_WIDTH_RATIO 0.42        // 小窗最宽不超过屏宽 42%（本机 430 → 180）
 #define MF_CARD_DOCK_MAX_HEIGHT_RATIO 0.46       // 小窗最高不超过屏高 46%（本机 932 → 429）
+
+// ===== 【MF 0.6.0】侧边停靠条（多贴片小窗 · 快照制）=====
+// 用户目标：屏幕侧面吸附停靠 3~5 个悬浮小窗 + 一个主悬浮窗；点贴片 = 该 App 显示到主窗，
+// 同时主窗自动吸附入条。实现 = 每窗一张「内容快照 + 图标」贴片挂在 POXWindow 上
+// （同一时刻只有一个活跃 scene → ContextHostManager 单会话零改动，回归风险最小；
+//   0.7 计划把贴片升级为实时多 Scene）。
+#define MF_DOCK_STRIP_MAX 5                      // 停靠条容量（用户口径 3~5 个，超出淘汰最旧）
+#define MF_DOCK_STRIP_TILE_W 62.0                // 贴片宽（9:16 → 高 110；5 片 + 4 缝隙 ≈ 582 < 屏高 932）
+#define MF_DOCK_STRIP_TILE_GAP 8.0               // 贴片纵向间距
+#define MF_DOCK_STRIP_EDGE_INSET 4.0             // 贴片距屏幕边缘
 #define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部移动热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12    // 左侧点击热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13   // 右侧点击热区带
@@ -274,6 +284,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 }
 @end
 
+#pragma mark - 【MF 0.6.0】停靠条贴片模型
+
+/// 停靠条里的一张贴片 = 一个被停靠的 App（快照制）。
+@interface PODockedWindow : NSObject
+@property (nonatomic, copy) NSString *bundleId;
+@property (nonatomic, strong) UIImage *iconImage;      // App 图标（POApplicationHelper）
+@property (nonatomic, strong) UIImage *snapshotImage;  // 停靠瞬间的内容快照（可 nil → 贴片退化为图标）
+@property (nonatomic, assign) CGRect savedFrame;       // 停靠前的内容坐标 frame（点贴片还原用）
+@property (nonatomic, assign) CGFloat savedScale;      // 停靠前的缩放档位
+@property (nonatomic, assign) NSInteger side;          // 1=右条 -1=左条
+@property (nonatomic, strong) UIView *tileView;        // 反向引用（重排/移除用）
+@end
+@implementation PODockedWindow
+@end
+
 @interface PullOverViewController ()<POHostSessionControllerDelegate, UIGestureRecognizerDelegate>{
     NSString *pinnedBundleId;
     UIView *contextView;
@@ -363,6 +388,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfDockedTapView;            // 【0.3.21】停靠态盖在小窗上的透明层：单击=还原停靠前尺寸，拖动=移动小窗
     NSInteger mfEdgeDragMode;           // 0=无 1=自由移动 2=滑动缩放
     NSInteger mfDockedSide;             // 【0.3.20】停靠边：0=未停靠 −1=停靠左 1=停靠右（"再点同侧=还原"只认它）
+    NSMutableArray<PODockedWindow *> *mfDockStripLeft;    // 【0.6.0】左停靠条贴片集合（快照制）
+    NSMutableArray<PODockedWindow *> *mfDockStripRight;   // 【0.6.0】右停靠条贴片集合（快照制）
+    UIView *mfDockStripViewLeft;        // 【0.6.0】左条容器（挂 POXWindow，不挂 self.view——面板关闭时 root view alpha=0）
+    UIView *mfDockStripViewRight;       // 【0.6.0】右条容器（同上）
+    NSUInteger mfStripRestoreGeneration; // 【0.6.0】贴片还原 frame 的代次（dispatch_after 防串扰）
+    PODockedWindow *mfStripPendingRestore; // 【0.6.0】等待开完还原 frame 的贴片
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -433,6 +464,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 -(void)resetAutoNubTimerWithMinimumDelay:(NSTimeInterval)minimumDelay;
 
 @end
+
+#pragma mark - 【MF 0.6.0】停靠条贴片模型（声明见文件头，此处不再重复）
 
 @implementation PullOverViewController
 @synthesize scrollView, handleScrollView;
@@ -988,13 +1021,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠左侧", p.x);
-        [self mfSnapCardToSide:NO];
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.0 贴片制）", p.x);
+        [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠右侧", p.x);
-        [self mfSnapCardToSide:YES];
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.0 贴片制）", p.x);
+        [self mfDockCardToStrip:YES];
         return;
     }
     MFLog(@"[card] 空白点击（屏 %.0f,%.0f）→ 未分类，忽略", p.x, p.y);
@@ -3107,7 +3140,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.5.1 卡外热区带已安装（左右=停靠 底=拖动移动 右下角+左下角=缩放 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.6.0 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3869,8 +3902,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d", toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow]);
-    [self mfSnapCardToSide:toRight];
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.0 贴片制）",
+          toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
+    [self mfDockCardToStrip:toRight];
 }
 
 /// 【0.3.22 重做（log31 用户指令）+ 0.3.23 改比例（log32）】侧边停靠 = **固定 9:16 小窗**贴该侧屏幕边缘：
@@ -3947,6 +3981,333 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self mfApplyDockedCardFrame:fix animated:NO];
         }
     });
+}
+
+#pragma mark - 【MF 0.6.0】侧边停靠条（多贴片小窗 · 快照制）
+
+-(NSMutableArray<PODockedWindow *> *)mfDockStripItemsForSide:(BOOL)toRight{
+    NSMutableArray *items = toRight ? mfDockStripRight : mfDockStripLeft;
+    if (!items) {
+        items = [NSMutableArray array];
+        if (toRight) {
+            mfDockStripRight = items;
+        } else {
+            mfDockStripLeft = items;
+        }
+    }
+    return items;
+}
+
+-(NSUInteger)dockStripTileCount{
+    return (mfDockStripLeft ? mfDockStripLeft.count : 0) +
+        (mfDockStripRight ? mfDockStripRight.count : 0);
+}
+
+/// 卡片内容快照（贴片用）：复用转换过渡同款 captureSnapshotImageForActiveBundleId:
+/// （真机验证过的宿主 scene 截图路；drawViewHierarchy 抓不到跨进程远程图层）。
+-(UIImage *)mfCaptureCardContentSnapshotForBundleId:(NSString *)bundleId{
+    if (bundleId.length == 0) {
+        return nil;
+    }
+    UIImage *image = nil;
+    @try {
+        image = [[ContextHostManager sharedInstance]
+            captureSnapshotImageForActiveBundleId:bundleId];
+    } @catch (__unused NSException *exception) {
+        image = nil;
+    }
+    return image;
+}
+
+/// 主窗停靠 = 快照入停靠条并关闭主窗（App 进程保留在后台，点贴片重开走快开链路）。
+-(void)mfDockCardToStrip:(BOOL)toRight{
+    if (panelState != POPanelStateOpen || [self isPanelTransitioning]) {
+        MFLog(@"[strip] 停靠请求被拒（panelState=%lu 过渡中=%d）",
+              (unsigned long)panelState, (int)[self isPanelTransitioning]);
+        return;
+    }
+    NSString *bid = hostSession.activeBundleId ?: pinnedBundleId;
+    if (bid.length == 0) {
+        MFLog(@"[strip] 停靠请求被拒（无活跃 App）");
+        return;
+    }
+    PODockedWindow *w = [PODockedWindow new];
+    w.bundleId = [bid copy];
+    w.iconImage = [POApplicationHelper imageForBundleId:bid];
+    w.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:bid];
+    w.savedFrame = keyboardZoomBaseFrame;
+    w.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+    w.side = toRight ? 1 : -1;
+    MFLog(@"[strip] 主窗停靠：%@ 快照%@ → %@侧（停靠前 scale %.2f）", bid,
+          w.snapshotImage ? @"成功" : @"失败（贴片退化为图标）",
+          toRight ? @"右" : @"左", w.savedScale);
+    [self mfDockStripAddWindow:w];
+    [self mfDockStripRebuildAnimated:YES];
+    [self close];   // 复用现成关闭动画；App 进程留后台，还原走 pinApp 快开
+}
+
+-(void)mfDockStripAddWindow:(PODockedWindow *)w{
+    if (!w || w.bundleId.length == 0) {
+        return;
+    }
+    [self mfDockStripRemoveWindowForBundleId:w.bundleId animated:NO];   // 同 App 去重
+    NSMutableArray *items = [self mfDockStripItemsForSide:w.side >= 0];
+    while (items.count >= MF_DOCK_STRIP_MAX) {
+        PODockedWindow *oldest = items.firstObject;
+        MFLog(@"[strip] 停靠条已满（%lu/​%d）→ 淘汰最旧贴片 %@",
+              (unsigned long)items.count, MF_DOCK_STRIP_MAX, oldest.bundleId);
+        [self mfDockStripDropWindow:oldest animated:NO];
+    }
+    [items addObject:w];
+    MFLog(@"[strip] 入条：%@ → %@侧（%lu 片）", w.bundleId,
+          w.side >= 0 ? @"右" : @"左", (unsigned long)items.count);
+}
+
+-(void)mfDockStripDropWindow:(PODockedWindow *)w animated:(BOOL)animated{
+    if (!w) {
+        return;
+    }
+    [[self mfDockStripItemsForSide:w.side >= 0] removeObject:w];
+    UIView *tile = w.tileView;
+    w.tileView = nil;
+    if (tile) {
+        if (animated) {
+            [UIView animateWithDuration:0.22
+                             animations:^{
+                tile.alpha = 0;
+                tile.transform = CGAffineTransformMakeScale(0.55, 0.55);
+            } completion:^(BOOL finished) {
+                [tile removeFromSuperview];
+            }];
+        } else {
+            [tile removeFromSuperview];
+        }
+    }
+    [self mfDockStripRebuildAnimated:animated];
+}
+
+-(void)mfDockStripRemoveWindowForBundleId:(NSString *)bundleId animated:(BOOL)animated{
+    if (bundleId.length == 0) {
+        return;
+    }
+    PODockedWindow *hit = nil;
+    for (PODockedWindow *w in mfDockStripLeft) {
+        if ([w.bundleId isEqualToString:bundleId]) { hit = w; break; }
+    }
+    if (!hit) {
+        for (PODockedWindow *w in mfDockStripRight) {
+            if ([w.bundleId isEqualToString:bundleId]) { hit = w; break; }
+        }
+    }
+    if (hit) {
+        MFLog(@"[strip] 移除贴片 %@（同 App 已被打开）", bundleId);
+        [self mfDockStripDropWindow:hit animated:animated];
+    }
+}
+
+-(PODockedWindow *)mfDockStripWindowForTileView:(UIView *)tileView{
+    for (PODockedWindow *w in mfDockStripLeft) {
+        if (w.tileView == tileView) { return w; }
+    }
+    for (PODockedWindow *w in mfDockStripRight) {
+        if (w.tileView == tileView) { return w; }
+    }
+    return nil;
+}
+
+-(UIView *)mfDockStripTileForWindow:(PODockedWindow *)w{
+    CGFloat tileH = MF_DOCK_STRIP_TILE_W * 16.0 / 9.0;
+    UIView *tile = [[UIView alloc] initWithFrame:CGRectMake(0, 0, MF_DOCK_STRIP_TILE_W, tileH)];
+    tile.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.94];
+    tile.layer.cornerRadius = 12.0;
+    tile.layer.masksToBounds = YES;
+    tile.layer.borderWidth = 1.0;
+    tile.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+    UIImageView *snapView = [[UIImageView alloc] initWithFrame:tile.bounds];
+    snapView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    snapView.contentMode = UIViewContentModeScaleAspectFill;
+    snapView.clipsToBounds = YES;
+    snapView.image = w.snapshotImage;
+    [tile addSubview:snapView];
+    BOOL iconOnly = (w.snapshotImage == nil);
+    CGFloat iconSize = iconOnly ? 30.0 : 20.0;
+    UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake(
+        (MF_DOCK_STRIP_TILE_W - iconSize) / 2.0,
+        iconOnly ? (tileH - iconSize) / 2.0 : 4.0,
+        iconSize, iconSize)];
+    iconView.image = w.iconImage;
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.65];
+    iconView.layer.cornerRadius = 6.0;
+    iconView.layer.masksToBounds = YES;
+    [tile addSubview:iconView];
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(mfDockStripTileTapped:)];
+    [tile addGestureRecognizer:tap];
+    UILongPressGestureRecognizer *longPress =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(mfDockStripTileLongPressed:)];
+    [tile addGestureRecognizer:longPress];
+    return tile;
+}
+
+/// 重建/重排某一侧的条与贴片。容器挂 **POXWindow**（root view 关面板时 alpha=0，不能挂 self.view）。
+-(void)mfDockStripRebuildSide:(BOOL)toRight animated:(BOOL)animated inWindow:(UIWindow *)hostWindow{
+    NSMutableArray *items = [self mfDockStripItemsForSide:toRight];
+    UIView **containerPtr = toRight ? &mfDockStripViewRight : &mfDockStripViewLeft;
+    if (items.count == 0) {
+        if (*containerPtr) {
+            [*containerPtr removeFromSuperview];
+            *containerPtr = nil;
+        }
+        return;
+    }
+    CGFloat tileH = MF_DOCK_STRIP_TILE_W * 16.0 / 9.0;
+    CGFloat totalH = items.count * tileH + (items.count - 1) * MF_DOCK_STRIP_TILE_GAP;
+    CGFloat screenW = CGRectGetWidth(hostWindow.bounds);
+    CGFloat screenH = CGRectGetHeight(hostWindow.bounds);
+    CGFloat x = toRight ? (screenW - MF_DOCK_STRIP_TILE_W - MF_DOCK_STRIP_EDGE_INSET)
+                        : MF_DOCK_STRIP_EDGE_INSET;
+    CGFloat y = MAX(MF_DOCK_STRIP_EDGE_INSET, (screenH - totalH) / 2.0);
+    UIView *container = *containerPtr;
+    if (!container) {
+        container = [[UIView alloc] initWithFrame:CGRectMake(x, y, MF_DOCK_STRIP_TILE_W, totalH)];
+        container.backgroundColor = [UIColor clearColor];
+        container.userInteractionEnabled = YES;
+        [hostWindow addSubview:container];
+        *containerPtr = container;
+        MFLog(@"[strip] %@侧停靠条已安装（%.0fx%.0f @ (%.0f,%.0f)）",
+              toRight ? @"右" : @"左", MF_DOCK_STRIP_TILE_W, totalH, x, y);
+    }
+    container.frame = CGRectMake(x, y, MF_DOCK_STRIP_TILE_W, totalH);
+    container.hidden = NO;
+    for (NSUInteger i = 0; i < items.count; i++) {
+        PODockedWindow *w = items[i];
+        CGRect frame = CGRectMake(0, i * (tileH + MF_DOCK_STRIP_TILE_GAP),
+                                  MF_DOCK_STRIP_TILE_W, tileH);
+        if (!w.tileView || w.tileView.superview != container) {
+            UIView *tile = [self mfDockStripTileForWindow:w];
+            tile.frame = frame;
+            [container addSubview:tile];
+            w.tileView = tile;
+            if (animated) {
+                tile.alpha = 0;
+                tile.transform = CGAffineTransformMakeTranslation(toRight ? 34.0 : -34.0, 0);
+                [UIView animateWithDuration:0.28 animations:^{
+                    tile.alpha = 1;
+                    tile.transform = CGAffineTransformIdentity;
+                }];
+            }
+        } else if (!CGRectEqualToRect(w.tileView.frame, frame)) {
+            if (animated) {
+                [UIView animateWithDuration:0.22 animations:^{
+                    w.tileView.frame = frame;
+                }];
+            } else {
+                w.tileView.frame = frame;
+            }
+        }
+    }
+}
+
+-(void)mfDockStripRebuildAnimated:(BOOL)animated{
+    UIWindow *hostWindow = self.view.window;
+    if (!hostWindow) {
+        return;
+    }
+    [self mfDockStripRebuildSide:YES animated:animated inWindow:hostWindow];
+    [self mfDockStripRebuildSide:NO animated:animated inWindow:hostWindow];
+}
+
+/// 点贴片 = 与主窗互换：主窗（若开着别的 App）快照入条，被点的 App 开回主窗并还原停靠前 frame。
+-(void)mfDockStripRestore:(PODockedWindow *)w{
+    if ([self isPanelTransitioning]) {
+        MFLog(@"[strip] 贴片点击被拒（面板过渡中）");
+        return;
+    }
+    if (panelState == POPanelStateOpen && hostSession.state == POHostSessionStateLive &&
+        hostSession.activeBundleId.length > 0 &&
+        ![hostSession.activeBundleId isEqualToString:w.bundleId]) {
+        PODockedWindow *current = [PODockedWindow new];
+        current.bundleId = [hostSession.activeBundleId copy];
+        current.iconImage = [POApplicationHelper imageForBundleId:current.bundleId];
+        current.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:current.bundleId];
+        current.savedFrame = keyboardZoomBaseFrame;
+        current.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+        current.side = w.side;
+        [self mfDockStripAddWindow:current];
+        [self mfDockStripRebuildAnimated:YES];
+        MFLog(@"[strip] 互换：主窗 %@ 自动入条（%@侧），%@ 上主窗",
+              current.bundleId, current.side >= 0 ? @"右" : @"左", w.bundleId);
+    }
+    mfStripPendingRestore = w;
+    mfStripRestoreGeneration += 1;
+    [self mfDockStripDropWindow:w animated:YES];
+    [self pinAppWithBundleId:w.bundleId];
+    NSUInteger generation = mfStripRestoreGeneration;
+    NSString *targetId = [w.bundleId copy];
+    CGRect targetFrame = w.savedFrame;
+    CGFloat targetScale = w.savedScale;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (generation != self->mfStripRestoreGeneration ||
+            ![self->mfStripPendingRestore.bundleId isEqualToString:targetId]) {
+            return;
+        }
+        self->mfStripPendingRestore = nil;
+        if (self->panelState != POPanelStateOpen ||
+            ![self->hostSession.activeBundleId isEqualToString:targetId]) {
+            MFLog(@"[strip] 还原核对：%@ 未成功打开，跳过 frame 还原", targetId);
+            return;
+        }
+        BOOL hasScale = fabs(targetScale - 1.0) > PO_CARD_SCALE_EPSILON;
+        self->mfUserCardPositionPinned = YES;
+        self->mfUserCardScaleOverride = hasScale ? targetScale : 0;
+        self->mfManualCardScaleLatched = hasScale;
+        if (!CGRectIsEmpty(targetFrame)) {
+            self->keyboardZoomBaseFrame = targetFrame;
+        }
+        [self applyLayoutPreservingHandlePosition:YES];
+        MFLog(@"[strip] 还原完成：%@ frame %.0fx%.0f scale %.2f", targetId,
+              CGRectGetWidth(targetFrame), CGRectGetHeight(targetFrame), targetScale);
+    });
+}
+
+-(void)mfDockStripTileTapped:(UITapGestureRecognizer *)tap{
+    PODockedWindow *w = [self mfDockStripWindowForTileView:tap.view];
+    if (!w) {
+        return;
+    }
+    MFLog(@"[strip] 贴片点击 → %@ 上主窗", w.bundleId);
+    [self mfDockStripRestore:w];
+}
+
+-(void)mfDockStripTileLongPressed:(UILongPressGestureRecognizer *)longPress{
+    if (longPress.state != UIGestureRecognizerStateBegan) {
+        return;
+    }
+    PODockedWindow *w = [self mfDockStripWindowForTileView:longPress.view];
+    if (!w) {
+        return;
+    }
+    MFLog(@"[strip] 长按贴片 → 移除 %@（App 留后台，可从圆盘再开）", w.bundleId);
+    [self mfDockStripDropWindow:w animated:YES];
+}
+
+/// POXWindow.hitTest 路由用：贴片命中返回贴片（贴片挂在窗口上，关面板时也要能点）。
+-(UIView *)dockStripHitTestViewForWindowPoint:(CGPoint)point{
+    UIView *containers[2] = { mfDockStripViewLeft, mfDockStripViewRight };
+    for (int i = 0; i < 2; i++) {
+        UIView *container = containers[i];
+        if (!container || container.hidden || container.alpha < 0.01) {
+            continue;
+        }
+        CGPoint local = [container convertPoint:point fromView:nil];
+        if (![container pointInside:local withEvent:nil]) {
+            continue;
+        }
+        return [container hitTest:local withEvent:nil];
+    }
+    return nil;
 }
 
 /// 松手收尾（缩放）：**不再吸附档位**（0.3.24 用户 log33：随便放大缩小），
@@ -4422,6 +4783,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (!self.isViewLoaded) {
         return;
     }
+    [self mfDockStripRebuildAnimated:NO];   // 【0.6.0】停靠条随窗口几何重排
     [self applyLayoutPreservingHandlePosition:YES];
     [self removeKeyboardZoomSuspension:POKeyboardZoomSuspensionRotation];
     [self reevaluateKeyboardZoomAnimated:NO];
@@ -4658,6 +5020,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         ![POApplicationHelper isUserFacingApplicationBundleId:bundleId]) {
         return;
     }
+    [self mfDockStripRemoveWindowForBundleId:bundleId animated:NO];   // 【0.6.0】同 App 贴片防重复
 
     BOOL hasVisibleLivePresentation = contextView && !contextView.hidden &&
         contextView.superview == self.contentView && presentationBundleId.length > 0;
