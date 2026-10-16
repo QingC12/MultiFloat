@@ -525,195 +525,30 @@ static BOOL MFSystemActionOpenTranslateApp(void) {
     return NO;
 }
 
-#pragma mark - 【0.6.11】通用自适应调用器（录屏 / 控制中心 / 通知中心共用）
+/// 【0.6.20 用户 log59-③ 复修】这里原本是 0.6.11 引入的"通用自适应调用器"
+///   （MFSystemActionArgTypeIsSafe / MFSystemActionUserArgType /
+///    MFSystemActionInvokeAdaptive / MFSystemActionScanAndInvoke，约 190 行：
+///    按名字挑 ≤2 参方法、按 type encoding 猜参数类型、猜不出就跳过；
+///    全猜不出就按关键字把实例上的方法扫一遍，**并真的调用**扫到的无参方法）。
+/// log59 真机实证这台机器是**净有害**的：
+///   · 控制中心：把 `presentAnimated:completion:`（实际编码 B@?）误判成「? / ? 不安全」跳过，
+///     随后扫到**无参**的 `_willPresent` 并调用 ⇒ SpringBoard 抛断言
+///     「we should have cleared this assertion in _willDismiss」，控制中心一个都没出来
+///     （同轮还误调了 `presentationRegions`）；
+///   · 通知中心：3 参主路被判"不敢乱调"，退到无参扫描，调了
+///     `animateIconsOnPresentationToo`（与呈现毫无关系的动画内部方法）。
+///   ⇒ 整条机器**删除**：控制中心 / 通知中心 / 录屏三条路现在一律**显式定签名**直调
+///     （见下方各动作实现），不存在"猜"这个环节，也就不可能再误调未知方法。
+/// 下面只保留一个纯日志用的小工具（取 type encoding，只打印、不调用）。
 
-/// 【0.6.13 用户 log53-② 重点排查·安全模式修复】
-/// 0.6.11 的调用器把第二参数寄存器一律塞 `flagValue`（YES=0x1）——若方法实际签名是
-/// **对象参数**（如 `xxxWithCompletion:(id)`），0x1 就是野指针，被调方解引用 →
-/// EXC_BAD_ACCESS。`@try` 只能捕 NSException，**抓不住 BAD_ACCESS** → SpringBoard
-/// 直接崩进安全模式（用户实测：点录屏图标即安全模式，日志连 [sysact] 一行都没有，
-/// 与"崩在 @try 保护范围之外"完全吻合）。
-/// 本版改为**按 objc type encoding 逐参数判型**：
-///   '@'（对象）→ 传 nil；'c'/'B'（BOOL）→ 传 flagValue；整型（i/I/s/S/l/L/q/Q）→ 传 0；
-///   浮点/结构体/指针/位域等 → 整个方法跳过（ABI 不敢乱调）。
-/// 由此保证任何被调方法收到的都是类型合法的值，杜绝野指针。
-
-/// 安全（可合法传值）的参数类型
-static BOOL MFSystemActionArgTypeIsSafe(char t) {
-    switch (t) {
-        case '@': case '#': case ':':
-        case 'c': case 'B':
-        case 'i': case 'I': case 's': case 'S':
-        case 'l': case 'L': case 'q': case 'Q':
-            return YES;
-        default:
-            return NO;   // d/f 浮点、^ 指针、{} 结构体、[] 数组、b 位域、* 字符串 → 不敢调
-    }
-}
-
-/// 从 method type encoding 里取第 wantIndex 个**用户参数**的类型。
-/// 编码序列 = 返回类型 + id + SEL + 参数…（前 3 个 token 不是用户参数）。
-/// 解析失败/复合类型一律返回 '?'（调用方按不安全跳过）。
-static char MFSystemActionUserArgType(const char *encoding, NSUInteger wantIndex) {
-    if (encoding == NULL) {
-        return '?';
-    }
-    const char *p = encoding;
-    NSUInteger tokenIndex = 0;
-    while (*p != '\0') {
-        while (*p == 'r' || *p == 'n' || *p == 'N' || *p == 'o' || *p == 'O' || *p == 'V') {
-            p++;   // 限定符不占 token
-        }
-        char start = *p;
-        switch (start) {
-            case '\0':
-                return '?';
-            case '@': case ':': case '#': case 'c': case 'B':
-            case 'i': case 'I': case 's': case 'S':
-            case 'l': case 'L': case 'q': case 'Q':
-            case 'd': case 'f': case 'v':
-                p++;
-                break;
-            case '^':
-                p++;
-                if (*p == '?') {
-                    p++;
-                } else {
-                    while (*p != '\0' && (isalnum((unsigned char)*p) || *p == '_')) {
-                        p++;
-                    }
-                }
-                break;
-            case 'b':   // 位域 bNUM
-                p++;
-                while (isdigit((unsigned char)*p)) {
-                    p++;
-                }
-                break;
-            case '{': case '(': {   // 结构体/联合：配对吞掉
-                char openCh = start, closeCh = (start == '{') ? '}' : ')';
-                int depth = 0;
-                do {
-                    if (*p == openCh) depth++;
-                    else if (*p == closeCh) depth--;
-                    p++;
-                } while (*p != '\0' && depth > 0);
-                break;
-            }
-            case '[':   // 数组：不安全，直接放弃整个解析
-                return '?';
-            default:
-                return '?';
-        }
-        if (tokenIndex >= 3 && tokenIndex - 3 == wantIndex) {
-            if (start == ':' || start == '#' || start == 'v') {
-                return '?';   // SEL/Class/void 槽位不作为参数出现，防御性视为不安全
-            }
-            return start;
-        }
-        tokenIndex++;
-    }
-    return '?';
-}
-
-static BOOL MFSystemActionInvokeAdaptive(id target, SEL selector, NSString *label, BOOL flagValue) {
+/// 【0.6.20】安全取实例方法在 `target` 上的 type encoding（取不到返回 "?"）。仅日志取证用。
+static const char *MFSystemActionSafeEncoding(id target, SEL selector) {
     Method method = class_getInstanceMethod(object_getClass(target), selector);
     if (method == NULL) {
-        return NO;
+        return "?";
     }
     const char *encoding = method_getTypeEncoding(method);
-    NSUInteger registers = method_getNumberOfArguments(method);   // 2 + 参数寄存器数
-    if (registers > 4) {
-        MFLog(@"[sysact] %@：参数寄存器 %lu 个，跳过（不敢乱调）",
-              label, (unsigned long)(registers - 2));
-        return NO;
-    }
-    // 逐参数判型：对象槽给 nil、BOOL 槽给 flagValue、整型槽给 0，其他类型整个跳过
-    char type0 = (registers >= 3) ? MFSystemActionUserArgType(encoding, 0) : '@';
-    char type1 = (registers >= 4) ? MFSystemActionUserArgType(encoding, 1) : '@';
-    if ((registers >= 3 && !MFSystemActionArgTypeIsSafe(type0)) ||
-        (registers >= 4 && !MFSystemActionArgTypeIsSafe(type1))) {
-        MFLog(@"[sysact] %@：参数类型不安全（%c / %c），跳过（防野指针崩溃）",
-              label,
-              registers >= 3 ? type0 : '-',
-              registers >= 4 ? type1 : '-');
-        return NO;
-    }
-    @try {
-        if (registers == 2) {
-            ((void (*)(id, SEL))objc_msgSend)(target, selector);
-        } else if (registers == 3) {
-            uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
-            // 【0.6.13】按 long 传参（寄存器值等价），绕开 ARC 的 uintptr_t→id 禁转
-            ((void (*)(id, SEL, long))objc_msgSend)(target, selector, (long)scalar0);
-        } else {
-            uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
-            uintptr_t scalar1 = (type1 == 'c' || type1 == 'B') ? (flagValue ? 1 : 0) : 0;
-            ((void (*)(id, SEL, long, long))objc_msgSend)(target, selector,
-                                                          (long)scalar0, (long)scalar1);
-        }
-        MFLog(@"[sysact] %@：命中（参数 %lu 个，类型 %c/%c）", label,
-              (unsigned long)(registers - 2),
-              registers >= 3 ? type0 : '-',
-              registers >= 4 ? type1 : '-');
-        return YES;
-    } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! %@ 调用异常：%@", label, exception);
-        return NO;
-    }
-}
-
-/// 在实例上按"名字含关键字"扫描可调方法（封顶 12 个，避免日志爆炸）。
-/// `preferKeywords` 命中的排前面（toggle/start/begin 这类动作词优先于 get/query）。
-static BOOL MFSystemActionScanAndInvoke(id target, NSArray<NSString *> *keywords,
-                                        NSArray<NSString *> *preferKeywords,
-                                        NSString *label, BOOL flagValue) {
-    if (target == nil) {
-        return NO;
-    }
-    Class cls = object_getClass(target);
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-    for (unsigned int i = 0; i < count; i++) {
-        NSString *name = NSStringFromSelector(method_getName(methods[i]));
-        if (method_getNumberOfArguments(methods[i]) > 4) {
-            continue;   // 只调 ≤2 参数寄存器的
-        }
-        for (NSString *keyword in keywords) {
-            if ([name localizedCaseInsensitiveContainsString:keyword]) {
-                [candidates addObject:name];
-                break;
-            }
-        }
-    }
-    if (methods != NULL) {
-        free(methods);
-    }
-    // 偏好词置前
-    [candidates sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        for (NSString *prefer in preferKeywords) {
-            BOOL aHit = [a localizedCaseInsensitiveContainsString:prefer];
-            BOOL bHit = [b localizedCaseInsensitiveContainsString:prefer];
-            if (aHit != bHit) {
-                return aHit ? NSOrderedAscending : NSOrderedDescending;
-            }
-        }
-        return NSOrderedSame;
-    }];
-    for (NSUInteger i = 0; i < candidates.count && i < 12; i++) {
-        SEL selector = NSSelectorFromString(candidates[i]);
-        if (MFSystemActionInvokeAdaptive(target, selector,
-                                         [NSString stringWithFormat:@"%@ %@",
-                                          label, candidates[i]], flagValue)) {
-            return YES;
-        }
-    }
-    if (candidates.count > 0) {
-        MFLog(@"[sysact] %@：候选 %@ 全部未成功", label,
-              [candidates subarrayWithRange:NSMakeRange(0, MIN(candidates.count, 6))]);
-    }
-    return NO;
+    return encoding != NULL ? encoding : "?";
 }
 
 // 【0.6.16】旧的 `MFSystemActionSingletonInstance`（sharedInstance/mainInstance 两种来源）
@@ -1066,90 +901,88 @@ static void MFSystemActionDumpMethodsMatching(id target, NSArray<NSString *> *ke
 
 #pragma mark - 动作④：控制中心（【0.6.11 用户指令】）
 
-/// 【0.6.16】控制中心：单例 / 窗口层级两路取实例 → 已知 selector 逐个试 →
-/// 再按关键字扫一遍 → 全失败才 dump。每一条都走类型安全的自适应调用器
-/// （BOOLEAN 槽给 YES、对象槽给 nil），失败只写日志。
+/// 【0.6.20 用户 log59-③ 复修】控制中心：实例两路取（单例 → 窗口层级）照旧，
+/// **调用方式改成显式定签名**。
+/// log59 实证：0.6.16 那套"按名字猜参数类型 → 自适应调用"的机器，在真机上把
+/// `presentAnimated:completion:`（实际编码 B@?）判成「? / ? 不安全」直接跳过，
+/// 接着按关键字扫到**无参**的 `_willPresent` 并真的调了它 ⇒ SpringBoard 抛
+/// 「we should have cleared this assertion in _willDismiss」；控制中心一点没出来。
+/// 那台"自动猜"的机器整条已删除（见上方 0.6.20 注记）。
+/// 现在只按**已知签名**强转调用；失败只 dump 方法名留证，绝不乱调未知方法。
 static BOOL MFSystemActionPresentControlCenter(void) {
     id controller = MFSystemActionResolveInstance(@"SBControlCenterController", @"控制中心");
-    if (controller != nil) {
-        NSArray<NSString *> *names = @[ @"presentAnimated:completion:",
-                                        @"presentAnimated:withCompletion:",
-                                        @"presentControlCenterAnimated:",
-                                        @"presentAnimated:",
-                                        @"present" ];
-        for (NSString *name in names) {
-            SEL selector = NSSelectorFromString(name);
-            if ([controller respondsToSelector:selector] &&
-                MFSystemActionInvokeAdaptive(controller, selector,
-                                             [NSString stringWithFormat:@"控制中心 SBControlCenterController %@",
-                                              name], YES)) {
-                return YES;
-            }
-        }
-        if (MFSystemActionScanAndInvoke(controller, @[ @"present", @"show", @"toggle", @"controlcenter" ],
-                                        @[ @"present", @"toggle" ],
-                                        @"控制中心 SBControlCenterController", YES)) {
-            return YES;
-        }
-        MFSystemActionDumpMethodsMatching(controller, @[ @"present", @"show", @"toggle", @"center" ],
-                                          @"控制中心");
+    if (controller == nil) {
+        MFLog(@"[sysact] 控制中心：未取到 SBControlCenterController 实例");
+        return NO;
     }
-    // 兜底：另一套常见命名（新版 SpringBoard 把 CC 也挂在 presentation manager 上）
-    for (NSString *className in @[ @"SBMainDisplaySceneController", @"SBControlCenterSystemAgent",
-                                   @"SBControlCenterPresentationManager" ]) {
-        id other = MFSystemActionResolveInstance(className, @"控制中心兜底");
-        if (other == nil) {
-            continue;
-        }
-        if (MFSystemActionScanAndInvoke(other, @[ @"controlcenter", @"present" ], @[ @"present" ],
-                                        [NSString stringWithFormat:@"控制中心兜底 %@", className], YES)) {
+    // 主路（实测签名）：- (void)presentAnimated:(BOOL)animated completion:(void(^)(void))completion
+    SEL presentTwo = NSSelectorFromString(@"presentAnimated:completion:");
+    if ([controller respondsToSelector:presentTwo]) {
+        @try {
+            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(controller, presentTwo, YES, nil);
+            MFLog(@"[sysact] 控制中心：已调 presentAnimated:YES completion:nil（编码 %s）",
+                  MFSystemActionSafeEncoding(controller, presentTwo));
             return YES;
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! 控制中心 presentAnimated:completion: 异常：%@", exception);
         }
     }
-    MFLog(@"[sysact] 控制中心：所有候选都没成功（见上面诊断）");
+    // 次路：单参变体 - (void)presentAnimated:(BOOL)animated
+    SEL presentOne = NSSelectorFromString(@"presentAnimated:");
+    if ([controller respondsToSelector:presentOne]) {
+        @try {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(controller, presentOne, YES);
+            MFLog(@"[sysact] 控制中心：已调 presentAnimated:YES（编码 %s）",
+                  MFSystemActionSafeEncoding(controller, presentOne));
+            return YES;
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! 控制中心 presentAnimated: 异常：%@", exception);
+        }
+    }
+    MFLog(@"[sysact] 控制中心：实例在，但 presentAnimated:(completion:) 都不响应");
+    MFSystemActionDumpMethodsMatching(controller, @[ @"present" ], @"控制中心");
     return NO;
 }
 
 #pragma mark - 动作⑤：通知中心（【0.6.11 用户指令】）
 
-/// 【0.6.16】通知中心：同上——实例两路取，4 参数那个 setCoverSheetPresented 显式调用
-/// （自适应器只支持 ≤2 参数），其余已知 selector 走自适应。
+/// 【0.6.20 用户 log59-③ 复修】通知中心：同上——实例两路取，调用改成显式定签名。
+/// 实测签名（log59 打印：`setCoverSheetPresented:animated:withCompletion:` 参数寄存器 3 个）：
+///   - (void)setCoverSheetPresented:(BOOL)presented animated:(BOOL)animated
+///                           withCompletion:(void(^)(void))completion
+/// 0.6.16 的自适应器只支持 ≤2 参，见到 3 参直接"不敢乱调"，于是退到无参扫描，
+/// 真的调了 `animateIconsOnPresentationToo`（跟呈现毫无关系的动画内部方法）。
 static BOOL MFSystemActionPresentNotificationCenter(void) {
     id manager = MFSystemActionResolveInstance(@"SBCoverSheetPresentationManager", @"通知中心");
-    if (manager != nil) {
-        // ① 4 参数主路（新版签名）：BOOL presented + BOOL animated + id options + id completion
-        SEL four = NSSelectorFromString(@"setCoverSheetPresented:animated:options:completion:");
-        if ([manager respondsToSelector:four]) {
-            @try {
-                ((void (*)(id, SEL, BOOL, BOOL, id, id))objc_msgSend)(manager, four, YES, YES, nil, nil);
-                MFLog(@"[sysact] 通知中心：命中 setCoverSheetPresented:animated:options:completion:");
-                return YES;
-            } @catch (NSException *exception) {
-                MFLog(@"[sysact] !! 通知中心 4 参数调用异常：%@", exception);
-            }
-        }
-        // ② 其余签名走自适应（≤2 参数）
-        NSArray<NSString *> *names = @[ @"setCoverSheetPresented:animated:withCompletion:",
-                                        @"setCoverSheetPresented:animated:",
-                                        @"presentNotificationCenterAnimated:",
-                                        @"presentAnimated:" ];
-        for (NSString *name in names) {
-            SEL selector = NSSelectorFromString(name);
-            if ([manager respondsToSelector:selector] &&
-                MFSystemActionInvokeAdaptive(manager, selector,
-                                             [NSString stringWithFormat:@"通知中心 SBCoverSheetPresentationManager %@",
-                                              name], YES)) {
-                return YES;
-            }
-        }
-        if (MFSystemActionScanAndInvoke(manager, @[ @"coversheet", @"present", @"notification" ],
-                                        @[ @"present", @"coversheet" ],
-                                        @"通知中心 SBCoverSheetPresentationManager", YES)) {
-            return YES;
-        }
-        MFSystemActionDumpMethodsMatching(manager, @[ @"coversheet", @"present", @"slide" ], @"通知中心");
+    if (manager == nil) {
+        MFLog(@"[sysact] 通知中心：未取到 SBCoverSheetPresentationManager 实例");
+        return NO;
     }
-    MFLog(@"[sysact] 通知中心：所有候选都没成功（见上面诊断）");
+    // 主路（本机实测签名，3 参）
+    SEL three = NSSelectorFromString(@"setCoverSheetPresented:animated:withCompletion:");
+    if ([manager respondsToSelector:three]) {
+        @try {
+            ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(manager, three, YES, YES, nil);
+            MFLog(@"[sysact] 通知中心：已调 setCoverSheetPresented:YES animated:YES withCompletion:nil"
+                  "（编码 %s）", MFSystemActionSafeEncoding(manager, three));
+            return YES;
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! 通知中心 setCoverSheetPresented:animated:withCompletion: 异常：%@", exception);
+        }
+    }
+    // 次路（新版 4 参变体：presented + animated + options + completion）
+    SEL four = NSSelectorFromString(@"setCoverSheetPresented:animated:options:completion:");
+    if ([manager respondsToSelector:four]) {
+        @try {
+            ((void (*)(id, SEL, BOOL, BOOL, id, id))objc_msgSend)(manager, four, YES, YES, nil, nil);
+            MFLog(@"[sysact] 通知中心：已调 setCoverSheetPresented:animated:options:completion:");
+            return YES;
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! 通知中心 4 参数调用异常：%@", exception);
+        }
+    }
+    MFLog(@"[sysact] 通知中心：实例在，但 setCoverSheetPresented 系列都不响应");
+    MFSystemActionDumpMethodsMatching(manager, @[ @"coversheet", @"present" ], @"通知中心");
     return NO;
 }
 

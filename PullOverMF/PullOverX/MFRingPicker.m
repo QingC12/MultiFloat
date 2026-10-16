@@ -2542,7 +2542,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.6.19 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.6.20 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -3512,7 +3512,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.19 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.20 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -5419,7 +5419,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.19 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.20 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
