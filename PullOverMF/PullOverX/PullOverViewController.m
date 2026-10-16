@@ -4153,11 +4153,15 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 重建/重排某一侧的条与贴片。容器挂 **POXWindow**（root view 关面板时 alpha=0，不能挂 self.view）。
 -(void)mfDockStripRebuildSide:(BOOL)toRight animated:(BOOL)animated inWindow:(UIWindow *)hostWindow{
     NSMutableArray *items = [self mfDockStripItemsForSide:toRight];
-    UIView **containerPtr = toRight ? &mfDockStripViewRight : &mfDockStripViewLeft;
+    UIView *container = toRight ? mfDockStripViewRight : mfDockStripViewLeft;
     if (items.count == 0) {
-        if (*containerPtr) {
-            [*containerPtr removeFromSuperview];
-            *containerPtr = nil;
+        if (container) {
+            [container removeFromSuperview];
+            if (toRight) {
+                mfDockStripViewRight = nil;
+            } else {
+                mfDockStripViewLeft = nil;
+            }
         }
         return;
     }
@@ -4168,13 +4172,16 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat x = toRight ? (screenW - MF_DOCK_STRIP_TILE_W - MF_DOCK_STRIP_EDGE_INSET)
                         : MF_DOCK_STRIP_EDGE_INSET;
     CGFloat y = MAX(MF_DOCK_STRIP_EDGE_INSET, (screenH - totalH) / 2.0);
-    UIView *container = *containerPtr;
     if (!container) {
         container = [[UIView alloc] initWithFrame:CGRectMake(x, y, MF_DOCK_STRIP_TILE_W, totalH)];
         container.backgroundColor = [UIColor clearColor];
         container.userInteractionEnabled = YES;
         [hostWindow addSubview:container];
-        *containerPtr = container;
+        if (toRight) {
+            mfDockStripViewRight = container;
+        } else {
+            mfDockStripViewLeft = container;
+        }
         MFLog(@"[strip] %@侧停靠条已安装（%.0fx%.0f @ (%.0f,%.0f)）",
               toRight ? @"右" : @"左", MF_DOCK_STRIP_TILE_W, totalH, x, y);
     }
