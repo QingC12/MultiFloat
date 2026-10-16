@@ -195,7 +195,7 @@ static CGFloat MFPanelHandleEdgeGap(void) {
 #define PO_KEYBOARD_ZOOM_MINIMUM_USEFUL_SCALE 1.12
 #define PO_CARD_SCALE_EPSILON 0.001
 #define PO_HANDLE_CARD_SCALE_ANIMATION_DURATION 0.25
-#define PO_SCALED_PROGRAMMATIC_CLOSE_DURATION 0.34   // 【0.6.6】程序化关闭 = 系统式"上滑收起"（略缩小+上飞+淡出）
+#define PO_SCALED_PROGRAMMATIC_CLOSE_DURATION 0.34   // 【0.6.7】程序化关闭 = "收回触发条"（缩小吸回手柄淡出+手柄脉冲）
 #define PO_SCALED_CLOSE_POST_COMMIT_CLEANUP_DELAY 0.035
 #define PO_HANDLE_GUARD_MINIMUM_REVEAL_DURATION 2.0
 
@@ -397,8 +397,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfDockStripViewRight;       // 【0.6.0】右条容器（同上）
     NSUInteger mfStripRestoreGeneration; // 【0.6.0】贴片还原 frame 的代次（dispatch_after 防串扰）
     PODockedWindow *mfStripPendingRestore; // 【0.6.0】等待开完还原 frame 的贴片
-    BOOL mfStripSuppressOpenSlide;   // 【0.6.6】贴片还原打开时免滑入（内容直接就位，只淡入）
-    CFTimeInterval mfStripSuppressOpenSlideAt;  // 【0.6.6】旗标设置时刻（5s 时效，防残留影响普通打开）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -1026,12 +1024,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.6 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.7 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.6 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.7 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2890,17 +2888,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat rawOffsetX = scrollView.contentOffset.x;
     CGFloat rawOffsetY = scrollView.contentOffset.y;
 
-    // 【0.6.6 用户 log50】贴片还原的打开不滑入：内容一步就位（面板还不可见，无观感跳变）
-    //   → 直接 finish 走淡入，卡片在最终位置淡入，无"从屏幕右侧出来"的画面。
-    //   旗标带 5s 时效：热切换（面板开）不走 snap-open 时旗标残留，过期后普通打开不受影响。
-    if (shouldOpen && mfStripSuppressOpenSlide &&
-        CACurrentMediaTime() - mfStripSuppressOpenSlideAt < 5.0) {
-        mfStripSuppressOpenSlide = NO;
+    // 【0.6.7 用户 log51】打开一律"原位淡入"：不再从手柄侧横移滑出（圆盘打开/贴片还原统一）。
+    //   内容一步就位（面板尚不可见，无观感跳变）→ 直接 finish 走淡入，卡片在最终位置浮现。
+    if (shouldOpen) {
         [scrollView setContentOffset:CGPointMake(targetOffset, 0) animated:NO];
         [self finishPanelSnapToOpenState:YES];
         return;
     }
-    mfStripSuppressOpenSlide = NO;
 
     BOOL xAlreadyOnTarget = fabs(rawOffsetX - targetOffset) <= CLOSED_CONTENT_OFFSET_EPSILON;
     BOOL yAlreadyClean = fabs(rawOffsetY) <= CLOSED_CONTENT_OFFSET_EPSILON;
@@ -2931,7 +2925,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 -(BOOL)canUseDirectScaledProgrammaticCloseAnimation{
     // 【0.6.6 用户 log50】删掉 scale≠1 门槛：所有程序化关闭（点关闭/甩边/停靠收尾等）
-    //   统一走"系统上滑收起"动画，不再有"飞往右侧边缘"的关闭画面。
+    //   统一走自研"收回触发条"动画（0.6.6 的上滑收起 / 更早的飞右缘均已弃用）。
     return panelState == POPanelStateOpen &&
         !scrollSnapAnimationInProgress && !scrollView.dragging && !scrollView.decelerating &&
         self.handle.layoutMode == POHandleLayoutModeVerticalRail &&
@@ -2983,11 +2977,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     appliedCardScale = visualScale;
     closingFrozenCardScale = visualScale;
 
-    // 【0.6.6 用户 log50】关闭动画 = 系统后台卡片"上滑收起"：略微缩小 + 向上飞出 + 淡出
-    //   （原"飞往右侧边缘"已按用户指令移除）。手柄不再跟随飞行，直接淡出。
-    CGFloat travelUp = CGRectGetHeight(self.view.bounds) * 0.55 +
-        CGRectGetHeight(keyboardZoomContainer.bounds) * MAX(visualScale, 0.1) * 0.5;
-    CGPoint cardEndCenter = CGPointMake(cardStartCenter.x, cardStartCenter.y - travelUp);
+    // 【0.6.7 用户 log51】自研关闭动画 = "收回触发条"：卡片缩小并吸回右缘手柄（触发条）
+    //   内淡出——与呼出侧"圆盘从触发条长出来"首尾呼应（0.6.6 的"上滑收起"按用户指令弃用）。
+    //   完成后手柄做一次 Q 弹脉冲（吸收反馈）。手柄中心即吸收靶点（rail 中点 = 触发条位置）。
+    CGPoint absorbTarget = handleScrollView.center;
 
     [UIView animateWithDuration:PO_SCALED_PROGRAMMATIC_CLOSE_DURATION
                           delay:0
@@ -2995,9 +2988,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
-        self->keyboardZoomContainer.center = cardEndCenter;
+        self->keyboardZoomContainer.center = absorbTarget;
         self->keyboardZoomContainer.transform =
-            CGAffineTransformScale(cardVisualTransform, 0.86, 0.86);
+            CGAffineTransformScale(cardVisualTransform, 0.12, 0.12);
         self->keyboardZoomContainer.alpha = 0.0;
         self->handleScrollView.alpha = 0.0;
         self->panelBackdropView.alpha = 0;
@@ -3022,6 +3015,33 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->scaledProgrammaticCloseNeedsLayout = NO;
         self->deferScaledCloseSessionCleanup = YES;
         [self finishPanelSnapToOpenState:NO];
+        // 【0.6.7】吸收完成 → 手柄 Q 弹脉冲一下（1.22 倍过冲回 1）。只在面板仍关时执行，
+        //   用户秒开则布局会重写 transform（铁律 3），脉冲自然失效无副作用。
+        if (self->panelState == POPanelStateClosed) {
+            [UIView animateWithDuration:0.24
+                                  delay:0.0
+                 usingSpringWithDamping:0.45
+                  initialSpringVelocity:0.5
+                                options:(UIViewAnimationOptionCurveEaseOut |
+                                         UIViewAnimationOptionBeginFromCurrentState |
+                                         UIViewAnimationOptionAllowUserInteraction)
+                             animations:^{
+                if (self->panelState == POPanelStateClosed) {
+                    self->handleScrollView.transform = CGAffineTransformMakeScale(1.22, 1.22);
+                }
+            } completion:^(__unused BOOL pulseDone) {
+                [UIView animateWithDuration:0.3
+                                      delay:0.0
+                     usingSpringWithDamping:0.5
+                      initialSpringVelocity:0.2
+                                    options:(UIViewAnimationOptionCurveEaseOut |
+                                             UIViewAnimationOptionBeginFromCurrentState |
+                                             UIViewAnimationOptionAllowUserInteraction)
+                                 animations:^{
+                    self->handleScrollView.transform = CGAffineTransformIdentity;
+                } completion:nil];
+            }];
+        }
         if (replayDeferredLayout) {
             [self applyCurrentSettings];
         }
@@ -3126,7 +3146,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         band.backgroundColor = [UIColor clearColor];
         if ([key isEqualToString:@"bottom"]) {
             band.tag = MF_CARD_EDGE_HOTZONE_TAG_BOTTOM;
-            // 【0.6.6】双击底带 = 关闭（上滑收起动画）。底带已有宿主移动 pan（拖动=移动）：
+            // 【0.6.6→0.6.7】双击底带 = 关闭（"收回触发条"动画）。底带已有宿主移动 pan（拖动=移动）：
             // 双击是静态手势，与 pan 天然共存（一拖 pan 接管、tap 失败；静止松手 tap 生效）。
             UITapGestureRecognizer *bottomDoubleTap = [[UITapGestureRecognizer alloc]
                 initWithTarget:self action:@selector(mfBandBottomDoubleTap:)];
@@ -3173,7 +3193,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.6 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.7 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3309,7 +3329,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (![self mfCanDragCardEdgeNow]) {
         return;
     }
-    MFLog(@"[card] 双击底带 → 关闭浮窗（上滑收起）");
+    MFLog(@"[card] 双击底带 → 关闭浮窗（收回触发条）");
     [self close];
 }
 
@@ -3548,7 +3568,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->keyboardZoomContainer.alpha = 1.0;
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
     } completion:nil];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.6 淡入 0.4s，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.7 淡入 0.4s，阴影浮起 %.2f）",
           CONTENT_SHADOW_OPACITY * progress);
 }
 
@@ -3939,7 +3959,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.6 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.7 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4518,11 +4538,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [self mfTeardownLiveStackForWindow:w];
     }
     // 【0.6.6 用户 log50】打开免滑入 + frame 预写回：
-    //   - 免滑入：snap 开门时内容直接就位（无"从屏幕右侧出来"画面），只走淡入；
+    //   - 原位淡入：snap 开门时内容直接就位（0.6.7 起所有打开统一原位淡入，无滑入）；
     //   - 预写回：面板开态（热切换）时布局 pass 会带着 pinned 位置走，卡片随内容交换即到位；
     //     面板关态（单贴片）时预写回 + finish 预落位双保险，全程无二次跳变。
-    mfStripSuppressOpenSlide = YES;
-    mfStripSuppressOpenSlideAt = CACurrentMediaTime();
     if (!CGRectIsEmpty(w.savedFrame)) {
         self->mfUserCardPositionPinned = YES;
         BOOL preScale = fabs(w.savedScale - 1.0) > PO_CARD_SCALE_EPSILON;

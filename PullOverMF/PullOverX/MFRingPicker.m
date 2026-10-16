@@ -3569,20 +3569,37 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (button == nil) {
         return;
     }
-    // 【0.3.0】借鉴 Stheno 的滑选图标动画（逆向实证：`_scaleToIcon`/`_selected` 选中缩放
-    //   + `CustomSpringAnimation`/阻尼系数贯穿）：选中图标**弹性**放大到 1.25 并加亮，
-    //   手指滑走时弹簧缩回。damping 0.5 = 明显的过冲回弹，正是 Stheno 圆盘的手感来源。
-    [UIView animateWithDuration:0.38
+    // 【0.6.7 用户 log51】滑选 Q 弹强化（在 0.3.0 的 Stheno 弹簧基础上加大幅度与层次）：
+    //   ① 底座按钮 1.38 倍过冲弹簧（damping 0.42 = 明显 Q 弹回晃）；
+    //   ② 内部图标再叠一层更快更弹的放大（1.18 倍）——图标比底座弹得更高，层次感；
+    //   ③ 选中亮起白色光晕（shadow），滑走时弹簧收回。手指划过即触发（BeginFromCurrentState
+    //      保证快速连续划过时动画从当前态衔接不跳变）。
+    [UIView animateWithDuration:0.42
                           delay:0.0
-         usingSpringWithDamping:(selected ? 0.5 : 0.65)
-          initialSpringVelocity:(selected ? 0.5 : 0.0)
+         usingSpringWithDamping:(selected ? 0.42 : 0.6)
+          initialSpringVelocity:(selected ? 0.7 : 0.0)
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
                      animations:^{
-        button.transform = selected ? CGAffineTransformMakeScale(1.25, 1.25) : CGAffineTransformIdentity;
+        button.transform = selected ? CGAffineTransformMakeScale(1.38, 1.38) : CGAffineTransformIdentity;
         button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.45 : 0.14];
         button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.95 : 0.35].CGColor;
+        button.layer.shadowColor = [UIColor whiteColor].CGColor;
+        button.layer.shadowOpacity = selected ? 0.5 : 0.0;
+        button.layer.shadowRadius = selected ? 9.0 : 0.0;
+        button.layer.shadowOffset = CGSizeZero;
+    } completion:nil];
+    [UIView animateWithDuration:0.3
+                          delay:0.0
+         usingSpringWithDamping:(selected ? 0.4 : 0.6)
+          initialSpringVelocity:(selected ? 0.9 : 0.0)
+                        options:(UIViewAnimationOptionCurveEaseOut |
+                                 UIViewAnimationOptionBeginFromCurrentState |
+                                 UIViewAnimationOptionAllowUserInteraction)
+                     animations:^{
+        button.imageView.transform =
+            selected ? CGAffineTransformMakeScale(1.18, 1.18) : CGAffineTransformIdentity;
     } completion:nil];
 }
 
