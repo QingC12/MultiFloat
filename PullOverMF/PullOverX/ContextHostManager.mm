@@ -766,12 +766,11 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 @property (nonatomic, assign) BOOL ios26HostedContentAwaitingInvalidation;
 @property (nonatomic, assign) BOOL ios26HostedContentUnavailableNotified;
 @property (nonatomic, assign) CFTimeInterval ios26HostedContentStableSince;
-// 【0.6.1】实时贴片保活槽（同一时刻只保活一片；布防/拆除见 beginLiveTilePreservation）
-@property (nonatomic, strong) FBScene *pinnedLiveScene;
-@property (nonatomic, copy) NSString *pinnedLiveBundleId;
-@property (nonatomic, strong) UIView *pinnedLiveSceneStackRef;   // 保活期间寄存的 sceneStack 视图（贴片挂载用）
-@property (nonatomic, strong) id pinnedLiveProcessAssertion;     // 从主租约转移来的进程断言（防挂起关键）
-@property (nonatomic, assign) int pinnedLivePID;
+// 【0.6.3】实时贴片保活槽位表（多片同时保活；key=bundleId；布防/拆除见 beginLiveTilePreservation）
+@property (nonatomic, strong) NSMutableDictionary<NSString *, FBScene *> *pinnedLiveScenes;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, UIView *> *pinnedLiveStackRefs;  // 保活期间寄存的 sceneStack 视图（贴片挂载用）
+@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *pinnedLiveAssertions;       // 从主租约转移来的进程断言（防挂起关键）
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *pinnedLivePIDs;
 - (void)acquireProcessAssertionForBundleId:(NSString *)bundleId;
 - (void)releaseProcessAssertion;
 - (int)pidForBundleId:(NSString *)bundleId;
@@ -1997,21 +1996,37 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     }
 }
 
-#pragma mark - 【0.6.1】实时贴片（保活一片）
+#pragma mark - 【0.6.3】实时贴片（多片同时保活）
 
 -(BOOL)hasPinnedLiveTile{
-    return self.pinnedLiveScene != nil || self.pinnedLiveProcessAssertion != nil;
+    return self.pinnedLiveScenes.count > 0 || self.pinnedLiveAssertions.count > 0;
 }
 
--(UIView *)pinnedLiveSceneStack{
-    return self.pinnedLiveSceneStackRef;
+-(BOOL)isBundleIdLivePinned:(NSString *)bundleId{
+    return bundleId.length > 0 && self.pinnedLiveScenes[bundleId] != nil;
+}
+
+-(BOOL)isSceneLivePinned:(FBScene *)scene{
+    if (!scene) {
+        return NO;
+    }
+    for (FBScene *pinned in self.pinnedLiveScenes.allValues) {
+        if (pinned == scene) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+-(UIView *)pinnedLiveSceneStackForBundleId:(NSString *)bundleId{
+    return bundleId.length > 0 ? self.pinnedLiveStackRefs[bundleId] : nil;
 }
 
 /// 布防：把当前活跃会话转进保活槽。
+/// 【0.6.3】多片同时保活——不再"换守"拆旧片（log47 实测：单片保活可用，用户要多贴片同播）。
 /// 【0.6.2】不再要求"自有场景"——本机（iOS 17）浮窗内 App 全部走"接管系统现成场景"路径
-/// （probeSceneForBundleId → activateScene，ownedHostedScene 恒空），0.6.1 的自有检查导致
-/// 保活从未生效。接管场景同样保活：进程断言转移（不 invalidate，App 不被挂起）+
-/// 租约释放路径跳过 setForeground:NO（App 继续以为自己在前台，贴片持续渲染）。
+/// （probeSceneForBundleId → activateScene，ownedHostedScene 恒空）。接管场景同样保活：
+/// 进程断言转移（不 invalidate，App 不被挂起）+ 租约释放路径跳过 setForeground:NO。
 /// 已知边界：保活的是系统 canonical 场景，用户按 Home 回桌面时系统会正常把它转后台
 /// → 贴片定格为最后一帧（快照兜底显示），属预期行为不视为故障。
 -(BOOL)beginLiveTilePreservation{
@@ -2019,48 +2034,55 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         self.hostedBundleId.length == 0 || !self.publishedSceneStack) {
         return NO;
     }
+    if (!self.pinnedLiveScenes) {
+        self.pinnedLiveScenes = [NSMutableDictionary dictionary];
+        self.pinnedLiveStackRefs = [NSMutableDictionary dictionary];
+        self.pinnedLiveAssertions = [NSMutableDictionary dictionary];
+        self.pinnedLivePIDs = [NSMutableDictionary dictionary];
+    }
     BOOL ownsHostedScene = self.hostedScene == self.ownedHostedScene;
-    if (self.pinnedLiveScene == self.hostedScene) {
+    NSString *bid = [self.hostedBundleId copy];
+    if (self.pinnedLiveScenes[bid] == self.hostedScene) {
         // 重入布防（同一片）：换上新断言，旧的补一发释放防泄漏
-        id oldAssertion = self.pinnedLiveProcessAssertion;
-        self.pinnedLiveProcessAssertion = nil;
+        id oldAssertion = self.pinnedLiveAssertions[bid];
         if (oldAssertion && [oldAssertion respondsToSelector:@selector(invalidate)]) {
             @try {
                 [oldAssertion invalidate];
             } @catch (__unused NSException *exception) {
             }
         }
-    } else if (self.pinnedLiveScene || self.pinnedLiveProcessAssertion) {
-        [self releasePinnedLiveTile];   // 换守：控制层应先做快照降级，这里兜底
+        [self.pinnedLiveAssertions removeObjectForKey:bid];
+    } else if (self.pinnedLiveScenes[bid] || self.pinnedLiveAssertions[bid]) {
+        // 同名槽但场景已变：只拆这一槽，其他槽不动
+        [self releasePinnedLiveTileForBundleId:bid];
     }
-    self.pinnedLiveScene = self.hostedScene;
-    self.pinnedLiveBundleId = [self.hostedBundleId copy];
-    self.pinnedLiveSceneStackRef = self.publishedSceneStack;
+    self.pinnedLiveScenes[bid] = self.hostedScene;
+    self.pinnedLiveStackRefs[bid] = self.publishedSceneStack;
     if (self.processAssertion) {
-        self.pinnedLiveProcessAssertion = self.processAssertion;
+        self.pinnedLiveAssertions[bid] = self.processAssertion;
         self.processAssertion = nil;
     }
-    self.pinnedLivePID = [self pidForBundleId:self.pinnedLiveBundleId];
-    MFLog(@"[strip][live] 实时贴片布防：%@（pid %d 断言%@ 场景=%@）",
-          self.pinnedLiveBundleId, self.pinnedLivePID,
-          self.pinnedLiveProcessAssertion ? @"已转移" : @"无",
-          ownsHostedScene ? @"自有" : @"接管");
+    self.pinnedLivePIDs[bid] = @([self pidForBundleId:bid]);
+    MFLog(@"[strip][live] 实时贴片布防：%@（pid %d 断言%@ 场景=%@ 槽位=%lu）",
+          bid, [self.pinnedLivePIDs[bid] intValue],
+          self.pinnedLiveAssertions[bid] ? @"已转移" : @"无",
+          ownsHostedScene ? @"自有" : @"接管",
+          (unsigned long)self.pinnedLiveScenes.count);
     return YES;
 }
 
-/// 拆除保活（App 转后台但不杀进程不毁场景；断言释放）。
--(void)releasePinnedLiveTile{
-    if (!self.hasPinnedLiveTile) {
+/// 拆除单槽保活（App 转后台但不杀进程不毁场景；断言释放）。
+-(void)releasePinnedLiveTileForBundleId:(NSString *)bundleId{
+    if (bundleId.length == 0 ||
+        (self.pinnedLiveScenes[bundleId] == nil && self.pinnedLiveAssertions[bundleId] == nil)) {
         return;
     }
-    FBScene *scene = self.pinnedLiveScene;
-    NSString *bundleId = [self.pinnedLiveBundleId copy];
-    id assertion = self.pinnedLiveProcessAssertion;
-    self.pinnedLiveScene = nil;
-    self.pinnedLiveBundleId = nil;
-    self.pinnedLiveSceneStackRef = nil;
-    self.pinnedLiveProcessAssertion = nil;
-    self.pinnedLivePID = 0;
+    FBScene *scene = self.pinnedLiveScenes[bundleId];
+    [self.pinnedLiveScenes removeObjectForKey:bundleId];
+    [self.pinnedLiveStackRefs removeObjectForKey:bundleId];
+    id assertion = self.pinnedLiveAssertions[bundleId];
+    [self.pinnedLiveAssertions removeObjectForKey:bundleId];
+    [self.pinnedLivePIDs removeObjectForKey:bundleId];
     if (scene) {
         @try {
             [self setForeground:NO forScene:scene];
@@ -2073,15 +2095,28 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
         } @catch (__unused NSException *exception) {
         }
     }
-    MFLog(@"[strip][live] 实时贴片拆除：%@（断言%@）",
-          bundleId ?: @"-", assertion ? @"已释放" : @"无");
+    MFLog(@"[strip][live] 实时贴片拆除：%@（断言%@ 剩余槽位=%lu）",
+          bundleId, assertion ? @"已释放" : @"无",
+          (unsigned long)self.pinnedLiveScenes.count);
+}
+
+/// 拆除全部保活（整链失效用）。
+-(void)releaseAllPinnedLiveTiles{
+    if (!self.hasPinnedLiveTile) {
+        return;
+    }
+    NSArray *allBids = [[self.pinnedLiveScenes.allKeys
+        arrayByAddingObjectsFromArray:self.pinnedLiveAssertions.allKeys] copy];
+    for (NSString *bid in allBids) {
+        [self releasePinnedLiveTileForBundleId:bid];
+    }
 }
 
 - (void)releaseForegroundLeaseForceBackgroundFormerHost:(BOOL)forceBackgroundFormerHost
                                       discardOwnedScene:(BOOL)discardOwnedScene{
     FBScene *scene = self.hostedScene;
     NSString *hostedId = [self.hostedBundleId copy];
-    BOOL livePin = scene != nil && scene == self.pinnedLiveScene;   // 【0.6.1】保活贴片：释放租约但保活渲染
+    BOOL livePin = [self isSceneLivePinned:scene];   // 【0.6.3】保活贴片（槽位表）：释放租约但保活渲染
     self.ios26HostedContentRecoveryPending = NO;
     self.ios26HostedContentRecoveryToken += 1;
     self.ios26HostedContentAwaitingInvalidation = NO;

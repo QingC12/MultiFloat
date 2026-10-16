@@ -79,13 +79,14 @@ hostedPresentationContentDidBecomeUnavailableForBundleId:(NSString *)bundleId
                                         generation:(NSUInteger)generation;
 -(void)abandonOwnedHostedSceneForBundleId:(NSString *)bundleId;
 
-// 【0.6.1】实时贴片（保活一片）：停靠/互换时把当前自有托管场景转进保活槽，
+// 【0.6.3】实时贴片（多片同时保活）：停靠/互换时把当前托管场景转进保活槽位表，
 // 进程断言一并转移（防挂起、持续渲染），scene 设置保持前台不回后台。
 -(BOOL)beginLiveTilePreservation;
--(void)releasePinnedLiveTile;
+-(void)releasePinnedLiveTileForBundleId:(NSString *)bundleId;
+-(void)releaseAllPinnedLiveTiles;
 -(BOOL)hasPinnedLiveTile;
--(NSString *)pinnedLiveBundleId;
--(UIView *)pinnedLiveSceneStack;
+-(BOOL)isBundleIdLivePinned:(NSString *)bundleId;
+-(UIView *)pinnedLiveSceneStackForBundleId:(NSString *)bundleId;
 
 -(void)activateScene:(FBScene *)scene
          forBundleId:(NSString *)bundleId

@@ -1024,12 +1024,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.2 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.3 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.2 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.3 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3143,7 +3143,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.2 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除 首片=实时保活）");
+    MFLog(@"[card] 0.6.3 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3905,7 +3905,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.2 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.3 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4042,12 +4042,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return image;
 }
 
-/// 停靠/互换前布防：把当前主窗会话转成实时贴片（内含旧实时片降级——同时只保活一片）。
+/// 停靠/互换前布防：把当前主窗会话转成实时贴片（【0.6.3】多片同时保活，不再拆旧片）。
 -(BOOL)mfArmLiveTileForWindow:(PODockedWindow *)w{
     if (!w) {
         return NO;
     }
-    [self mfDemotePinnedLiveTileIfAny];
     BOOL armed = NO;
     @try {
         armed = [hostSession preserveActiveSessionAsLiveTile];
@@ -4056,35 +4055,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     if (armed) {
         ContextHostManager *manager = [ContextHostManager sharedInstance];
-        w.liveStackView = [manager pinnedLiveSceneStack];
+        w.liveStackView = [manager pinnedLiveSceneStackForBundleId:w.bundleId];
         if (!w.liveStackView) {
             armed = NO;
-            [manager releasePinnedLiveTile];
         }
     }
     return armed;
-}
-
-/// 同时只保活一片：有旧实时片 → 抓最后一帧当快照 → 拆保活。
--(void)mfDemotePinnedLiveTileIfAny{
-    ContextHostManager *manager = [ContextHostManager sharedInstance];
-    if (![manager hasPinnedLiveTile]) {
-        return;
-    }
-    NSString *bid = [manager pinnedLiveBundleId] ?: @"";
-    UIView *stack = [manager pinnedLiveSceneStack];
-    UIImage *lastFrame = [self mfCaptureViewSnapshot:stack];
-    [manager releasePinnedLiveTile];
-    PODockedWindow *w = [self mfDockStripWindowForBundleId:bid];
-    if (w) {
-        [self mfTeardownLiveStackForWindow:w];
-        if (lastFrame) {
-            w.snapshotImage = lastFrame;
-            [self mfRefreshTileForWindow:w];
-        }
-        MFLog(@"[strip][live] 旧实时片降级为快照：%@（最后一帧%@）", bid,
-              lastFrame ? @"已截" : @"截取失败");
-    }
 }
 
 /// 拆除某贴片的实时挂载（回退快照 underlay）；寄存的 sceneStack 复位后脱管（可被发布链路重用）。
@@ -4157,8 +4133,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             return;
         }
         ContextHostManager *manager = [ContextHostManager sharedInstance];
-        if (![manager hasPinnedLiveTile] ||
-            ![manager.pinnedLiveBundleId isEqualToString:bid]) {
+        if (![manager isBundleIdLivePinned:bid]) {
             [self mfTeardownLiveStackForWindow:w];   // 已被开回主窗/旁路拆除
             return;
         }
@@ -4181,8 +4156,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             if ([w.bundleId isEqualToString:bundleId] && w.liveStackView == publishedStack) {
                 continue;   // 该 App 已回主窗；贴片由 pinApp 去重 drop 拆保活
             }
-            if (![manager hasPinnedLiveTile] ||
-                ![manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
+            if (![manager isBundleIdLivePinned:w.bundleId]) {
                 MFLog(@"[strip][live] 对账回退：%@ 保活已不在位 → 回退快照", w.bundleId);
                 [self mfTeardownLiveStackForWindow:w];
             }
@@ -4225,7 +4199,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     w.bundleId = [bid copy];
     w.iconImage = [POApplicationHelper imageForBundleId:bid];
     w.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:bid];
-    BOOL live = [self mfArmLiveTileForWindow:w];   // 【0.6.1】先截快照再布防（布防不动租约，快照仍可用）
+    BOOL live = [self mfArmLiveTileForWindow:w];   // 【0.6.3】先截快照再布防（布防不动租约，快照仍可用）
     w.savedFrame = keyboardZoomBaseFrame;
     w.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
     w.side = toRight ? 1 : -1;
@@ -4266,11 +4240,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     // 【0.6.1】实时片先拆保活（App 留后台）、再把寄存视图摘出来——别随贴片动画一起销毁
     if (w.liveStackView) {
-        ContextHostManager *manager = [ContextHostManager sharedInstance];
-        if ([manager hasPinnedLiveTile] &&
-            [manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
-            [manager releasePinnedLiveTile];
-        }
+        [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
         [self mfTeardownLiveStackForWindow:w];
     }
     [[self mfDockStripItemsForSide:w.side >= 0] removeObject:w];
@@ -4475,7 +4445,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         current.bundleId = [hostSession.activeBundleId copy];
         current.iconImage = [POApplicationHelper imageForBundleId:current.bundleId];
         current.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:current.bundleId];
-        BOOL live = [self mfArmLiveTileForWindow:current];   // 【0.6.1】先截快照再布防（含旧实时片降级）
+        BOOL live = [self mfArmLiveTileForWindow:current];   // 【0.6.3】先截快照再布防（多片保活，旧片不动）
         current.savedFrame = keyboardZoomBaseFrame;
         current.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
         current.side = w.side;
@@ -4491,11 +4461,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     // 【0.6.1】目标贴片若正保活：先拆保活再开（激活链路会重新拿租约与断言，scene 仍温热）
     if (w.liveStackView) {
-        ContextHostManager *manager = [ContextHostManager sharedInstance];
-        if ([manager hasPinnedLiveTile] &&
-            [manager.pinnedLiveBundleId isEqualToString:w.bundleId]) {
-            [manager releasePinnedLiveTile];
-        }
+        [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
         [self mfTeardownLiveStackForWindow:w];
     }
     mfStripPendingRestore = w;
@@ -6449,7 +6415,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [self restoreKeyboardZoomImmediately];
     keyboardZoomSuspensionReasons = POKeyboardZoomSuspensionNone;
     [self hidePresentationContainer];
-    [[ContextHostManager sharedInstance] releasePinnedLiveTile];   // 【0.6.1】整链失效 → 保活贴片一并拆除
+    [[ContextHostManager sharedInstance] releaseAllPinnedLiveTiles];   // 【0.6.3】整链失效 → 全部保活贴片一并拆除
     [hostSession invalidate];
     [[POSplitSessionController sharedInstance] end];
     [self cleanUpSubviews];
