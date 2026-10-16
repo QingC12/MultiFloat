@@ -738,6 +738,12 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 - (id<ContextHostManagerExternalSceneDelegate>)sceneDelegateForBundleId:(NSString *)bundleId;
 - (void)setSceneDelegate:(id<ContextHostManagerExternalSceneDelegate>)delegate forBundleId:(NSString *)bundleId;
 - (id<ContextHostManagerExternalSceneDelegate>)mf_delegateForScene:(FBScene *)scene;
+// 【M1/S3】会话生命周期账本（窗口认领）：只记账 + 打日志，不参与任何业务判定 ⇒ 行为零变化。
+- (POSceneSession *)mfLedgerSession;
+- (NSUInteger)mfTotalWindowClaimCount;
+- (void)mfClaimWindow:(NSString *)windowKey forBundleId:(NSString *)bundleId;
+- (void)mfReleaseWindow:(NSString *)windowKey forBundleId:(NSString *)bundleId;
+- (void)mfLogSessionProbe:(NSString *)tag;   // 【M1/S4】断言/租约探测（探测版，不改行为）
 @property (nonatomic, strong) FBScene *hostedScene;
 @property (nonatomic, strong) FBSceneLayerManager *hostedLayerManager;
 @property (nonatomic, strong) FBSceneHostManager *hostedFallbackHostManager;
@@ -891,6 +897,11 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
                                                          valueOptions:NSPointerFunctionsWeakMemory];
         [self registerSession:_primarySession forBundleId:nil];
         MFLog(@"[session] 0.6.19 多会话注册表就位（S2）：已登记 1 个会话（primarySession），按 bundleId 路由 delegate 可用（本步仍单会话）");
+
+        // 【M1/S3+S4】生命周期账本 + 断言/租约探测（探测版）：只记账、只打日志，不改变任何行为。
+        MFLog(@"[session] 0.6.22 会话生命周期账本就位（S3）：会话身份 + 窗口认领计数（单窗恒落在 primarySession，行为零变化）");
+        MFLog(@"[session] 0.6.22 断言/租约探测已启用（S4 探测版）：单窗期望 前台租约=1、主租约断言=1、保活断言=片数");
+        [self mfLogSessionProbe:@"启动基线"];
     }
     return self;
 }
@@ -1035,6 +1046,100 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
         }
     }
     return self.sceneDelegate;
+}
+
+#pragma mark - 【M1 / S3】会话生命周期账本（窗口认领 / 引用计数）
+//
+// 目标（路线图 M1/S3）：把「会话的创建 / 存活 / 回收」从散落的隐式引用，收成一份**显式账本**，
+// 让「一片窗口 = 一次认领」变成日志可验证的事实（无泄漏判定），同时为 M2（一片 = 一会话）铺路。
+//
+// 本步**行为零变化**：
+//   · 单窗阶段所有认领一律落在 primarySession（**不新建会话** ⇒ 与 S2 完全一致）；
+//   · 账本**只记录**，不参与任何 if 判定、不影响任何既有返回值 / 时序。
+//
+// 认领槽位 key：
+//   · main        —— 主悬浮窗（前台租约生效即认领，租约释放即释放）
+//   · tile:<bid>  —— 停靠条上的实时贴片（保活布防即认领，拆除即释放）
+static NSString * const kMFWindowClaimMain = @"main";
+
+static inline NSString *MFWindowClaimKeyForTile(NSString *bundleId) {
+    return bundleId.length ? [NSString stringWithFormat:@"tile:%@", bundleId] : @"tile:";
+}
+
+- (POSceneSession *)mfLedgerSession {
+    // 单窗阶段：账本只落在主会话（M2 起改为「按 bundleId 取会话」）。
+    return self.primarySession;
+}
+
+- (NSUInteger)mfTotalWindowClaimCount {
+    NSUInteger total = self.primarySession.windowClaimCount;
+    NSMutableSet<NSValue *> *seen = [NSMutableSet set];
+    if (self.primarySession) {
+        [seen addObject:[NSValue valueWithNonretainedObject:self.primarySession]];
+    }
+    for (POSceneSession *session in self.sessionsByBundleId.allValues) {
+        if (!session) {
+            continue;
+        }
+        NSValue *box = [NSValue valueWithNonretainedObject:session];
+        if ([seen containsObject:box]) {
+            continue;   // primarySession 可能同时挂在多个 key 下，按对象去重
+        }
+        [seen addObject:box];
+        total += session.windowClaimCount;
+    }
+    return total;
+}
+
+- (void)mfClaimWindow:(NSString *)windowKey forBundleId:(NSString *)bundleId {
+    if (windowKey.length == 0) {
+        return;
+    }
+    POSceneSession *session = [self mfLedgerSession];
+    if (!session) {
+        return;
+    }
+    if (session.sessionBundleId.length == 0 && bundleId.length) {
+        session.sessionBundleId = [bundleId copy];
+    }
+    NSUInteger count = [session mf_claimWindow:windowKey];
+    MFLog(@"[session] 0.6.22 账本·认领窗口：%@（bid=%@ 会话=%@ 本会话认领=%lu 全局认领=%lu）",
+          windowKey, bundleId ?: @"-",
+          (session == self.primarySession) ? @"primary" : @"detached",
+          (unsigned long)count, (unsigned long)[self mfTotalWindowClaimCount]);
+}
+
+- (void)mfReleaseWindow:(NSString *)windowKey forBundleId:(NSString *)bundleId {
+    if (windowKey.length == 0) {
+        return;
+    }
+    POSceneSession *session = [self mfLedgerSession];
+    if (!session) {
+        return;
+    }
+    NSUInteger before = session.windowClaimCount;
+    NSUInteger count = [session mf_releaseWindow:windowKey];
+    if (before == count) {
+        return;   // 本就没认领过 ⇒ 不刷日志（防噪声）
+    }
+    MFLog(@"[session] 0.6.22 账本·释放窗口：%@（bid=%@ 本会话认领=%lu 全局认领=%lu）",
+          windowKey, bundleId ?: @"-",
+          (unsigned long)count, (unsigned long)[self mfTotalWindowClaimCount]);
+}
+
+/// 【M1/S4】断言 / 租约探测（**探测版**：只打数，不改行为）。
+/// 单窗期望：前台租约 ∈ {0,1}；主租约断言 ∈ {0,1}；保活断言数 == 保活片数 == 保活 pid 数。
+- (void)mfLogSessionProbe:(NSString *)tag {
+    MFLog(@"[session][probe] 0.6.22 %@：认领=%lu（%@）会话=%@ ｜ 前台租约=%d 主租约断言=%d ｜ 保活片=%lu 保活断言=%lu 保活pid=%lu",
+          tag ?: @"-",
+          (unsigned long)[self mfTotalWindowClaimCount],
+          [[self.primarySession mf_claimedWindowKeys] componentsJoinedByString:@","],
+          (self.primarySession == nil) ? @"无" : @"primary",
+          (int)(self.isForegroundLeaseActive ? 1 : 0),
+          (int)(self.processAssertion ? 1 : 0),
+          (unsigned long)self.pinnedLiveScenes.count,
+          (unsigned long)self.pinnedLiveAssertions.count,
+          (unsigned long)self.pinnedLivePIDs.count);
 }
 
 #pragma mark - 【M1 / S1】会话作用域状态转发访问器（状态在 POSceneSession，接口未变）
@@ -2212,6 +2317,9 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
 
     self.foregroundLeaseActive = YES;
     self.activeLeaseGeneration = generation;
+    // 【M1/S3】账本：主悬浮窗认领（前台租约生效 = 主窗存在）
+    [self mfClaimWindow:kMFWindowClaimMain forBundleId:bundleId];
+    [self mfLogSessionProbe:@"租约生效"];   // 【M1/S4】探测点
     self.hostedScene = scene;
     self.hostedBundleId = [bundleId copy];
     if (scene == self.ownedHostedScene &&
@@ -2544,6 +2652,9 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
           self.pinnedLiveAssertions[bid] ? @"已转移" : @"无",
           ownsHostedScene ? @"自有" : @"接管",
           (unsigned long)self.pinnedLiveScenes.count);
+    // 【M1/S3】账本：贴片认领（一片 = 一次认领；同槽重入幂等，不会翻倍）
+    [self mfClaimWindow:MFWindowClaimKeyForTile(bid) forBundleId:bid];
+    [self mfLogSessionProbe:@"贴片布防"];   // 【M1/S4】探测点
     return YES;
 }
 
@@ -2574,6 +2685,9 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
     MFLog(@"[strip][live] 实时贴片拆除：%@（断言%@ 剩余槽位=%lu）",
           bundleId, assertion ? @"已释放" : @"无",
           (unsigned long)self.pinnedLiveScenes.count);
+    // 【M1/S3】账本：贴片释放
+    [self mfReleaseWindow:MFWindowClaimKeyForTile(bundleId) forBundleId:bundleId];
+    [self mfLogSessionProbe:@"贴片拆除"];   // 【M1/S4】探测点
 }
 
 /// 拆除全部保活（整链失效用）。
@@ -2586,6 +2700,7 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
     for (NSString *bid in allBids) {
         [self releasePinnedLiveTileForBundleId:bid];
     }
+    [self mfLogSessionProbe:@"清空保活"];   // 【M1/S3】整链失效后：认领应已归零
 }
 
 - (void)releaseForegroundLeaseForceBackgroundFormerHost:(BOOL)forceBackgroundFormerHost
@@ -2616,7 +2731,10 @@ static NSString * const kMFPrimarySessionKey = @"__mf_primary_session__";
     MFLog(@"[cam] 清空相机前台授权（放弃托管 %@）", hostedId ?: @"-");
     self.foregroundLeaseActive = NO;
     self.activeLeaseGeneration = 0;
+    // 【M1/S3】账本：主悬浮窗释放（停靠时主窗身份转为贴片，故认领总数由 1 main 变成 1 tile）
+    [self mfReleaseWindow:kMFWindowClaimMain forBundleId:hostedId];
     [self releaseProcessAssertion];
+    [self mfLogSessionProbe:@"租约释放"];   // 【M1/S4】探测点
     [self stopObservingLayerManager];
     [self stopObservingHostedSceneEvents];
     if (self.hostedFallbackHostManager) {

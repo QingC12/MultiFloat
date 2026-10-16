@@ -83,4 +83,21 @@
 @property (nonatomic, assign) BOOL ios26HostedContentUnavailableNotified;
 @property (nonatomic, assign) CFTimeInterval ios26HostedContentStableSince;
 
+// ---- 【M1/S3】会话身份与「窗口认领账本」----
+// S1 让状态可以「每窗一份」；S2 让会话可以「按 bundleId 找到」；本步补上第三件：
+//   会话的「身份 / 认领 / 回收」在 manager 侧有一份**显式账本**（一片窗口 = 一次认领）。
+//   · sessionBundleId   —— 该会话当前代表的窗口 bundleId（长度 0 = 尚未认领具体 App）
+//   · mf_claimWindow:   —— 认领一个窗口槽（**幂等**：同一 key 重复认领只算一次）
+//   · mf_releaseWindow: —— 释放窗口槽，返回剩余认领数
+//   · mf_claimedWindowKeys —— 当前认领的槽位清单（探测日志用）
+//   ⚠️ 账本**只用于**「生命周期可观测 + 无泄漏判定」，不参与任何业务判定
+//      ⇒ 单窗阶段行为零变化；M2 起「一片 = 一会话」时才用它做归属判定。
+@property (nonatomic, copy) NSString *sessionBundleId;
+@property (nonatomic, assign, readonly) NSTimeInterval sessionCreatedAt;
+@property (nonatomic, assign, readonly) NSUInteger windowClaimCount;
+- (NSUInteger)mf_claimWindow:(NSString *)windowKey;
+- (NSUInteger)mf_releaseWindow:(NSString *)windowKey;
+- (void)mf_releaseAllWindows;
+- (NSArray<NSString *> *)mf_claimedWindowKeys;
+
 @end
