@@ -1,4 +1,5 @@
 #import "ContextHostManager.h"
+#import "POSceneSession.h"   // 【M1/S1】会话作用域状态容器
 #import "POSplitSessionController.h"
 #import "POApplicationHelper.h"
 #import "POCameraGrantState.h"
@@ -721,6 +722,10 @@ static void PONormalizeIOS26PresentationContainerGeometry(UIView *container) {
 }
 
 @interface ContextHostManager ()
+// 【M1/S1】会话作用域状态容器：本步只创建一个（单窗行为零变化）。
+// 下方原 @property 声明全部由转发访问器实现（见 @implementation 内同名 getter/setter），
+// 因此这些状态实际存储在 primarySession 上，调用点一行未改。
+@property (nonatomic, strong) POSceneSession *primarySession;
 @property (nonatomic, strong) FBScene *hostedScene;
 @property (nonatomic, strong) FBSceneLayerManager *hostedLayerManager;
 @property (nonatomic, strong) FBSceneHostManager *hostedFallbackHostManager;
@@ -853,8 +858,311 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
     return sharedInstance;
 }
 
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // 【M1/S1】会话作用域状态容器（单窗阶段只建一个；S2 起按 bundleId 注册）
+        _primarySession = [POSceneSession new];
+        MFLog(@"[session] 0.6.18 会话状态对象化（S1）：primarySession 已创建（会话作用域状态 %lu 项，多片表仍在本类）",
+              (unsigned long)44);
+    }
+    return self;
+}
+
+#pragma mark - 【M1 / S1】会话作用域状态转发访问器（状态在 POSceneSession，接口未变）
+//
+// 为什么用「转发」而不是直接改调用点：
+//   全文件对这批属性有 0 处直接 ivar 引用（全部走 self.xxx），
+//   因此这里实现 getter/setter 后，原 @property 声明不再合成 ivar，
+//   而所有 self.xxx 调用点 **一行都不用改** ⇒ 搬家是机械的、可逐项核对。
+// 本步只有一个会话（primarySession）；S2 起改为「按 bundleId 取会话」。
+//
+// ---- 托管组 ----
+- (FBScene *)hostedScene {
+    return [self.primarySession hostedScene];
+}
+- (void)setHostedScene:(FBScene *)value {
+    [self.primarySession setHostedScene:value];
+}
+- (FBSceneLayerManager *)hostedLayerManager {
+    return [self.primarySession hostedLayerManager];
+}
+- (void)setHostedLayerManager:(FBSceneLayerManager *)value {
+    [self.primarySession setHostedLayerManager:value];
+}
+- (FBSceneHostManager *)hostedFallbackHostManager {
+    return [self.primarySession hostedFallbackHostManager];
+}
+- (void)setHostedFallbackHostManager:(FBSceneHostManager *)value {
+    [self.primarySession setHostedFallbackHostManager:value];
+}
+- (NSString *)hostedBundleId {
+    return [self.primarySession hostedBundleId];
+}
+- (void)setHostedBundleId:(NSString *)value {
+    [self.primarySession setHostedBundleId:value];
+}
+- (BOOL)observingLayers {
+    return [self.primarySession observingLayers];
+}
+- (void)setObservingLayers:(BOOL)value {
+    [self.primarySession setObservingLayers:value];
+}
+- (FBScene *)observedClientSettingsScene {
+    return [self.primarySession observedClientSettingsScene];
+}
+- (void)setObservedClientSettingsScene:(FBScene *)value {
+    [self.primarySession setObservedClientSettingsScene:value];
+}
+- (FBScene *)observedContentStateScene {
+    return [self.primarySession observedContentStateScene];
+}
+- (void)setObservedContentStateScene:(FBScene *)value {
+    [self.primarySession setObservedContentStateScene:value];
+}
+
+// ---- 租约与进程断言组 ----
+- (BOOL)isForegroundLeaseActive {
+    return [self.primarySession isForegroundLeaseActive];
+}
+- (void)setForegroundLeaseActive:(BOOL)value {
+    [self.primarySession setForegroundLeaseActive:value];
+}
+- (NSUInteger)activeLeaseGeneration {
+    return [self.primarySession activeLeaseGeneration];
+}
+- (void)setActiveLeaseGeneration:(NSUInteger)value {
+    [self.primarySession setActiveLeaseGeneration:value];
+}
+- (id)processAssertion {
+    return [self.primarySession processAssertion];
+}
+- (void)setProcessAssertion:(id)value {
+    [self.primarySession setProcessAssertion:value];
+}
+
+// ---- 发布（呈现栈）组 ----
+- (FBScene *)publishedScene {
+    return [self.primarySession publishedScene];
+}
+- (void)setPublishedScene:(FBScene *)value {
+    [self.primarySession setPublishedScene:value];
+}
+- (UIView *)publishedSceneStack {
+    return [self.primarySession publishedSceneStack];
+}
+- (void)setPublishedSceneStack:(UIView *)value {
+    [self.primarySession setPublishedSceneStack:value];
+}
+- (id)ios26PresentationContext {
+    return [self.primarySession ios26PresentationContext];
+}
+- (void)setIos26PresentationContext:(id)value {
+    [self.primarySession setIos26PresentationContext:value];
+}
+- (UIView *)ios26PresentationContainer {
+    return [self.primarySession ios26PresentationContainer];
+}
+- (void)setIos26PresentationContainer:(UIView *)value {
+    [self.primarySession setIos26PresentationContainer:value];
+}
+- (NSArray<FBSceneLayer *> *)publishedMainLayers {
+    return [self.primarySession publishedMainLayers];
+}
+- (void)setPublishedMainLayers:(NSArray<FBSceneLayer *> *)value {
+    [self.primarySession setPublishedMainLayers:value];
+}
+- (CGSize)publishedSceneStackSize {
+    return [self.primarySession publishedSceneStackSize];
+}
+- (void)setPublishedSceneStackSize:(CGSize)value {
+    [self.primarySession setPublishedSceneStackSize:value];
+}
+- (UIInterfaceOrientation)publishedSceneStackOrientation {
+    return [self.primarySession publishedSceneStackOrientation];
+}
+- (void)setPublishedSceneStackOrientation:(UIInterfaceOrientation)value {
+    [self.primarySession setPublishedSceneStackOrientation:value];
+}
+- (BOOL)forceNextPublishedSceneStackRebuild {
+    return [self.primarySession forceNextPublishedSceneStackRebuild];
+}
+- (void)setForceNextPublishedSceneStackRebuild:(BOOL)value {
+    [self.primarySession setForceNextPublishedSceneStackRebuild:value];
+}
+
+// ---- 自有场景组 ----
+- (FBScene *)ownedHostedScene {
+    return [self.primarySession ownedHostedScene];
+}
+- (void)setOwnedHostedScene:(FBScene *)value {
+    [self.primarySession setOwnedHostedScene:value];
+}
+- (NSString *)ownedHostedBundleId {
+    return [self.primarySession ownedHostedBundleId];
+}
+- (void)setOwnedHostedBundleId:(NSString *)value {
+    [self.primarySession setOwnedHostedBundleId:value];
+}
+- (int)ownedHostedProcessPID {
+    return [self.primarySession ownedHostedProcessPID];
+}
+- (void)setOwnedHostedProcessPID:(int)value {
+    [self.primarySession setOwnedHostedProcessPID:value];
+}
+- (BOOL)ownedHostedSceneServerFrameCanonicalized {
+    return [self.primarySession ownedHostedSceneServerFrameCanonicalized];
+}
+- (void)setOwnedHostedSceneServerFrameCanonicalized:(BOOL)value {
+    [self.primarySession setOwnedHostedSceneServerFrameCanonicalized:value];
+}
+- (BOOL)ownedHostedSceneCapabilityProven {
+    return [self.primarySession ownedHostedSceneCapabilityProven];
+}
+- (void)setOwnedHostedSceneCapabilityProven:(BOOL)value {
+    [self.primarySession setOwnedHostedSceneCapabilityProven:value];
+}
+
+// ---- 系统托管快照组 ----
+- (FBScene *)systemHostedSnapshotScene {
+    return [self.primarySession systemHostedSnapshotScene];
+}
+- (void)setSystemHostedSnapshotScene:(FBScene *)value {
+    [self.primarySession setSystemHostedSnapshotScene:value];
+}
+- (id)systemHostedOriginalSettings {
+    return [self.primarySession systemHostedOriginalSettings];
+}
+- (void)setSystemHostedOriginalSettings:(id)value {
+    [self.primarySession setSystemHostedOriginalSettings:value];
+}
+- (CGRect)systemHostedOriginalFrame {
+    return [self.primarySession systemHostedOriginalFrame];
+}
+- (void)setSystemHostedOriginalFrame:(CGRect)value {
+    [self.primarySession setSystemHostedOriginalFrame:value];
+}
+- (BOOL)systemHostedInitialFrameApplied {
+    return [self.primarySession systemHostedInitialFrameApplied];
+}
+- (void)setSystemHostedInitialFrameApplied:(BOOL)value {
+    [self.primarySession setSystemHostedInitialFrameApplied:value];
+}
+- (BOOL)systemHostedServerFrameCanonicalized {
+    return [self.primarySession systemHostedServerFrameCanonicalized];
+}
+- (void)setSystemHostedServerFrameCanonicalized:(BOOL)value {
+    [self.primarySession setSystemHostedServerFrameCanonicalized:value];
+}
+
+// ---- 方向权威组 ----
+- (UIInterfaceOrientation)hostedInterfaceOrientation {
+    return [self.primarySession hostedInterfaceOrientation];
+}
+- (void)setHostedInterfaceOrientation:(UIInterfaceOrientation)value {
+    [self.primarySession setHostedInterfaceOrientation:value];
+}
+- (UIInterfaceOrientation)activeSurfaceSourceOrientation {
+    return [self.primarySession activeSurfaceSourceOrientation];
+}
+- (void)setActiveSurfaceSourceOrientation:(UIInterfaceOrientation)value {
+    [self.primarySession setActiveSurfaceSourceOrientation:value];
+}
+- (BOOL)runtimeHostedOrientationAuthorityActive {
+    return [self.primarySession runtimeHostedOrientationAuthorityActive];
+}
+- (void)setRuntimeHostedOrientationAuthorityActive:(BOOL)value {
+    [self.primarySession setRuntimeHostedOrientationAuthorityActive:value];
+}
+- (BOOL)runtimeClientOrientationBaselineEstablished {
+    return [self.primarySession runtimeClientOrientationBaselineEstablished];
+}
+- (void)setRuntimeClientOrientationBaselineEstablished:(BOOL)value {
+    [self.primarySession setRuntimeClientOrientationBaselineEstablished:value];
+}
+- (BOOL)retainedRuntimeSourceRebasePending {
+    return [self.primarySession retainedRuntimeSourceRebasePending];
+}
+- (void)setRetainedRuntimeSourceRebasePending:(BOOL)value {
+    [self.primarySession setRetainedRuntimeSourceRebasePending:value];
+}
+- (BOOL)applyingHostedSettingsInternally {
+    return [self.primarySession applyingHostedSettingsInternally];
+}
+- (void)setApplyingHostedSettingsInternally:(BOOL)value {
+    [self.primarySession setApplyingHostedSettingsInternally:value];
+}
+- (UIInterfaceOrientation)pendingRuntimeOrientationNotification {
+    return [self.primarySession pendingRuntimeOrientationNotification];
+}
+- (void)setPendingRuntimeOrientationNotification:(UIInterfaceOrientation)value {
+    [self.primarySession setPendingRuntimeOrientationNotification:value];
+}
+- (NSUInteger)pendingRuntimeOrientationNotificationGeneration {
+    return [self.primarySession pendingRuntimeOrientationNotificationGeneration];
+}
+- (void)setPendingRuntimeOrientationNotificationGeneration:(NSUInteger)value {
+    [self.primarySession setPendingRuntimeOrientationNotificationGeneration:value];
+}
+- (UIInterfaceOrientation)presentationInterfaceOrientation {
+    return [self.primarySession presentationInterfaceOrientation];
+}
+- (void)setPresentationInterfaceOrientation:(UIInterfaceOrientation)value {
+    [self.primarySession setPresentationInterfaceOrientation:value];
+}
+
+// ---- 重连与 iOS26 恢复组 ----
+- (NSString *)pendingRemnantReconnectBundleId {
+    return [self.primarySession pendingRemnantReconnectBundleId];
+}
+- (void)setPendingRemnantReconnectBundleId:(NSString *)value {
+    [self.primarySession setPendingRemnantReconnectBundleId:value];
+}
+- (NSString *)remnantReconnectClaimBundleId {
+    return [self.primarySession remnantReconnectClaimBundleId];
+}
+- (void)setRemnantReconnectClaimBundleId:(NSString *)value {
+    [self.primarySession setRemnantReconnectClaimBundleId:value];
+}
+- (NSString *)ownedCanonicalSceneAwaitingLeaseBundleId {
+    return [self.primarySession ownedCanonicalSceneAwaitingLeaseBundleId];
+}
+- (void)setOwnedCanonicalSceneAwaitingLeaseBundleId:(NSString *)value {
+    [self.primarySession setOwnedCanonicalSceneAwaitingLeaseBundleId:value];
+}
+- (BOOL)ios26HostedContentRecoveryPending {
+    return [self.primarySession ios26HostedContentRecoveryPending];
+}
+- (void)setIos26HostedContentRecoveryPending:(BOOL)value {
+    [self.primarySession setIos26HostedContentRecoveryPending:value];
+}
+- (NSUInteger)ios26HostedContentRecoveryToken {
+    return [self.primarySession ios26HostedContentRecoveryToken];
+}
+- (void)setIos26HostedContentRecoveryToken:(NSUInteger)value {
+    [self.primarySession setIos26HostedContentRecoveryToken:value];
+}
+- (BOOL)ios26HostedContentAwaitingInvalidation {
+    return [self.primarySession ios26HostedContentAwaitingInvalidation];
+}
+- (void)setIos26HostedContentAwaitingInvalidation:(BOOL)value {
+    [self.primarySession setIos26HostedContentAwaitingInvalidation:value];
+}
+- (BOOL)ios26HostedContentUnavailableNotified {
+    return [self.primarySession ios26HostedContentUnavailableNotified];
+}
+- (void)setIos26HostedContentUnavailableNotified:(BOOL)value {
+    [self.primarySession setIos26HostedContentUnavailableNotified:value];
+}
+- (CFTimeInterval)ios26HostedContentStableSince {
+    return [self.primarySession ios26HostedContentStableSince];
+}
+- (void)setIos26HostedContentStableSince:(CFTimeInterval)value {
+    [self.primarySession setIos26HostedContentStableSince:value];
+}
+
 - (void)setPresentationInterfaceOrientation:(UIInterfaceOrientation)orientation {
-    _presentationInterfaceOrientation = orientation;
+    [self.primarySession setPresentationInterfaceOrientation:orientation];
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26 ||
         !self.publishedSceneStack ||
         !POIsConcreteInterfaceOrientation(self.publishedSceneStackOrientation) ||
