@@ -69,7 +69,6 @@
 #define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
 #define MF_CARD_EDGE_FLICK_CLOSE_MARGIN 44.0     // 【0.3.19】卡片右缘距屏幕右缘小于此值才可甩边关闭
-#define MF_CARD_BOTTOM_ARM_DELAY 0.20            // 【0.5.0 用户 log44】底带"按住后移动"：按住 0.2s 后进入移动模式（快速滑动/上滑/下拉手势已按用户指令移除）
 // 【0.4.12 用户 log39】"移动不灵敏 / 缩放太灵敏" —— 两条都对上实证：
 //   · 移动：用户三次按在**卡片底边内侧 1~5pt**（宿主坐标 y=682/685/686，底带起点 687）⇒ 差一点点，
 //     带子没接住（`MFEdgeBandHostView.hitTest` 只认带子子视图，空隙一律透传给 App）。
@@ -384,8 +383,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL mfEdgeDragFromDocked;          // 【0.3.22】本次拖动起手自"停靠小窗盖层"（小位移=还原）
     BOOL mfManualScaleAnchorRight;      // 【0.3.19】手动缩放锚点：NO=左上角（默认，用户指定） YES=右上角（右侧停靠）
     CFTimeInterval mfEdgeDragBeganAt;   // 【0.4.14→0.5.0 保留】角把手手势 Began 时刻（缩放收尾日志用）
-    BOOL mfBottomMoveArmed;             // 【0.5.0】底带"按住后移动"：按住 0.2s 后 armed 才跟手
-    CGPoint mfBottomMoveArmTranslation; // 【0.4.18】armed 瞬间的累计位移（移动重定锚基准）
     NSUInteger mfEdgeGestureToken;      // 【0.4.18】边缘手势代次（dispatch_after 回调防串扰）
     UIView *handleVisualHandoffSnapshotView;
     NSUInteger handleVisualHandoffGeneration;
@@ -3110,7 +3107,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.5.0 卡外热区带已安装（左右=停靠 底=按住0.2s后拖动移动 右下角+左下角=缩放 顶=关闭 停靠态=点小窗还原）");
+    MFLog(@"[card] 0.5.1 卡外热区带已安装（左右=停靠 底=拖动移动 右下角+左下角=缩放 顶=关闭 停靠态=点小窗还原）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3549,39 +3546,20 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                   NSStringFromCGRect(mfEdgeBandBottomLeft.frame));
             return;
         }
-        // ---- 自由移动（【0.5.0 用户 log44】底带唯一语义 = 按住 0.2s 后拖动移动；
+        // ---- 自由移动（【0.5.1 用户指令】底带唯一语义 = 命中热区立即跟手移动，无按住时长要求；
         //      快速上滑关闭/下拉全屏/原生打开均已按用户指令移除）----
         mfEdgeDragMode = 1;
         // 【0.3.22】起手自"停靠小窗盖层"：小位移（< MF_CARD_EDGE_TAP_SLOP）= 用户其实是在点小窗 → 松手时还原。
         mfEdgeDragFromDocked = (mfDockedTapView != nil && !mfDockedTapView.hidden &&
                                 CGRectContainsPoint(mfDockedTapView.frame, p));
-        // 停靠盖层立即 armed（保点小窗还原）；普通底带按住 0.2s 后 armed
-        mfBottomMoveArmed = mfEdgeDragFromDocked;
-        mfBottomMoveArmTranslation = CGPointZero;
         mfEdgeDragStartBottomY = CGRectGetMaxY(keyboardZoomBaseFrame);
         mfEdgeDragStartX = CGRectGetMinX(keyboardZoomBaseFrame);
-        NSUInteger moveToken = mfEdgeGestureToken;
-        if (!mfBottomMoveArmed) {
-            UIPanGestureRecognizer *capturedPan = pan;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(MF_CARD_BOTTOM_ARM_DELAY * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (moveToken != self->mfEdgeGestureToken || self->mfEdgeDragMode != 1 ||
-                    self->mfBottomMoveArmed) {
-                    return;
-                }
-                self->mfBottomMoveArmed = YES;
-                self->mfBottomMoveArmTranslation = [capturedPan translationInView:self.view];
-                MFLog(@"[card] 底带按住 %.0fms 生效 → 进入移动模式（从当前位置跟手）",
-                      MF_CARD_BOTTOM_ARM_DELAY * 1000.0);
-            });
-        }
         CGFloat rangeMin = 0, rangeMax = 0;
         [self mfCardBottomYRangeMin:&rangeMin max:&rangeMax];
         // 【0.3.19】不再强制 restoreKeyboardZoomImmediately：停靠/缩放态拖动保持当前大小移动
-        MFLog(@"[card] 自由移动开始（起点 屏x=%.0f 内容x=%.0f 底边 %.0f，scale %.2f，Y 可用区间 %.0f..%.0f，armed=%d）",
+        MFLog(@"[card] 自由移动开始（起点 屏x=%.0f 内容x=%.0f 底边 %.0f，scale %.2f，Y 可用区间 %.0f..%.0f）",
               mfEdgeDragStartX - [self mfCardScrollOffsetX], mfEdgeDragStartX,
-              mfEdgeDragStartBottomY, appliedCardScale, rangeMin, rangeMax, mfBottomMoveArmed);
+              mfEdgeDragStartBottomY, appliedCardScale, rangeMin, rangeMax);
         return;
     }
     if (pan.state == UIGestureRecognizerStateChanged) {
@@ -3597,10 +3575,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         if (mfEdgeDragMode != 1) {
             return;
         }
-        // 【0.4.18 用户 log43】"按住后移动"：未 armed（按住未生效/快速滑动）→ 不跟手
-        if (!mfBottomMoveArmed) {
-            return;
-        }
         // 【0.3.20 诊断】每次拖动的第一帧打一行，用来区分"Changed 到底有没有到"
         // 与"到了但被钳制压回原处"（log29 只有首尾两行、位移恒为 0，无法区分这两种真因）
         if (!mfEdgeDragLoggedChanged) {
@@ -3608,11 +3582,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             MFLog(@"[card] 自由移动跟手首帧 位移(%.1f,%.1f) 触点数=%lu",
                   t.x, t.y, (unsigned long)pan.numberOfTouches);
         }
-        // armed 后从 armed 瞬间的位置起算（重定锚：手指按住期间卡片不动，动的是之后的增量）
-        CGFloat moveX = t.x - mfBottomMoveArmTranslation.x;
-        CGFloat moveY = t.y - mfBottomMoveArmTranslation.y;
-        [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + moveY
-                                 originX:mfEdgeDragStartX + moveX];
+        // 【0.5.1】命中热区立即跟手（无 armed 时长门槛），从手势起点累计位移直接映射
+        [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + t.y
+                                 originX:mfEdgeDragStartX + t.x];
         return;
     }
     if (pan.state == UIGestureRecognizerStateEnded ||
@@ -3640,15 +3612,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         if (pan.state == UIGestureRecognizerStateEnded) {
             CGPoint velocity = [pan velocityInView:self.view];
-            // 【0.5.0 用户 log44】未 armed（按住未满 0.2s 的快速滑动）→ 无手势语义，忽略。
-            //   快速上滑关闭/下拉全屏/原生打开均已按用户指令移除。
-            if (!mfBottomMoveArmed) {
-                MFLog(@"[card] 底带快速滑动（vy=%.0f 位移y=%.1f）→ 忽略（按住 0.2s 后拖动才会移动）",
-                      velocity.y, endTranslation.y);
-                mfEdgeDragMode = 0;
-                [self resetAutoNubTimer];
-                return;
-            }
             // 【0.3.22】停靠小窗上"手抖式拖动"（位移 < MF_CARD_EDGE_TAP_SLOP）= 用户想点小窗还原 → 还原，不移动
             if (mfEdgeDragFromDocked &&
                 hypot(endTranslation.x, endTranslation.y) < MF_CARD_EDGE_TAP_SLOP) {
@@ -3660,17 +3623,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 [self mfRestoreFromDock];
                 return;
             }
-            // armed（按住生效后拖动）→ 正常移动收尾：无 Changed 补一次、甩边关、越界回弹
+            // 【0.5.1】正常移动收尾：无 Changed 补一次、甩边关、越界回弹
             if (!mfEdgeDragLoggedChanged &&
-                (fabs(endTranslation.x - mfBottomMoveArmTranslation.x) > 0.5 ||
-                 fabs(endTranslation.y - mfBottomMoveArmTranslation.y) > 0.5)) {
+                (fabs(endTranslation.x) > 0.5 || fabs(endTranslation.y) > 0.5)) {
                 MFLog(@"[card] 自由移动：全程无 Changed，按总位移补一次(%.1f,%.1f)",
-                      endTranslation.x - mfBottomMoveArmTranslation.x,
-                      endTranslation.y - mfBottomMoveArmTranslation.y);
-                [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY +
-                                                 (endTranslation.y - mfBottomMoveArmTranslation.y)
-                                         originX:mfEdgeDragStartX +
-                                                 (endTranslation.x - mfBottomMoveArmTranslation.x)];
+                      endTranslation.x, endTranslation.y);
+                [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + endTranslation.y
+                                         originX:mfEdgeDragStartX + endTranslation.x];
             }
             CGFloat endScreenX = CGRectGetMinX(keyboardZoomBaseFrame) - [self mfCardScrollOffsetX];
             CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
