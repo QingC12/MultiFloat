@@ -21,6 +21,10 @@ NSString * const MFSystemActionIdPrefix = @"mfsys.";
 
 static NSString * const kMFSystemActionScreenshot = @"mfsys.screenshot";
 static NSString * const kMFSystemActionTranslate  = @"mfsys.translate";
+// 【0.6.11 用户指令】ACR 快捷方式扩编：录屏 / 控制中心 / 通知中心（用户叫这类快捷动作"ACR"）
+static NSString * const kMFSystemActionRecord     = @"mfsys.record";
+static NSString * const kMFSystemActionCC         = @"mfsys.controlcenter";
+static NSString * const kMFSystemActionNC         = @"mfsys.notificationcenter";
 
 /// 圆盘收起动画 0.22s（MFRingPicker.m 的 hide）⇒ 动作统一延后 0.35s 执行，
 /// 保证截图/翻译面板出现时圆盘已经不在了。
@@ -42,13 +46,26 @@ NSString *MFSystemActionDisplayName(NSString *actionId) {
     if ([actionId isEqualToString:kMFSystemActionTranslate]) {
         return @"翻译";
     }
+    if ([actionId isEqualToString:kMFSystemActionRecord]) {
+        return @"录屏";
+    }
+    if ([actionId isEqualToString:kMFSystemActionCC]) {
+        return @"控制中心";
+    }
+    if ([actionId isEqualToString:kMFSystemActionNC]) {
+        return @"通知中心";
+    }
     return nil;
 }
 
 NSArray<NSDictionary<NSString *, NSString *> *> *MFSystemActionEditorEntries(void) {
-    // 名字后面带「· 系统动作」便于在编辑器里一眼区分（它们会置顶显示）
-    return @[ @{ @"id": kMFSystemActionScreenshot, @"name": @"截屏 · 系统动作" },
-              @{ @"id": kMFSystemActionTranslate,  @"name": @"翻译 · 系统动作" } ];
+    // 【0.6.11 用户指令】名字后面带「· ACR」——用户对这类系统快捷动作的叫法，编辑器里
+    //   与"桌面 APP"一眼区分（它们置顶显示）
+    return @[ @{ @"id": kMFSystemActionScreenshot, @"name": @"截屏 · ACR" },
+              @{ @"id": kMFSystemActionTranslate,  @"name": @"翻译 · ACR" },
+              @{ @"id": kMFSystemActionRecord,     @"name": @"录屏 · ACR" },
+              @{ @"id": kMFSystemActionCC,         @"name": @"控制中心 · ACR" },
+              @{ @"id": kMFSystemActionNC,         @"name": @"通知中心 · ACR" } ];
 }
 
 /// 动作对应的 SF Symbol 名（取不到会走候补符号）
@@ -59,15 +76,51 @@ static NSString *MFSystemActionSymbolName(NSString *actionId) {
     if ([actionId isEqualToString:kMFSystemActionTranslate]) {
         return @"translate";
     }
+    if ([actionId isEqualToString:kMFSystemActionRecord]) {
+        return @"record.circle";   // 【0.6.11】录屏 = 红色录制圆
+    }
+    if ([actionId isEqualToString:kMFSystemActionCC]) {
+        return @"slider.horizontal.3";   // 【0.6.11】控制中心 = 滑杆组
+    }
+    if ([actionId isEqualToString:kMFSystemActionNC]) {
+        return @"bell";   // 【0.6.11】通知中心 = 铃铛
+    }
     return nil;
 }
 
-/// 动作底圆配色（截图=系统蓝、翻译=靛蓝）—— 在浅色底/深色 App 上都能看清白字形
+/// 动作底圆配色 —— 每个动作一色（简洁 + 一眼可辨）：
+///   截屏=系统蓝、翻译=靛蓝、录屏=红（录制惯例色）、控制中心=青、通知中心=橙
 static UIColor *MFSystemActionTintColor(NSString *actionId) {
     if ([actionId isEqualToString:kMFSystemActionTranslate]) {
         return [UIColor colorWithRed:0.35 green:0.34 blue:0.84 alpha:1.0];
     }
+    if ([actionId isEqualToString:kMFSystemActionRecord]) {
+        return [UIColor colorWithRed:0.90 green:0.26 blue:0.26 alpha:1.0];
+    }
+    if ([actionId isEqualToString:kMFSystemActionCC]) {
+        return [UIColor colorWithRed:0.08 green:0.60 blue:0.60 alpha:1.0];
+    }
+    if ([actionId isEqualToString:kMFSystemActionNC]) {
+        return [UIColor colorWithRed:0.95 green:0.55 blue:0.14 alpha:1.0];
+    }
     return [UIColor colorWithRed:0.00 green:0.48 blue:1.00 alpha:1.0];
+}
+
+/// 候补符号（老系统没有主符号时用）
+static NSString *MFSystemActionFallbackSymbolName(NSString *actionId) {
+    if ([actionId isEqualToString:kMFSystemActionTranslate]) {
+        return @"globe";
+    }
+    if ([actionId isEqualToString:kMFSystemActionRecord]) {
+        return @"circle.fill";
+    }
+    if ([actionId isEqualToString:kMFSystemActionCC]) {
+        return @"gearshape.fill";
+    }
+    if ([actionId isEqualToString:kMFSystemActionNC]) {
+        return @"bell.fill";
+    }
+    return nil;
 }
 
 UIImage *MFSystemActionIcon(NSString *actionId, CGFloat pointSize) {
@@ -79,8 +132,11 @@ UIImage *MFSystemActionIcon(NSString *actionId, CGFloat pointSize) {
     UIImage *image = nil;
     @try {
         UIImage *glyph = [UIImage systemImageNamed:symbol];
-        if (glyph == nil && [actionId isEqualToString:kMFSystemActionTranslate]) {
-            glyph = [UIImage systemImageNamed:@"globe"];   // 老系统没有 translate 符号时的兜底
+        if (glyph == nil) {
+            NSString *fallback = MFSystemActionFallbackSymbolName(actionId);
+            if (fallback.length > 0) {
+                glyph = [UIImage systemImageNamed:fallback];
+            }
         }
         if (glyph == nil) {
             return nil;
@@ -469,6 +525,269 @@ static BOOL MFSystemActionOpenTranslateApp(void) {
     return NO;
 }
 
+#pragma mark - 【0.6.11】通用自适应调用器（录屏 / 控制中心 / 通知中心共用）
+
+/// 按方法签名自适应调用（0~2 个参数寄存器）：BOOL 参数给 `flagValue`，对象参数一律 nil。
+/// 与截屏同款保护：method 不存在 / 参数再多不敢乱调 / @try 兜底，全程写日志。
+static BOOL MFSystemActionInvokeAdaptive(id target, SEL selector, NSString *label, BOOL flagValue) {
+    Method method = class_getInstanceMethod(object_getClass(target), selector);
+    if (method == NULL) {
+        return NO;
+    }
+    NSUInteger registers = method_getNumberOfArguments(method);   // 2 + 参数寄存器数
+    @try {
+        if (registers == 2) {
+            ((void (*)(id, SEL))objc_msgSend)(target, selector);
+        } else if (registers == 3) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(target, selector, flagValue);
+        } else if (registers == 4) {
+            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(target, selector, flagValue, nil);
+        } else {
+            MFLog(@"[sysact] %@：参数寄存器 %lu 个，跳过（不敢乱调）",
+                  label, (unsigned long)(registers - 2));
+            return NO;
+        }
+        MFLog(@"[sysact] %@：命中（参数 %lu 个）", label, (unsigned long)(registers - 2));
+        return YES;
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! %@ 调用异常：%@", label, exception);
+        return NO;
+    }
+}
+
+/// 在实例上按"名字含关键字"扫描可调方法（封顶 12 个，避免日志爆炸）。
+/// `preferKeywords` 命中的排前面（toggle/start/begin 这类动作词优先于 get/query）。
+static BOOL MFSystemActionScanAndInvoke(id target, NSArray<NSString *> *keywords,
+                                        NSArray<NSString *> *preferKeywords,
+                                        NSString *label, BOOL flagValue) {
+    if (target == nil) {
+        return NO;
+    }
+    Class cls = object_getClass(target);
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        if (method_getNumberOfArguments(methods[i]) > 4) {
+            continue;   // 只调 ≤2 参数寄存器的
+        }
+        for (NSString *keyword in keywords) {
+            if ([name localizedCaseInsensitiveContainsString:keyword]) {
+                [candidates addObject:name];
+                break;
+            }
+        }
+    }
+    if (methods != NULL) {
+        free(methods);
+    }
+    // 偏好词置前
+    [candidates sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        for (NSString *prefer in preferKeywords) {
+            BOOL aHit = [a localizedCaseInsensitiveContainsString:prefer];
+            BOOL bHit = [b localizedCaseInsensitiveContainsString:prefer];
+            if (aHit != bHit) {
+                return aHit ? NSOrderedAscending : NSOrderedDescending;
+            }
+        }
+        return NSOrderedSame;
+    }];
+    for (NSUInteger i = 0; i < candidates.count && i < 12; i++) {
+        SEL selector = NSSelectorFromString(candidates[i]);
+        if (MFSystemActionInvokeAdaptive(target, selector,
+                                         [NSString stringWithFormat:@"%@ %@",
+                                          label, candidates[i]], flagValue)) {
+            return YES;
+        }
+    }
+    if (candidates.count > 0) {
+        MFLog(@"[sysact] %@：候选 %@ 全部未成功", label,
+              [candidates subarrayWithRange:NSMakeRange(0, MIN(candidates.count, 6))]);
+    }
+    return NO;
+}
+
+/// 拿某个单例类的实例（sharedInstance 优先，mainInstance/alloc/init 兜底）
+static id MFSystemActionSingletonInstance(NSString *className, NSString *label) {
+    Class cls = objc_getClass(className.UTF8String);
+    if (cls == Nil) {
+        MFLog(@"[sysact] %@：类 %@ 不存在", label, className);
+        return nil;
+    }
+    for (NSString *getter in @[ @"sharedInstance", @"mainInstance", @"defaultInstance" ]) {
+        SEL selector = NSSelectorFromString(getter);
+        if ([cls respondsToSelector:selector]) {
+            @try {
+                id instance = ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+                if (instance != nil) {
+                    MFLog(@"[sysact] %@：%@.%@ 可用", label, className, getter);
+                    return instance;
+                }
+            } @catch (NSException *exception) {
+                MFLog(@"[sysact] !! %@ %@.%@ 异常：%@", label, className, getter, exception);
+            }
+        }
+    }
+    return nil;
+}
+
+#pragma mark - 动作③：录屏（【0.6.11 用户指令】）
+
+/// 录屏开关（iOS 11+ 的"屏幕录制"由 SpringBoard 侧录制器执行）。
+/// 真实 API 随版本变化 ⇒ 与截屏同套路：已知类/选择器逐个试 + 运行时扫描
+/// （扫所有名字含 ScreenRecording 的类与含 record 字样的方法，结果进日志，
+///   用户回传日志即可钉死本机真实 API）。
+static BOOL MFSystemActionToggleScreenRecording(void) {
+    NSArray<NSString *> *knownClasses = @[
+        @"SBCCScreenRecordingControlsModule",
+        @"SBCCScreenRecordingModule",
+        @"SBScreenRecordingManager",
+        @"_SBCCScreenRecordingManager",
+    ];
+    for (NSString *className in knownClasses) {
+        id instance = MFSystemActionSingletonInstance(className, @"录屏");
+        if (instance == nil) {
+            continue;
+        }
+        // 先试显式已知选择器，再按关键字扫描该实例的方法
+        for (NSString *name in @[ @"toggleScreenRecording", @"startRecording",
+                                  @"startScreenRecording", @"toggleRecording",
+                                  @"beginRecording" ]) {
+            SEL selector = NSSelectorFromString(name);
+            if ([instance respondsToSelector:selector] &&
+                MFSystemActionInvokeAdaptive(instance, selector,
+                                             [NSString stringWithFormat:@"录屏 %@.%@", className, name],
+                                             YES)) {
+                return YES;
+            }
+        }
+        if (MFSystemActionScanAndInvoke(instance, @[ @"recording" ], @[ @"toggle", @"start", @"begin" ],
+                                        [NSString stringWithFormat:@"录屏 %@", className], YES)) {
+            return YES;
+        }
+    }
+    // 运行时扫描：所有名字含 ScreenRecording 的类
+    MFLog(@"[sysact] 录屏：已知类全失败，开始运行时扫描（结果在下面，请回传日志）");
+    @try {
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        unsigned int logged = 0;
+        for (unsigned int i = 0; i < classCount; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (![name localizedCaseInsensitiveContainsString:@"screenrecording"]) {
+                continue;
+            }
+            if (logged < 10) {
+                MFLog(@"[sysact] 录屏扫描：发现类 %@", name);
+                logged++;
+            }
+            id instance = MFSystemActionSingletonInstance(name, @"录屏扫描");
+            if (instance == nil) {
+                @try {
+                    instance = [[classes[i] alloc] init];
+                } @catch (__unused NSException *exception) {
+                    instance = nil;
+                }
+            }
+            if (instance != nil &&
+                MFSystemActionScanAndInvoke(instance, @[ @"recording" ], @[ @"toggle", @"start", @"begin" ],
+                                            [NSString stringWithFormat:@"录屏扫描 %@", name], YES)) {
+                if (classes != NULL) {
+                    free(classes);
+                }
+                return YES;
+            }
+        }
+        if (classes != NULL) {
+            free(classes);
+        }
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 录屏运行时扫描异常：%@", exception);
+    }
+    return NO;
+}
+
+#pragma mark - 动作④：控制中心（【0.6.11 用户指令】）
+
+static BOOL MFSystemActionPresentControlCenter(void) {
+    id controller = MFSystemActionSingletonInstance(@"SBControlCenterController", @"控制中心");
+    if (controller != nil) {
+        for (NSString *name in @[ @"presentAnimated:completion:", @"presentAnimated:",
+                                  @"presentControlCenterAnimated:", @"present" ]) {
+            SEL selector = NSSelectorFromString(name);
+            if ([controller respondsToSelector:selector] &&
+                MFSystemActionInvokeAdaptive(controller, selector,
+                                             [NSString stringWithFormat:@"控制中心 SBControlCenterController %@",
+                                              name], YES)) {
+                return YES;
+            }
+        }
+    }
+    // 兜底：扫控制中心相关单例的 present 系方法
+    @try {
+        Class cls = objc_getClass("SBControlCenterController");
+        if (cls != Nil) {
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(cls, &count);
+            for (unsigned int i = 0; i < count; i++) {
+                SEL selector = method_getName(methods[i]);
+                NSString *name = NSStringFromSelector(selector);
+                if (method_getNumberOfArguments(methods[i]) <= 4 &&
+                    [name localizedCaseInsensitiveContainsString:@"present"]) {
+                    if (MFSystemActionInvokeAdaptive(controller, selector,
+                                                     [NSString stringWithFormat:@"控制中心扫描 %@",
+                                                      name], YES)) {
+                        if (methods != NULL) {
+                            free(methods);
+                        }
+                        return YES;
+                    }
+                }
+            }
+            if (methods != NULL) {
+                free(methods);
+            }
+        }
+    } @catch (NSException *exception) {
+        MFLog(@"[sysact] !! 控制中心扫描异常：%@", exception);
+    }
+    return NO;
+}
+
+#pragma mark - 动作⑤：通知中心（【0.6.11 用户指令】）
+
+static BOOL MFSystemActionPresentNotificationCenter(void) {
+    id manager = MFSystemActionSingletonInstance(@"SBCoverSheetPresentationManager", @"通知中心");
+    if (manager != nil) {
+        for (NSString *name in @[ @"setCoverSheetPresented:animated:withOptions:withCompletion:",
+                                  @"setCoverSheetPresented:animated:options:completion:",
+                                  @"presentNotificationCenterAnimated:",
+                                  @"presentAnimated:" ]) {
+            SEL selector = NSSelectorFromString(name);
+            if ([manager respondsToSelector:selector] &&
+                MFSystemActionInvokeAdaptive(manager, selector,
+                                             [NSString stringWithFormat:@"通知中心 %@",
+                                              name], YES)) {
+                return YES;
+            }
+        }
+        // setCoverSheetPresented 系签名参数多（BOOL+BOOL+对象+对象），单独按 4 参数调用
+        SEL selector = NSSelectorFromString(@"setCoverSheetPresented:animated:options:completion:");
+        if ([manager respondsToSelector:selector]) {
+            @try {
+                ((void (*)(id, SEL, BOOL, BOOL, id, id))objc_msgSend)(manager, selector, YES, YES, nil, nil);
+                MFLog(@"[sysact] 通知中心：命中 setCoverSheetPresented:animated:options:completion:（4 参数显式调用）");
+                return YES;
+            } @catch (NSException *exception) {
+                MFLog(@"[sysact] !! 通知中心 setCoverSheetPresented 异常：%@", exception);
+            }
+        }
+    }
+    MFLog(@"[sysact] 通知中心：所有候选都没成功");
+    return NO;
+}
+
 #pragma mark - 执行入口
 
 static void MFSystemActionRun(NSString *actionId) {
@@ -489,6 +808,13 @@ static void MFSystemActionRun(NSString *actionId) {
         if (!handled) {
             handled = MFSystemActionOpenTranslateApp();
         }
+    } else if ([actionId isEqualToString:kMFSystemActionRecord]) {
+        // 【0.6.11】录屏 = 开/关切换（再点一次即停）；红条由系统自己画
+        handled = MFSystemActionToggleScreenRecording();
+    } else if ([actionId isEqualToString:kMFSystemActionCC]) {
+        handled = MFSystemActionPresentControlCenter();
+    } else if ([actionId isEqualToString:kMFSystemActionNC]) {
+        handled = MFSystemActionPresentNotificationCenter();
     } else {
         MFLog(@"[sysact] !! 未知动作：%@", actionId);
         return;

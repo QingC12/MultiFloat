@@ -397,6 +397,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfDockStripViewRight;       // 【0.6.0】右条容器（同上）
     NSUInteger mfStripRestoreGeneration; // 【0.6.0】贴片还原 frame 的代次（dispatch_after 防串扰）
     PODockedWindow *mfStripPendingRestore; // 【0.6.0】等待开完还原 frame 的贴片
+    // 【0.6.11 用户指令】贴片还原"连续变形"动画：小窗不先消失，快照从贴片矩形飞进主窗最终矩形。
+    PODockedWindow *mfStripMorphWindow;    // 冻结保留的贴片（还原动画接管前不摘除）
+    UIImage *mfStripMorphSnapshot;         // 贴片快照（实时片 = 现抓视图截图；退路 = snapshotImage）
+    CGRect mfStripMorphFromRect;           // 贴片此刻在窗口里的矩形（变形起点）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
@@ -1024,12 +1028,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.10 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.11 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.10 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.11 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3197,7 +3201,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.10 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.11 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3568,9 +3572,54 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     [keyboardZoomContainer.layer removeAllAnimations];
-    keyboardZoomContainer.alpha = 0.0;
     CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     self->shadowView.layer.shadowOpacity = 0;
+    // 【0.6.11 用户指令】贴片还原 = **连续变形**：小窗不先消失——贴片快照从贴片矩形
+    //   弹簧飞进主窗最终矩形，落位瞬间与真实卡片交叉淡接（观感 = 小窗"长"成主窗）。
+    //   仅面板关态还原（贴片可见）+ 基准尺寸时启用；swap / 有缩放档位走 0.6.10 Q 弹退路。
+    if (mfStripMorphWindow != nil && mfStripMorphSnapshot != nil &&
+        mfStripMorphFromRect.size.width > 1.0 && keyboardZoomContainer.window != nil) {
+        PODockedWindow *morphWindow = mfStripMorphWindow;
+        UIImage *morphImage = mfStripMorphSnapshot;
+        CGRect fromRect = mfStripMorphFromRect;
+        mfStripMorphWindow = nil;
+        mfStripMorphSnapshot = nil;
+        [self mfDockStripDropWindow:morphWindow animated:NO];   // 同帧摘贴片 → overlay 补位（无空窗）
+        keyboardZoomContainer.alpha = 0.0;
+        UIWindow *hostWindow = keyboardZoomContainer.window;
+        UIView * __weak weakContainer = keyboardZoomContainer;
+        UIImageView *overlay = [[UIImageView alloc] initWithImage:morphImage];
+        overlay.frame = fromRect;
+        overlay.contentMode = UIViewContentModeScaleToFill;   // 快照自带贴片宽高比，直接铺
+        overlay.layer.cornerRadius = 12.0;
+        overlay.layer.masksToBounds = YES;
+        overlay.userInteractionEnabled = NO;
+        [hostWindow addSubview:overlay];
+        CGRect finalRect = [weakContainer convertRect:weakContainer.bounds toView:hostWindow];
+        [UIView animateWithDuration:0.52
+                              delay:0.0
+             usingSpringWithDamping:0.62
+              initialSpringVelocity:0.4
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState |
+                                     UIViewAnimationOptionAllowUserInteraction)
+                         animations:^{
+            overlay.frame = finalRect;
+        } completion:^(__unused BOOL finished) {
+            // 落位：真实卡片 0.1s 淡接接管，快照 overlay 随即退场
+            [UIView animateWithDuration:0.10
+                                 animations:^{
+                weakContainer.alpha = 1.0;
+            } completion:^(__unused BOOL innerFinished) {
+                [overlay removeFromSuperview];
+            }];
+        }];
+        MFLog(@"[card][morph] 连续变形：贴片 %@ → 主窗（0.52s 弹簧 %.0f,%.0f → %.0f,%.0f，落位淡接 0.1s）",
+              morphWindow.bundleId, fromRect.origin.x, fromRect.origin.y,
+              finalRect.origin.x, finalRect.origin.y);
+        return;
+    }
+    keyboardZoomContainer.alpha = 0.0;
     // 【0.6.10 用户指令】贴片还原主窗（屏上无主窗、单贴片场景）＝ 淡入 + **Q 弹放大**：
     //   从 0.88 起弹簧弹到 1.0（阻尼 0.5 一定过冲一次再收），不再是干巴巴的原位淡入。
     //   只对贴片还原生效 —— 圆盘打开保持 0.6.7 定稿的纯淡入不动。
@@ -3594,7 +3643,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         }
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
     } completion:nil];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.10 淡入 0.5s %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.11 淡入 0.5s %@，阴影浮起 %.2f）",
           stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0" : @"纯淡入",
           CONTENT_SHADOW_OPACITY * progress);
 }
@@ -3994,7 +4043,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.10 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.11 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4329,6 +4378,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (!w) {
         return;
     }
+    // 【0.6.11】连续变形布防中的贴片：冻结保留（pinApp 的"同 App 去重"等中途摘除一律让位），
+    //   由变形动画启动时显式接管摘除；开失败时由 1.0s 核对块兜底摘除。
+    if (w == mfStripMorphWindow) {
+        MFLog(@"[strip][morph] 摘除请求让位：%@ 冻结保留（变形动画接管中）", w.bundleId);
+        return;
+    }
     // 【0.6.1】实时片先拆保活（App 留后台）、再把寄存视图摘出来——别随贴片动画一起销毁
     if (w.liveStackView) {
         [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
@@ -4542,6 +4597,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 /// 点贴片 = 与主窗互换：主窗（若开着别的 App）快照入条，被点的 App 开回主窗并还原停靠前 frame。
 -(void)mfDockStripRestore:(PODockedWindow *)w{
+    if (w != nil && w == mfStripMorphWindow) {
+        MFLog(@"[strip] 贴片点击被拒（%@ 正在连续变形布防中）", w.bundleId);
+        return;
+    }
     if ([self isPanelTransitioning]) {
         MFLog(@"[strip] 贴片点击被拒（面板过渡中）");
         return;
@@ -4568,6 +4627,34 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
               current.bundleId, current.side >= 0 ? @"右" : @"左", live ? 1 : 0, w.bundleId);
     }
     // 【0.6.1】目标贴片若正保活：先拆保活再开（激活链路会重新拿租约与断言，scene 仍温热）
+    // 【0.6.11 用户指令】连续变形动画：面板关着时（屏上无主窗、贴片可见），在拆保活**之前**
+    //   现抓贴片整视图快照（实时片内容在本进程，drawViewHierarchy 可用；失败退 snapshotImage），
+    //   贴片本体冻结保留（不参加摘除动画），等卡片就位后由变形动画无缝接管——
+    //   观感 = 小窗不消失，直接"长"成主悬浮窗。
+    BOOL closedRestore = (panelState != POPanelStateOpen);
+    if (closedRestore) {
+        // 上一次变形还没收尾就又点了还原：把残留冻结片正常摘掉，防叠加
+        if (self->mfStripMorphWindow && self->mfStripMorphWindow != w) {
+            PODockedWindow *stale = self->mfStripMorphWindow;
+            self->mfStripMorphWindow = nil;
+            self->mfStripMorphSnapshot = nil;
+            [self mfDockStripDropWindow:stale animated:NO];
+        }
+        BOOL scaleNeutral = fabs(w.savedScale - 1.0) <= PO_CARD_SCALE_EPSILON;   // 有缩放档位时后续重估会改 frame，变形不做
+        UIImage *morphImage = scaleNeutral ? [self mfCaptureViewSnapshot:w.tileView] : nil;
+        if (morphImage == nil) {
+            morphImage = scaleNeutral ? w.snapshotImage : nil;
+        }
+        UIWindow *tileWindow = w.tileView.window;
+        if (morphImage != nil && tileWindow != nil) {
+            self->mfStripMorphWindow = w;
+            self->mfStripMorphSnapshot = morphImage;
+            self->mfStripMorphFromRect = [w.tileView convertRect:w.tileView.bounds toView:tileWindow];
+            MFLog(@"[strip][morph] 连续变形布防：%@ 贴片矩形 %@ 快照 %.0fx%.0f（冻结保留）",
+                  w.bundleId, NSStringFromCGRect(self->mfStripMorphFromRect),
+                  morphImage.size.width, morphImage.size.height);
+        }
+    }
     if (w.liveStackView) {
         [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
         [self mfTeardownLiveStackForWindow:w];
@@ -4585,7 +4672,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     mfStripPendingRestore = w;
     mfStripRestoreGeneration += 1;
-    [self mfDockStripDropWindow:w animated:YES];
+    if (self->mfStripMorphWindow == w) {
+        // 【0.6.11】变形接管：跳过立即摘除（贴片冻结在原地，等卡片就位后无缝补位）
+        MFLog(@"[strip][morph] 跳过立即摘除：%@ 由变形动画接管", w.bundleId);
+    } else {
+        [self mfDockStripDropWindow:w animated:YES];
+    }
     [self pinAppWithBundleId:w.bundleId];
     NSUInteger generation = mfStripRestoreGeneration;
     NSString *targetId = [w.bundleId copy];
@@ -4593,6 +4685,16 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat targetScale = w.savedScale;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // 【0.6.11】变形兜底：这次还原没能走到变形动画 → 冻结贴片正常摘除（防永久滞留）
+        if (self->mfStripMorphWindow != nil &&
+            (generation != self->mfStripRestoreGeneration ||
+             ![self->mfStripPendingRestore.bundleId isEqualToString:targetId])) {
+            PODockedWindow *stuck = self->mfStripMorphWindow;
+            self->mfStripMorphWindow = nil;
+            self->mfStripMorphSnapshot = nil;
+            [self mfDockStripDropWindow:stuck animated:YES];
+            MFLog(@"[strip][morph] 还原被作废：冻结贴片 %@ 正常摘除", stuck.bundleId);
+        }
         if (generation != self->mfStripRestoreGeneration ||
             ![self->mfStripPendingRestore.bundleId isEqualToString:targetId]) {
             return;
@@ -4600,6 +4702,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->mfStripPendingRestore = nil;
         if (self->panelState != POPanelStateOpen ||
             ![self->hostSession.activeBundleId isEqualToString:targetId]) {
+            // 【0.6.11】开失败：变形布防若还在（动画没接管），一并收掉
+            if (self->mfStripMorphWindow != nil) {
+                PODockedWindow *stuck = self->mfStripMorphWindow;
+                self->mfStripMorphWindow = nil;
+                self->mfStripMorphSnapshot = nil;
+                [self mfDockStripDropWindow:stuck animated:YES];
+                MFLog(@"[strip][morph] 开盘失败：冻结贴片 %@ 正常摘除", stuck.bundleId);
+            }
             MFLog(@"[strip] 还原核对：%@ 未成功打开，跳过 frame 还原", targetId);
             return;
         }

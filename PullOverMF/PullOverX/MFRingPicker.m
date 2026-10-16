@@ -19,6 +19,16 @@
 //  ③ **起手区加深**：单指 20 → 28pt、双指 40pt —— App 自己的返回手势只认屏缘约 20pt，
 //     加深不侵占它；带内贴边起手更容易被我们收到。开关：mfRingTwoFingerSummon（默认开）。
 //
+//  ============================ 0.6.11 核心改动（用户四项指令）============================
+//  ① **ACR 快捷方式扩编**：新增 录屏 / 控制中心 / 通知中心（mfsys.record / controlcenter /
+//     notificationcenter，实现见 MFSystemActions.m —— 与截屏同套"多候选 + 运行时扫描"兜底，
+//     命中哪条 API 写日志）；编辑器条目改名「· ACR」；未添加 tab 网格**分区展示**
+//     （ACR 快捷方式 / 桌面应用 两个区块标题）。
+//  ② **已添加排序改平铺网格**：自动换行一屏看全所有已选 App（不再横向滑动找），
+//     拖拽换位改二维最近邻；预览/网格高度按行数动态分配。
+//  ③ **触发条可贴底**：位置比例上限 0.95 → 0.98，左右条底部避让 44 → 10pt。
+//  （④ 贴片还原连续变形动画在 PullOverViewController.m —— mfStripMorph* 三件套。）
+//
 //  ============================ 0.4.12 核心改动（用户 log38）============================
 //  用户原话："关于添加arc功能，按照方案A推进，可以只添加截屏和翻译"（另有一条 bug：
 //  "我打开设置时调整了窗口大小，当我点击某一个二级菜单时，悬浮窗会恢复默认大小" ——
@@ -846,13 +856,15 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *MFRingInstalledAppsForEd
     [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"name"] localizedStandardCompare:b[@"name"]];
     }];
-    // 【0.4.12 用户 log38】系统动作（截屏 / 翻译）**置顶**展示 —— 它们不是"已安装 App"，
-    //   不参与上面的中文名排序；伪 bundleID（mfsys.*）与真 App 不冲突，可以直接混着勾选。
+    // 【0.4.12 用户 log38 → 0.6.11 扩编】ACR 快捷方式（截屏/翻译/录屏/控制中心/通知中心）
+    //   **置顶**展示 —— 它们不是"已安装 App"，不参与上面的中文名排序；
+    //   伪 bundleID（mfsys.*）与真 App 不冲突，可以直接混着勾选。
+    //   【0.6.11 用户指令】未添加 tab 网格里 ACR 与桌面应用分区展示（见 relayoutEditorGridAnimated）。
     NSArray<NSDictionary<NSString *, NSString *> *> *systemActions = MFSystemActionEditorEntries();
     if (systemActions.count > 0) {
         [apps insertObjects:systemActions
                   atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, systemActions.count)]];
-        MFLog(@"[ring] 编辑器已置顶 %lu 个系统动作（截屏 / 翻译）", (unsigned long)systemActions.count);
+        MFLog(@"[ring] 编辑器已置顶 %lu 个 ACR 快捷方式", (unsigned long)systemActions.count);
     }
     return apps;
 }
@@ -1444,6 +1456,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIView *editorOrderDraggingCell;     // 拖拽中的排序格子（layout 跳过它）
 @property (nonatomic, assign) NSUInteger editorOrderDragIndex;     // 拖拽中格子的当前 index
 @property (nonatomic, assign) CGFloat editorOrderDragGrabOffset;   // 按下点相对格子中心的偏移
+@property (nonatomic, assign) CGFloat editorOrderDragGrabOffsetY;  // 【0.6.11】平铺网格拖拽：Y 向提起偏移
 // 【0.6.10 用户指令】编辑器二级菜单：一级只留菜单行（应用管理/触发条/其他选项），
 //   全部 App 收进二级「应用管理」（已添加 / 未添加 两个 tab）；已添加 tab 顶部有
 //   圆盘实时预览 —— 拖动排序/加/减成员时图标位置即时跟随，所见即圆盘真实排布。
@@ -1541,6 +1554,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 // 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
 - (void)rebuildEditorOrderStrip;
 - (void)layoutEditorOrderCellsAnimated:(BOOL)animated;
+- (NSUInteger)mfEditorOrderColumnsForWidth:(CGFloat)width;   // 【0.6.11】排序网格每行列数
 - (void)applyEditorOrderCellDecorations:(UIView *)cell index:(NSUInteger)index total:(NSUInteger)total;
 // 【0.6.8 用户指令】拖拽排序（长按提起 → 跟手换位 → 松手落位）
 - (void)onEditorOrderDrag:(UILongPressGestureRecognizer *)gesture;
@@ -1885,7 +1899,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 ///   · 右/左边缘条：x 紧贴屏幕右/左边（宽度 = mfTriggerThickness）；
 ///   · 下边缘条：**贴屏幕底边**（bottomInset 默认 0）——底部主屏手势带同样是系统保留区，
 ///     是"零 hook 也能在全屏 App 上收到触摸"的最后一块可用地。
-/// 顶部条无所谓 inset。左右条的纵向范围仍避开底部 44pt，免得跟主屏手势打架。
+/// 顶部条无所谓 inset。左右条的纵向范围只避开底部 10pt（【0.6.11 用户指令】44 → 10：
+/// 位置比例上限 0.98，触发条可以贴近屏幕底部；10pt 只防配置极端时越出屏外）。
 - (CGRect)triggerFrameForBounds:(CGRect)bounds {
     CGFloat width = CGRectGetWidth(bounds);
     CGFloat height = CGRectGetHeight(bounds);
@@ -1898,10 +1913,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     //   显式设置 mfTriggerLength（>0）仍生效，下限 80。
     CGFloat lengthRaw = MFRingNumber(@"mfTriggerLength", 0.0);
     CGFloat length = lengthRaw > 0.0 ? MAX(80.0, lengthRaw) : MAX(80.0, height * 0.30);
-    CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
+    CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.98);
     NSString *edge = MFRingEdge();
-    // 下边缘条默认**不留底边距**（贴死屏幕底边）；其余方向沿用 44pt 避让主屏手势区
-    CGFloat insetFallback = [edge isEqualToString:@"bottom"] ? 0.0 : 44.0;
+    // 下边缘条默认**不留底边距**（贴死屏幕底边）；
+    // 【0.6.11 用户指令】左右条底部避让 44 → 10pt：位置比例上限提到 0.98 后，
+    //   触发条下沿可以贴到屏幕底部 98% 左右（更贴近底部；只让开最后 10pt 防误出屏）。
+    CGFloat insetFallback = [edge isEqualToString:@"bottom"] ? 0.0 : 10.0;
     CGFloat bottomInset = MAX(0.0, MFRingNumber(@"mfTriggerBottomInset", insetFallback));
     if ([edge isEqualToString:@"bottom"]) {
         bottomInset = MIN(bottomInset, MAX(height - thickness, 0.0));
@@ -3130,15 +3147,16 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
     self.editorAppNames = nameTable;
 
-    // 【0.3.26 → 0.6.8 用户指令】「已添加」排序条：**长按拖拽排序**（跟手换位 + 让位动画 +
-    //   边缘自动滚），◀ ▶ 逐格点击已删——简约且高效。
-    //   【0.6.10】排序条挂进二级页；快速点按格子 = 移出圆盘（长按仍是拖拽，互不干扰）。
+    // 【0.3.26 → 0.6.11 用户指令】「已添加」排序：**平铺网格**（自动换行，一屏看全所有已选
+    //   App，不再横向滑动找）+ 长按拖拽排序（二维最近邻换位）。
+    //   快速点按格子 = 移出圆盘（长按仍是拖拽，互不干扰）。
     UIScrollView *orderScroll = [[UIScrollView alloc]
-        initWithFrame:CGRectMake(0.0, 0.0, width, 104.0)];
+        initWithFrame:CGRectMake(0.0, 0.0, width, 300.0)];
     orderScroll.backgroundColor = [UIColor clearColor];
     orderScroll.opaque = NO;
     orderScroll.showsHorizontalScrollIndicator = NO;
-    orderScroll.alwaysBounceHorizontal = YES;
+    orderScroll.showsVerticalScrollIndicator = NO;
+    orderScroll.alwaysBounceVertical = NO;
     orderScroll.delaysContentTouches = NO;
     UILongPressGestureRecognizer *drag = [[UILongPressGestureRecognizer alloc]
         initWithTarget:self action:@selector(onEditorOrderDrag:)];
@@ -3234,7 +3252,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.10 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.11 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -3276,7 +3294,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGFloat rawLength = MFRingNumber(@"mfTriggerLength", 0.0);
     CGFloat currentLength = rawLength > 0.0 ? MAX(80.0, rawLength) : MAX(80.0, along * 0.30);
     currentLength = MIN(currentLength, along);
-    CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95);
+    CGFloat centerRatio = MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.98);
     CGFloat margin = MIN(MAX(MFRingNumber(@"mfTriggerTouchMargin", 60.0), 0.0), 90.0);
 
     // 触发条高亮预览（在 App 之上、面板之下；只做显示，不接触摸）
@@ -3296,7 +3314,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.triggerValueLabels = [NSMutableArray array];
     NSArray<NSString *> *titles = @[ @"触发条长度", @"上下位置", @"呼出灵敏度" ];
     NSArray<NSNumber *> *mins = @[ @(60.0), @(0.05), @(0.0) ];
-    NSArray<NSNumber *> *maxs = @[ @(MAX(160.0, along * 0.55)), @(0.95), @(90.0) ];
+    NSArray<NSNumber *> *maxs = @[ @(MAX(160.0, along * 0.55)), @(0.98), @(90.0) ];
     NSArray<NSNumber *> *values = @[ @(currentLength), @(centerRatio), @(margin) ];
     for (NSUInteger index = 0; index < titles.count; index++) {
         CGFloat rowY = top + (CGFloat)index * 32.0;
@@ -3387,7 +3405,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     MFLog(@"[ring] 触发条已更新：%@（长度 %.0fpt / 位置比例 %.2f / 灵敏度外扩 %.0fpt / 外侧边距屏边 %.1fpt）",
           NSStringFromCGRect(self.triggerFrame),
           CGRectGetHeight(self.triggerFrame) > 0 ? CGRectGetHeight(self.triggerFrame) : CGRectGetWidth(self.triggerFrame),
-          MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95),
+          MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.98),
           MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0)),
           [self triggerOuterEdgeGapForBounds:bounds]);
 }
@@ -3401,7 +3419,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         ? CGRectGetHeight(band) : CGRectGetWidth(band);
     self.triggerValueLabels[0].text = [NSString stringWithFormat:@"%.0f pt", length];
     self.triggerValueLabels[1].text = [NSString stringWithFormat:@"%.0f%%",
-        MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.95) * 100.0];
+        MIN(MAX(MFRingNumber(@"mfTriggerCenterRatio", 0.78), 0.05), 0.98) * 100.0];
     self.triggerValueLabels[2].text = [NSString stringWithFormat:@"%.0f pt",
         MAX(0.0, MFRingNumber(@"mfTriggerTouchMargin", 60.0))];
 }
@@ -3500,10 +3518,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark - 【0.3.26 用户 log35】「已添加」排序条（自定义圆盘内应用位置）
 
-/// 按 `editorSelection`（= 圆盘真实顺序）**重建**排序条：序号 + 图标 + 名称 + ◀ ▶。
+/// 按 `editorSelection`（= 圆盘真实顺序）**重建**排序网格：序号 + 图标 + 名称。
 /// 顺带说明：圆盘上图标的位置就是这个顺序（`ringApps` 数组顺序），点「完成」即写盘生效。
 /// ⚠️ 只做"加/减成员"后的重建；单纯换位置走 layoutEditorOrderCellsAnimated:（保留格子身份，
 ///    能看见"哪个 App 挪到哪儿"）。【0.6.8】◀ ▶ 已删，换位走拖拽 moveEditorOrderCellFromIndex:toIndex:。
+/// 【0.6.11 用户指令】排序条改**平铺网格**（自动换行）：所有已选 App 一屏看全，不再横向滑动找 App。
 - (void)rebuildEditorOrderStrip {
     UIScrollView *strip = self.editorOrderScroll;
     if (strip == nil) {
@@ -3520,6 +3539,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     const CGFloat gap = MF_RING_ORDER_CELL_GAP;
     const CGFloat inset = MF_RING_ORDER_INSET;
     const CGFloat iconSize = 48.0;
+    NSUInteger columns = [self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)];
 
     for (NSUInteger index = 0; index < ordered.count; index++) {
         NSString *bundleId = ordered[index];
@@ -3529,8 +3549,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         if (name.length == 0) {
             name = [bundleId lastPathComponent];
         }
-        UIView *cell = [[UIView alloc] initWithFrame:CGRectMake(inset + (CGFloat)index * (cellW + gap),
-                                                                0.0, cellW, cellH)];
+        NSUInteger column = index % columns;
+        NSUInteger row = index / columns;
+        UIView *cell = [[UIView alloc] initWithFrame:CGRectMake(inset + (CGFloat)column * (cellW + gap),
+                                                                inset + (CGFloat)row * (cellH + gap),
+                                                                cellW, cellH)];
         cell.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
         cell.layer.cornerRadius = 12.0;
         objc_setAssociatedObject(cell, &kMFRingBundleIdKey, bundleId, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -3574,8 +3597,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         [self applyEditorOrderCellDecorations:cell index:index total:ordered.count];
     }
 
-    strip.contentSize = CGSizeMake(inset * 2.0 + (CGFloat)ordered.count * (cellW + gap),
-                                   cellH + 2.0);
+    // 【0.6.11】平铺网格：按当前宽度算行数，contentSize 纵向撑开（宽度方向不滚）
+    NSUInteger rows = (ordered.count + columns - 1) / columns;
+    strip.contentSize = CGSizeMake(MAX(CGRectGetWidth(strip.bounds),
+                                       inset * 2.0 + (CGFloat)columns * (cellW + gap)),
+                                   MAX(CGRectGetHeight(strip.bounds),
+                                       (CGFloat)MAX(rows, 1) * (cellH + gap) + inset * 2.0));
     // 【0.6.8】提示并入计数行（排序条标题已随简约化移除，editorOrderTitle 不再创建）。
 
     // 图标：命中缓存是瞬时的；没命中先显示首字母，由 fillEditorIcons: 就近补齐
@@ -3585,15 +3612,33 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                     fromIndex:0
                    generation:self.editorIconGeneration];
     }
-    MFLog(@"[ring] 排序条已重建：%lu 个（从左到右 = 圆盘顺序，长按拖动调整）", (unsigned long)ordered.count);
+    MFLog(@"[ring] 排序网格已重建：%lu 个（%lu 列 × %lu 行平铺，长按拖动调整）",
+          (unsigned long)ordered.count, (unsigned long)columns, (unsigned long)rows);
     // 【0.6.10】实时预览跟随成员变化（排序拖拽的换位走 moveEditorOrderCellFromIndex 单独刷新）
     [self rebuildEditorRingPreview];
+    // 【0.6.11】成员变化 → 网格行数变化 → 预览/网格高度重排（layoutEditorAppsAnimated 只做布局不回环）
+    [self layoutEditorAppsAnimated:NO];
 }
 
-/// 按数组顺序摆好每个格子（frame + 序号 + ◀▶ 可用状态）。
+/// 【0.6.11】排序网格每行列数：宽度 ÷ (格子宽+间距)，夹在 3~6（430pt 宽 = 5 列）。
+- (NSUInteger)mfEditorOrderColumnsForWidth:(CGFloat)width {
+    if (width <= 0.0) {
+        width = CGRectGetWidth(self.editorPanel.bounds);
+    }
+    if (width <= 0.0) {
+        width = 430.0;
+    }
+    NSUInteger columns = (NSUInteger)floor((width - MF_RING_ORDER_INSET * 2.0 + MF_RING_ORDER_CELL_GAP)
+                                           / (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP));
+    return MAX((NSUInteger)3, MIN(columns, (NSUInteger)6));
+}
+
+/// 按数组顺序摆好每个格子（平铺网格 frame + 序号装饰）。
 /// 换位置时只调它、不重建视图 ⇒ 格子带着自己的图标/名称一起滑动，看得清"哪个 App 挪到哪去"。
 - (void)layoutEditorOrderCellsAnimated:(BOOL)animated {
     NSArray<UIView *> *cells = [self.editorOrderCells copy];
+    UIScrollView *strip = self.editorOrderScroll;
+    NSUInteger columns = [self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)];
     void (^layout)(void) = ^{
         for (NSUInteger index = 0; index < cells.count; index++) {
             UIView *cell = cells[index];
@@ -3603,20 +3648,21 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 continue;
             }
             CGRect frame = cell.frame;
-            frame.origin.x = MF_RING_ORDER_INSET + (CGFloat)index * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+            frame.origin.x = MF_RING_ORDER_INSET
+                + (CGFloat)(index % columns) * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+            frame.origin.y = MF_RING_ORDER_INSET
+                + (CGFloat)(index / columns) * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP);
             cell.frame = frame;
             [self applyEditorOrderCellDecorations:cell index:index total:cells.count];
         }
-        // 挪到看不着的地方就跟着滚一下（按格子宽度整格滚，避免抖）
-        UIScrollView *strip = self.editorOrderScroll;
-        if (strip != nil && cells.count > 0) {
-            CGFloat contentW = MF_RING_ORDER_INSET * 2.0 + (CGFloat)cells.count
-                * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
-            CGFloat maxOffset = MAX(0.0, contentW - CGRectGetWidth(strip.bounds));
-            if (strip.contentOffset.x > maxOffset || strip.contentOffset.x < 0.0) {
-                strip.contentOffset = CGPointMake(MIN(MAX(strip.contentOffset.x, 0.0), maxOffset), 0.0);
-            }
-        }
+        // 【0.6.11】contentSize 纵向撑开（平铺全览，宽度方向不滚）
+        NSUInteger rows = (cells.count + columns - 1) / columns;
+        strip.contentSize = CGSizeMake(MAX(CGRectGetWidth(strip.bounds),
+                                           MF_RING_ORDER_INSET * 2.0
+                                           + (CGFloat)columns * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP)),
+                                       MAX(CGRectGetHeight(strip.bounds),
+                                           (CGFloat)MAX(rows, 1) * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP)
+                                           + MF_RING_ORDER_INSET * 2.0));
     };
     if (animated) {
         [UIView animateWithDuration:0.18
@@ -3645,9 +3691,10 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 
 #pragma mark - 【0.6.8 用户指令】排序条长按拖拽（简约/快捷/效率：一步到位，替代 ◀ ▶ 逐格点）
 
-/// 长按拖拽排序：Began 提起 → Changed 跟手 + 跨格换位 + 边缘自动滚 → Ended 弹簧落位。
-/// 数据同步 = editorSelection（remove + insert，即圆盘真实顺序）；视图 = cells 数组同步插入 +
-/// layoutEditorOrderCellsAnimated 让位（铁律：交换/移动引用 + 只重排 frame，绝不整段重建）。
+/// 长按拖拽排序（【0.6.11】平铺网格版）：Began 提起 → Changed 跟手（x/y 双向）+ 最近格换位
+/// → Ended 弹簧落位。数据同步 = editorSelection（remove + insert，即圆盘真实顺序）；
+/// 视图 = cells 数组同步插入 + layoutEditorOrderCellsAnimated 让位
+/// （铁律：交换/移动引用 + 只重排 frame，绝不整段重建）。平铺全览后不再需要边缘自动滚。
 - (void)onEditorOrderDrag:(UILongPressGestureRecognizer *)gesture {
     UIScrollView *strip = self.editorOrderScroll;
     if (strip == nil || self.editorOrderCells.count == 0) {
@@ -3656,12 +3703,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGPoint touchInStrip = [gesture locationInView:strip];
 
     if (gesture.state == UIGestureRecognizerStateBegan) {
-        // 定位按下点所在格子（内容坐标比对）
-        CGFloat contentX = touchInStrip.x + strip.contentOffset.x;
+        // 定位按下点所在格子（内容坐标比对，x/y 双向）
+        CGPoint contentPoint = CGPointMake(touchInStrip.x + strip.contentOffset.x,
+                                           touchInStrip.y + strip.contentOffset.y);
         NSUInteger hit = NSNotFound;
         for (NSUInteger index = 0; index < self.editorOrderCells.count; index++) {
             UIView *cell = self.editorOrderCells[index];
-            if (contentX >= CGRectGetMinX(cell.frame) && contentX <= CGRectGetMaxX(cell.frame)) {
+            if (contentPoint.x >= CGRectGetMinX(cell.frame) && contentPoint.x <= CGRectGetMaxX(cell.frame) &&
+                contentPoint.y >= CGRectGetMinY(cell.frame) && contentPoint.y <= CGRectGetMaxY(cell.frame)) {
                 hit = index;
                 break;
             }
@@ -3672,8 +3721,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         UIView *cell = self.editorOrderCells[hit];
         self.editorOrderDraggingCell = cell;
         self.editorOrderDragIndex = hit;
-        self.editorOrderDragGrabOffset = contentX - CGRectGetMidX(cell.frame);
-        strip.scrollEnabled = NO;   // 拖拽期间禁滚动（手势接管水平位移；边缘自动滚自己推进）
+        self.editorOrderDragGrabOffset = contentPoint.x - CGRectGetMidX(cell.frame);
+        self.editorOrderDragGrabOffsetY = contentPoint.y - CGRectGetMidY(cell.frame);
+        strip.scrollEnabled = NO;   // 拖拽期间禁滚动（网格平时全览不滚，防误滚）
         [strip addSubview:cell];    // 提到最上层（盖住让位的邻居）
         cell.transform = CGAffineTransformMakeScale(1.12, 1.12);
         cell.alpha = 0.95;
@@ -3694,37 +3744,32 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     NSUInteger dragIndex = self.editorOrderDragIndex;
 
     if (gesture.state == UIGestureRecognizerStateChanged) {
-        // 跟手：center.x = 触点内容坐标 - 提起偏移（y 保持行中心不动）
-        CGFloat contentX = touchInStrip.x + strip.contentOffset.x;
+        // 跟手：center = 触点内容坐标 - 提起偏移（x/y 双向，平铺网格）
+        CGPoint contentPoint = CGPointMake(touchInStrip.x + strip.contentOffset.x,
+                                           touchInStrip.y + strip.contentOffset.y);
         CGPoint center = dragCell.center;
-        center.x = contentX - self.editorOrderDragGrabOffset;
+        center.x = contentPoint.x - self.editorOrderDragGrabOffset;
+        center.y = contentPoint.y - self.editorOrderDragGrabOffsetY;
         dragCell.center = center;
 
-        // 目标 index：拖拽格子的中心点划过哪格的中心，就插到哪格
-        NSUInteger target = 0;
+        // 目标 index：离拖拽格中心**最近**的格子（平铺网格 = 二维最近邻）
+        NSUInteger target = dragIndex;
+        CGFloat bestDistance = CGFLOAT_MAX;
         for (NSUInteger k = 0; k < self.editorOrderCells.count; k++) {
             if (k == dragIndex) {
                 continue;
             }
-            CGFloat neighborMidX = CGRectGetMidX(self.editorOrderCells[k].frame);
-            if (center.x > neighborMidX) {
-                target = k + 1;
+            CGPoint neighborCenter = self.editorOrderCells[k].center;
+            CGFloat dx = center.x - neighborCenter.x;
+            CGFloat dy = center.y - neighborCenter.y;
+            CGFloat distance = dx * dx + dy * dy;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                target = k;
             }
-        }
-        if (target >= self.editorOrderCells.count) {
-            target = self.editorOrderCells.count - 1;
         }
         if (target != dragIndex) {
             [self moveEditorOrderCellFromIndex:dragIndex toIndex:target];
-        }
-
-        // 边缘自动滚：触点进入左右 34pt 边缘带则每事件推进/回退 8pt
-        CGFloat maxOffset = MAX(0.0, strip.contentSize.width - CGRectGetWidth(strip.bounds));
-        if (touchInStrip.x < 34.0 && strip.contentOffset.x > 0.0) {
-            strip.contentOffset = CGPointMake(MAX(0.0, strip.contentOffset.x - 8.0), 0.0);
-        } else if (touchInStrip.x > CGRectGetWidth(strip.bounds) - 34.0 &&
-                   strip.contentOffset.x < maxOffset) {
-            strip.contentOffset = CGPointMake(MIN(maxOffset, strip.contentOffset.x + 8.0), 0.0);
         }
         return;
     }
@@ -3736,8 +3781,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         NSUInteger finalIndex = dragIndex;
         UIView * __weak weakCell = dragCell;
         CGRect homeFrame = dragCell.frame;
-        homeFrame.origin.x = MF_RING_ORDER_INSET + (CGFloat)finalIndex *
-            (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+        homeFrame.origin.x = MF_RING_ORDER_INSET
+            + (CGFloat)(finalIndex % (NSUInteger)[self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)])
+            * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
+        homeFrame.origin.y = MF_RING_ORDER_INSET
+            + (CGFloat)(finalIndex / (NSUInteger)[self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)])
+            * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP);
         dragCell.frame = homeFrame;   // model 值先落位（动画从这个 home 弹回）
         dragCell.transform = CGAffineTransformMakeScale(1.12, 1.12);
         [UIView animateWithDuration:0.42
@@ -3890,10 +3939,20 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.editorOrderScroll.hidden = !added;
         self.editorScroll.hidden = added;
         if (added) {
-            CGFloat ph = MIN(320.0, h - y - 104.0 - 40.0);
-            self.editorPreviewBox.frame = CGRectMake(10.0, y, w - 20.0, MAX(160.0, ph));
+            // 【0.6.11 用户指令】平铺全览优先：先按已选数量算网格内容高，
+            //   剩余空间给圆盘预览（夹 150~300pt）；极端多行时网格内部纵向滚。
+            CGFloat avail = h - y;
+            NSUInteger columns = [self mfEditorOrderColumnsForWidth:w];
+            NSUInteger count = self.editorOrderCells.count;
+            NSUInteger rows = (count > 0) ? (count + columns - 1) / columns : 1;
+            CGFloat gridContentH = (CGFloat)rows * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP)
+                + MF_RING_ORDER_INSET * 2.0;
+            CGFloat previewH = MIN(MAX(avail - gridContentH - 24.0, 150.0), 300.0);
+            self.editorPreviewBox.frame = CGRectMake(10.0, y, w - 20.0, previewH);
             y = CGRectGetMaxY(self.editorPreviewBox.frame) + 8.0;
-            self.editorOrderScroll.frame = CGRectMake(0.0, y, w, 104.0);
+            CGFloat gridH = MAX(160.0, h - y);
+            self.editorOrderScroll.frame = CGRectMake(0.0, y, w, gridH);
+            self.editorOrderScroll.scrollEnabled = (gridContentH > gridH + 1.0);
         } else {
             self.editorScroll.frame = CGRectMake(0.0, y, w, MAX(120.0, h - y));
         }
@@ -3911,6 +3970,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         layout();
     }
     [self refreshEditorTabVisual];
+    // 【0.6.11】网格 contentSize 依赖自身高度 → 布局后重算一次（cells 只重排 frame，无重建）
+    [self layoutEditorOrderCellsAnimated:NO];
 }
 
 /// 一级 ↔ 二级 页面切换（淡入淡出 + 轻位移）。
@@ -4029,10 +4090,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (strip == nil || self.editorOrderCells.count == 0) {
         return;
     }
-    CGFloat contentX = [tap locationInView:strip].x + strip.contentOffset.x;
+    CGPoint touch = [tap locationInView:strip];
+    CGPoint contentPoint = CGPointMake(touch.x + strip.contentOffset.x, touch.y + strip.contentOffset.y);
     UIView *hit = nil;
     for (UIView *cell in self.editorOrderCells) {
-        if (contentX >= CGRectGetMinX(cell.frame) && contentX <= CGRectGetMaxX(cell.frame)) {
+        if (contentPoint.x >= CGRectGetMinX(cell.frame) && contentPoint.x <= CGRectGetMaxX(cell.frame) &&
+            contentPoint.y >= CGRectGetMinY(cell.frame) && contentPoint.y <= CGRectGetMaxY(cell.frame)) {
             hit = cell;
             break;
         }
@@ -4056,7 +4119,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self refreshEditorCount];
 }
 
-/// 【0.6.10】未添加 tab 网格重排：只显示未加入的 App（加入/移出后即时重排 + 动画）。
+/// 【0.6.10 → 0.6.11】未添加 tab 网格重排：只显示未加入的条目，
+/// 且**分区展示**（用户指令：区分 ACR 快捷方式和桌面 APP）——ACR 组在上、桌面应用组在下，
+/// 各带区块标题（组空则标题不显示）。加入/移出后即时重排 + 动画。
 - (void)relayoutEditorGridAnimated:(BOOL)animated {
     UIScrollView *scroll = self.editorScroll;
     if (scroll == nil || self.editorCells == nil) {
@@ -4070,32 +4135,74 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         return;
     }
     NSMutableSet<NSString *> *selected = [NSMutableSet setWithArray:self.editorSelection.array];
-    NSMutableArray<UIView *> *visible = [NSMutableArray array];
+    NSMutableArray<UIView *> *visibleActions = [NSMutableArray array];   // 未加入的 ACR
+    NSMutableArray<UIView *> *visibleApps = [NSMutableArray array];      // 未加入的桌面应用
     for (UIView *cell in self.editorCells) {
         NSString *bundleId = objc_getAssociatedObject(cell, &kMFRingBundleIdKey);
         BOOL isSelected = [selected containsObject:bundleId];
         cell.hidden = isSelected;   // 未添加 tab 只列未加入的
         if (!isSelected) {
-            [visible addObject:cell];
+            if (MFSystemActionIsActionId(bundleId)) {
+                [visibleActions addObject:cell];
+            } else {
+                [visibleApps addObject:cell];
+            }
         }
     }
     const NSUInteger columns = 4;
     const CGFloat sideInset = 8.0;
     const CGFloat cellW = floor((w - sideInset * 2.0) / (CGFloat)columns);
     const CGFloat cellH = 100.0;
+    const CGFloat headerH = 30.0;
+    // 区块标题（懒创建，挂在 scroll 上，随内容排版）
+    UILabel *actionHeader = (UILabel *)[scroll viewWithTag:991021];
+    UILabel *appHeader = (UILabel *)[scroll viewWithTag:991022];
+    if (actionHeader == nil) {
+        actionHeader = [[UILabel alloc] initWithFrame:CGRectZero];
+        actionHeader.tag = 991021;
+        actionHeader.text = @"ACR 快捷方式";
+        actionHeader.textColor = [UIColor colorWithWhite:1.0 alpha:0.5];
+        actionHeader.font = [UIFont boldSystemFontOfSize:12.0];
+        [scroll addSubview:actionHeader];
+    }
+    if (appHeader == nil) {
+        appHeader = [[UILabel alloc] initWithFrame:CGRectZero];
+        appHeader.tag = 991022;
+        appHeader.text = @"桌面应用";
+        appHeader.textColor = [UIColor colorWithWhite:1.0 alpha:0.5];
+        appHeader.font = [UIFont boldSystemFontOfSize:12.0];
+        [scroll addSubview:appHeader];
+    }
+    actionHeader.hidden = (visibleActions.count == 0);
+    appHeader.hidden = (visibleApps.count == 0);
     void (^layout)(void) = ^{
-        NSUInteger column = 0;
-        NSUInteger row = 0;
-        for (UIView *cell in visible) {
-            cell.frame = CGRectMake(sideInset + column * cellW, row * cellH, cellW, cellH);
-            column++;
-            if (column >= columns) {
-                column = 0;
-                row++;
-            }
+        __block CGFloat y = 6.0;
+        if (visibleActions.count > 0) {
+            actionHeader.frame = CGRectMake(sideInset + 4.0, y, w - sideInset * 2.0 - 8.0, headerH);
+            y += headerH;
         }
-        NSUInteger totalRows = row + (column > 0 ? 1 : 0);
-        scroll.contentSize = CGSizeMake(w, (CGFloat)MAX(totalRows, 1) * cellH + 24.0);
+        void (^placeGroup)(NSArray<UIView *> *cells) = ^(NSArray<UIView *> *cells) {
+            NSUInteger column = 0;
+            for (UIView *cell in cells) {
+                cell.frame = CGRectMake(sideInset + column * cellW, y, cellW, cellH);
+                column++;
+                if (column >= columns) {
+                    column = 0;
+                    y += cellH;
+                }
+            }
+            if (column > 0) {
+                y += cellH;   // 收尾的半行
+            }
+        };
+        placeGroup(visibleActions);
+        if (visibleApps.count > 0) {
+            y += 4.0;
+            appHeader.frame = CGRectMake(sideInset + 4.0, y, w - sideInset * 2.0 - 8.0, headerH);
+            y += headerH;
+        }
+        placeGroup(visibleApps);
+        scroll.contentSize = CGSizeMake(w, y + 24.0);
     };
     if (animated) {
         [UIView animateWithDuration:0.18
@@ -4988,7 +5095,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.10 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.11 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
