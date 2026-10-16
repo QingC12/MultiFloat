@@ -97,9 +97,10 @@
 // （同一时刻只有一个活跃 scene → ContextHostManager 单会话零改动，回归风险最小；
 //   0.7 计划把贴片升级为实时多 Scene）。
 #define MF_DOCK_STRIP_MAX 5                      // 停靠条容量（用户口径 3~5 个，超出淘汰最旧）
-#define MF_DOCK_STRIP_TILE_W 62.0                // 贴片宽（9:16 → 高 110；5 片 + 4 缝隙 ≈ 582 < 屏高 932）
+#define MF_DOCK_STRIP_TILE_W 74.0                // 【0.6.5】贴片宽（9:16 → 高 131.6；5 片 + 4 缝隙 ≈ 690，25% 起放后底边 923 < 屏高 932）
 #define MF_DOCK_STRIP_TILE_GAP 8.0               // 贴片纵向间距
 #define MF_DOCK_STRIP_EDGE_INSET 4.0             // 贴片距屏幕边缘
+#define MF_DOCK_STRIP_TOP_RATIO 0.25             // 【0.6.5】首片起始位置 = 屏高 25%（两侧一致，不置顶）
 #define MF_CARD_EDGE_HOTZONE_TAG_BOTTOM 11  // 底部移动热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_LEFT 12    // 左侧点击热区带
 #define MF_CARD_EDGE_HOTZONE_TAG_RIGHT 13   // 右侧点击热区带
@@ -1023,12 +1024,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.4 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.5 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.4 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.5 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3142,7 +3143,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.4 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.5 卡外热区带已安装（左右=停靠入侧边条 底=拖动移动 右下角+左下角=缩放 顶=关闭 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3511,10 +3512,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     keyboardZoomContainer.alpha = 0.0;
     CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     self->shadowView.layer.shadowOpacity = 0;
-    [UIView animateWithDuration:0.26
+    [UIView animateWithDuration:0.4
                           delay:0.0
-         usingSpringWithDamping:0.92
-          initialSpringVelocity:0.1
+         usingSpringWithDamping:0.74
+          initialSpringVelocity:0.5
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -3522,7 +3523,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->keyboardZoomContainer.alpha = 1.0;
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
     } completion:nil];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.26s 弹簧，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.5 Q 弹 0.4s，阴影浮起 %.2f）",
           CONTENT_SHADOW_OPACITY * progress);
 }
 
@@ -3904,7 +3905,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.4 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.5 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4338,7 +4339,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [tile addSubview:liveContainer];
     w.liveContainerView = liveContainer;
     BOOL iconOnly = (w.snapshotImage == nil);
-    CGFloat iconSize = iconOnly ? 30.0 : 20.0;
+    // 【0.6.5】图标随贴片宽度自适应（74pt 宽 → 常态 24 / 兜底 35）
+    CGFloat iconSize = iconOnly ? (MF_DOCK_STRIP_TILE_W * 0.48) : (MF_DOCK_STRIP_TILE_W * 0.32);
     UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake(
         (MF_DOCK_STRIP_TILE_W - iconSize) / 2.0,
         iconOnly ? (tileH - iconSize) / 2.0 : 4.0,
@@ -4379,7 +4381,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat screenH = CGRectGetHeight(hostWindow.bounds);
     CGFloat x = toRight ? (screenW - MF_DOCK_STRIP_TILE_W - MF_DOCK_STRIP_EDGE_INSET)
                         : MF_DOCK_STRIP_EDGE_INSET;
-    CGFloat y = MAX(MF_DOCK_STRIP_EDGE_INSET, (screenH - totalH) / 2.0);
+    // 【0.6.5 用户 log49】首片从屏高 25% 开始（两侧一致、不置顶）；5 片放不下时贴底钳制
+    CGFloat y = MAX(MF_DOCK_STRIP_EDGE_INSET, screenH * MF_DOCK_STRIP_TOP_RATIO);
+    if (y + totalH > screenH - MF_DOCK_STRIP_EDGE_INSET) {
+        y = MAX(MF_DOCK_STRIP_EDGE_INSET, screenH - totalH - MF_DOCK_STRIP_EDGE_INSET);
+    }
     if (!container) {
         container = [[UIView alloc] initWithFrame:CGRectMake(x, y, MF_DOCK_STRIP_TILE_W, totalH)];
         container.backgroundColor = [UIColor clearColor];
@@ -4405,18 +4411,30 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [container addSubview:tile];
             w.tileView = tile;
             if (animated) {
+                // 【0.6.5】入条动画弹簧化（欠阻尼 → 有一点 Q 弹回位，不再匀速生硬）
                 tile.alpha = 0;
                 tile.transform = CGAffineTransformMakeTranslation(toRight ? 34.0 : -34.0, 0);
-                [UIView animateWithDuration:0.28 animations:^{
+                [UIView animateWithDuration:0.45
+                                      delay:0.0
+                     usingSpringWithDamping:0.68
+                      initialSpringVelocity:0.5
+                                    options:(UIViewAnimationOptionCurveEaseOut |
+                                             UIViewAnimationOptionAllowUserInteraction)
+                                 animations:^{
                     tile.alpha = 1;
                     tile.transform = CGAffineTransformIdentity;
-                }];
+                } completion:nil];
             }
         } else if (!CGRectEqualToRect(w.tileView.frame, frame)) {
             if (animated) {
-                [UIView animateWithDuration:0.22 animations:^{
+                [UIView animateWithDuration:0.3
+                                      delay:0.0
+                     usingSpringWithDamping:0.82
+                      initialSpringVelocity:0.3
+                                    options:UIViewAnimationOptionCurveEaseOut
+                                 animations:^{
                     w.tileView.frame = frame;
-                }];
+                } completion:nil];
             } else {
                 w.tileView.frame = frame;
             }
@@ -4493,7 +4511,26 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             self->keyboardZoomBaseFrame = targetFrame;
         }
         [self applyLayoutPreservingHandlePosition:YES];
-        MFLog(@"[strip] 还原完成：%@ frame %.0fx%.0f scale %.2f", targetId,
+        // 【0.6.5 用户 log49】落位补"Q 弹"：布局重排本身是瞬时重写（铁律：位置/倍率必须显式重施），
+        //   视觉上从 0.9 倍欠阻尼弹簧弹到最终态（保留布局重排重施的缩放档位），衔接自然不生硬。
+        {
+            UIView *card = self->keyboardZoomContainer;
+            CGAffineTransform finalT = card.transform;
+            CGAffineTransform startT = CGAffineTransformScale(finalT, 0.90, 0.90);
+            [card.layer removeAllAnimations];
+            card.transform = startT;
+            [UIView animateWithDuration:0.5
+                                  delay:0.0
+                 usingSpringWithDamping:0.58
+                  initialSpringVelocity:0.6
+                                options:(UIViewAnimationOptionCurveEaseOut |
+                                         UIViewAnimationOptionAllowUserInteraction |
+                                         UIViewAnimationOptionBeginFromCurrentState)
+                             animations:^{
+                self->keyboardZoomContainer.transform = finalT;
+            } completion:nil];
+        }
+        MFLog(@"[strip] 还原完成：%@ frame %.0fx%.0f scale %.2f（0.6.5 Q 弹回位）", targetId,
               CGRectGetWidth(targetFrame), CGRectGetHeight(targetFrame), targetScale);
     });
 }
