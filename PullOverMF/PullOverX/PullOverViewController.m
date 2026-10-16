@@ -402,6 +402,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIImage *mfStripMorphSnapshot;         // 贴片快照（实时片 = 现抓视图截图；退路 = snapshotImage）
     CGRect mfStripMorphFromRect;           // 贴片此刻在窗口里的矩形（变形起点）
     BOOL mfPinAppSkipOpenDelay;            // 【0.6.12】贴片还原免 0.3s 开门延迟（快照静止期减半）
+    CGRect mfRingOpenOriginRect;           // 【0.6.13】圆盘打开"图标展开"动画起点（选中图标的屏幕矩形）
+    UIView *mfSwapTransitionCover;         // 【0.6.13】多贴片互换主窗的过渡盖片（旧画面截图，新场景发布后淡出）
     BOOL mfCardAppearPopActive;            // 【0.6.12】打开 Q 弹窗口（弹簧持有 transform，重估让路）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
@@ -1030,12 +1032,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.12 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.13 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.12 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.13 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3209,7 +3211,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.12 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.13 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3604,6 +3606,27 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         overlay.userInteractionEnabled = NO;
         [hostWindow addSubview:overlay];
         CGRect finalRect = [weakContainer convertRect:weakContainer.bounds toView:hostWindow];
+        // 【0.6.13 用户 log53-① 重点排查】"快照约 1 秒才变实时"根因 = 交叉淡接排成**串行**
+        //   （飞行 0.52s 走完才开始 0.1s 淡接，实时画面最早 0.62s 才可见；叠加场景接管
+        //   与内容挂载的异步耗时，观感直逼 1 秒）。改为**并行交叉**：
+        //     · 飞行 0.20s 时主窗即开始 0.26s 淡入 —— 快照还压在上层，实时画面从
+        //       0.20s 起逐渐透出，无空窗（overlay 永远在最顶）；
+        //     · 飞行落位（0.52s）时快照直接 0.15s 淡出退场 —— 快照可见期 0.52s 收口，
+        //       不再依赖"落位→淡接→移除"的串行链。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (weakContainer == nil || weakContainer.window == nil) {
+                return;
+            }
+            [UIView animateWithDuration:0.26
+                                  delay:0.0
+                                options:(UIViewAnimationOptionCurveEaseInOut |
+                                         UIViewAnimationOptionBeginFromCurrentState)
+                             animations:^{
+                weakContainer.alpha = 1.0;
+            } completion:nil];
+            MFLog(@"[card][morph] 主窗并行淡入开始（+0.20s，实时画面开始透出）");
+        });
         // 【0.6.12】飞行弹簧再欠一点阻尼（0.62→0.58）：过冲更明显，落位淡接更顺
         [UIView animateWithDuration:0.52
                               delay:0.0
@@ -3615,20 +3638,75 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                          animations:^{
             overlay.frame = finalRect;
         } completion:^(__unused BOOL finished) {
-            // 落位：真实卡片 0.1s 淡接接管，快照 overlay 随即退场
-            [UIView animateWithDuration:0.10
-                                 animations:^{
-                weakContainer.alpha = 1.0;
-            } completion:^(__unused BOOL innerFinished) {
+            // 【0.6.13】落位即快照淡出退场（不再串行等淡接——主窗已在飞行中段接管淡入）
+            MFLog(@"[card][morph] 飞行落位（+0.52s）→ 快照淡出退场");
+            [UIView animateWithDuration:0.15
+                                 animations:^{ overlay.alpha = 0.0; }
+                                 completion:^(__unused BOOL innerFinished) {
                 [overlay removeFromSuperview];
             }];
         }];
-        MFLog(@"[card][morph] 连续变形：贴片 %@ → 主窗（0.52s 弹簧 %.0f,%.0f → %.0f,%.0f，落位淡接 0.1s）",
+        MFLog(@"[card][morph] 连续变形：贴片 %@ → 主窗（0.52s 弹簧 %.0f,%.0f → %.0f,%.0f，并行交叉淡化）",
               morphWindow.bundleId, fromRect.origin.x, fromRect.origin.y,
               finalRect.origin.x, finalRect.origin.y);
         return;
     }
     keyboardZoomContainer.alpha = 0.0;
+    // 【0.6.13 用户指令·复刻视频动画层】圆盘打开主窗 = **图标从选中位置"长"成主窗**：
+    //   参考视频（分屏小窗插件实机演示）：点图标 → 窗口从图标位置 zoom 展开。
+    //   实现：把选中 App 的图标画成一张"图标卡"，从圆盘选中图标的屏幕矩形弹簧飞进
+    //   主窗矩形（圆角同步长大），落位交叉淡接真实卡片。仅基准尺寸启用（带缩放档位
+    //   时 transform 交给 applyCardScaleTarget，保持纯淡入退路）。
+    if (mfRingOpenOriginRect.size.width > 1.0 &&
+        fabs(appliedCardScale - 1.0) <= PO_CARD_SCALE_EPSILON) {
+        CGRect originRect = mfRingOpenOriginRect;
+        mfRingOpenOriginRect = CGRectZero;
+        UIImage *iconImage = [POApplicationHelper imageForBundleId:pinnedBundleId];
+        UIWindow *hostWindow = keyboardZoomContainer.window;
+        if (iconImage != nil && hostWindow != nil &&
+            CGRectIntersectsRect(originRect, hostWindow.bounds)) {
+            UIView * __weak weakContainer = keyboardZoomContainer;
+            UIImageView *flyIcon = [[UIImageView alloc] initWithImage:iconImage];
+            flyIcon.frame = originRect;
+            flyIcon.contentMode = UIViewContentModeScaleAspectFit;
+            flyIcon.layer.cornerRadius = 12.0;
+            flyIcon.layer.masksToBounds = YES;
+            flyIcon.userInteractionEnabled = NO;
+            [hostWindow addSubview:flyIcon];
+            CGRect targetRect = [weakContainer convertRect:weakContainer.bounds toView:hostWindow];
+            [UIView animateWithDuration:0.42
+                                  delay:0.0
+                 usingSpringWithDamping:0.62
+                  initialSpringVelocity:0.4
+                                options:(UIViewAnimationOptionCurveEaseOut |
+                                         UIViewAnimationOptionBeginFromCurrentState)
+                             animations:^{
+                flyIcon.frame = targetRect;
+                flyIcon.layer.cornerRadius = 40.0;   // 与主窗圆角同步长大
+            } completion:^(__unused BOOL finished) {
+                [UIView animateWithDuration:0.12
+                                     animations:^{ flyIcon.alpha = 0.0; }
+                                     completion:^(__unused BOOL innerFinished) {
+                    [flyIcon removeFromSuperview];
+                }];
+            }];
+            // 主窗并行淡入（与变形同款：飞行 0.18s 后实时画面开始透出，无空窗）
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (weakContainer == nil || weakContainer.window == nil) {
+                    return;
+                }
+                [UIView animateWithDuration:0.24
+                                      delay:0.0
+                                    options:(UIViewAnimationOptionCurveEaseInOut |
+                                             UIViewAnimationOptionBeginFromCurrentState)
+                                 animations:^{ weakContainer.alpha = 1.0; } completion:nil];
+            });
+            MFLog(@"[card] 圆盘打开：图标展开动画（0.42s 弹簧 图标%@ → 主窗，并行交叉淡化）",
+                  NSStringFromCGRect(originRect));
+            return;
+        }
+    }
     // 【0.6.10 用户指令】贴片还原主窗（屏上无主窗、单贴片场景）＝ 淡入 + **Q 弹放大**：
     //   从 0.88 起弹簧弹到 1.0（阻尼 0.5 一定过冲一次再收），不再是干巴巴的原位淡入。
     //   只在"还原到基准尺寸"时启用：restoreScale≠1 时后续 applyCardScaleTarget 会接管
@@ -3662,7 +3740,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     } completion:^(__unused BOOL finished) {
         self->mfCardAppearPopActive = NO;   // 弹簧窗口关闭，后续缩放重估恢复正常
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.12 淡入 0.5s %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.13 淡入 0.5s %@，阴影浮起 %.2f）",
           stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                              : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入"),
           CONTENT_SHADOW_OPACITY * progress);
@@ -3674,6 +3752,39 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     return (mfStripPendingRestore != nil &&
         fabs(mfStripPendingRestore.savedScale - 1.0) <= PO_CARD_SCALE_EPSILON &&
         fabs(appliedCardScale - 1.0) <= PO_CARD_SCALE_EPSILON);
+}
+
+/// 【0.6.13】多贴片互换主窗的过渡盖片退场：新场景已发布（真实内容在最顶）→
+///   旧画面截图交叉淡出。幂等：无盖片时 no-op。
+-(void)mfRetireSwapTransitionCoverAnimated{
+    if (self->mfSwapTransitionCover == nil) {
+        return;
+    }
+    UIView *cover = self->mfSwapTransitionCover;
+    self->mfSwapTransitionCover = nil;
+    [UIView animateWithDuration:0.22
+                          delay:0.05
+                        options:(UIViewAnimationOptionCurveEaseInOut |
+                                 UIViewAnimationOptionBeginFromCurrentState)
+                     animations:^{ cover.alpha = 0.0; }
+                     completion:^(__unused BOOL finished) {
+        [cover removeFromSuperview];
+    }];
+    MFLog(@"[strip][swap] 换位过渡：新场景已发布 → 旧画面交叉淡出");
+}
+
+/// 【0.6.13】圆盘（MFRingPicker）反射写入"选中图标的屏幕矩形"——
+/// 下一次打开主窗时做"图标从选中位置长成主窗"的展开动画。用一次即清。
+/// 注意：方法名绝不带 set+同名属性形式（铁律 3 防 setter 死递归）。
+-(void)mfSetRingOpenOriginRectFromValue:(NSValue *)value{
+    if (![value isKindOfClass:[NSValue class]]) {
+        return;
+    }
+    CGRect rect = [value CGRectValue];
+    if (isfinite(rect.origin.x) && isfinite(rect.origin.y) &&
+        rect.size.width > 1.0 && rect.size.height > 1.0) {
+        self->mfRingOpenOriginRect = rect;
+    }
 }
 
 /// 【0.3.13】底部热区：pan 自由移动（X+Y 跟手，松手停在哪就是哪，不吸附）。
@@ -4063,7 +4174,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.12 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.13 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4706,7 +4817,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     } else {
         [self mfDockStripDropWindow:w animated:YES];
     }
-    [self pinAppWithBundleId:w.bundleId];
+    // 【0.6.13 用户 log53】0.6.11 误留的第二行 pinApp 调用已删：面板打开后二次 pinApp
+    //   会走 activateBundleId 再接管一次场景（日志"场景已发布"双打、gen 空耗），白添抖动。
     NSUInteger generation = mfStripRestoreGeneration;
     NSString *targetId = [w.bundleId copy];
     CGRect targetFrame = w.savedFrame;
@@ -5525,6 +5637,35 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [self contextManagerPreferredHostedInterfaceOrientation:nil];
     if (switchingVisibleTarget) {
         [self capturePresentationSnapshotIfPossible];
+        // 【0.6.13 用户 log53-③】多贴片互换主窗过渡：旧画面截图盖顶（新内容切换全程
+        //   观感不变），等新场景发布后交叉淡出 —— 不再是"内容瞬变/灰占位闪现"。
+        if (self->mfSwapTransitionCover) {
+            [self->mfSwapTransitionCover removeFromSuperview];
+            self->mfSwapTransitionCover = nil;
+        }
+        UIImage *swapCoverImage = [self mfCaptureViewSnapshot:self->contentView];
+        if (swapCoverImage != nil && self->contentView.bounds.size.width > 10.0) {
+            UIImageView *cover = [[UIImageView alloc] initWithImage:swapCoverImage];
+            cover.frame = self->contentView.bounds;
+            cover.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                UIViewAutoresizingFlexibleHeight;
+            cover.userInteractionEnabled = NO;
+            [self->contentView addSubview:cover];
+            self->mfSwapTransitionCover = cover;
+            // 兜底：万一新场景迟迟不发布（开失败等），1.2s 后强制淡出防永久遮挡
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self->mfSwapTransitionCover == cover) {
+                    self->mfSwapTransitionCover = nil;
+                    [UIView animateWithDuration:0.2
+                                         animations:^{ cover.alpha = 0.0; }
+                                         completion:^(__unused BOOL f) {
+                        [cover removeFromSuperview];
+                    }];
+                }
+            });
+            MFLog(@"[strip][swap] 换位过渡布防：旧画面盖顶，待 %@ 场景发布后交叉淡出", bundleId);
+        }
     }
 
     [self commitPinnedBundleId:bundleId];
@@ -5618,6 +5759,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     deferredOpenGeneration += 1;
+    // 【0.6.13】换位过渡盖片：面板关闭即作废（防跨次残留盖在新内容上）
+    if (self->mfSwapTransitionCover != nil) {
+        UIView *staleCover = self->mfSwapTransitionCover;
+        self->mfSwapTransitionCover = nil;
+        [staleCover removeFromSuperview];
+    }
     [self addKeyboardZoomSuspension:POKeyboardZoomSuspensionClosing];
     [self dismissPresentedQuickSwitchMenuImmediately];
     if ([self canUseDirectScaledProgrammaticCloseAnimation]) {
@@ -7005,6 +7152,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     presentationRetainedAfterRelease = NO;
     showingCantHost = NO;
     [self.contentView bringSubviewToFront:contextView];
+    [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
 
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 &&
         runtimeCategoryTransitionSnapshotActive && presentationSnapshotView &&
@@ -7077,6 +7225,7 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     }
     [self reevaluateKeyboardZoomAnimated:YES];
     [self completeExternallyActivatedApplicationIfNeeded:bundleId];
+    [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
 }
 
 -(void)hostSessionController:(POHostSessionController *)controller

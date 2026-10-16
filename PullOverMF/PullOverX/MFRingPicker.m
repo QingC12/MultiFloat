@@ -3253,7 +3253,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.12 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.13 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -4674,6 +4674,21 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             MFLog(@"[ring] !! 找不到 PullOver 控制器，无法打开浮窗");
             return;
         }
+        // 【0.6.13 用户指令·复刻视频动画层】把当前选中图标的屏幕矩形交给控制器：
+        //   打开主窗时做"图标从选中位置 zoom 展开成主窗"的动画（与贴片变形同款机制）。
+        @try {
+            UIButton *selected = self.selectedButton;
+            if (selected != nil && selected.window != nil) {
+                CGRect iconScreenRect = [selected convertRect:selected.bounds toView:selected.window];
+                SEL originSelector = NSSelectorFromString(@"mfSetRingOpenOriginRectFromValue:");
+                if ([controller respondsToSelector:originSelector]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(controller, originSelector,
+                                                          [NSValue valueWithCGRect:iconScreenRect]);
+                }
+            }
+        } @catch (__unused NSException *exception) {
+            // 起点记录失败只影响动画形态，不影响打开本身
+        }
         SEL pinSelector = NSSelectorFromString(@"pinAppWithBundleId:");
         if ([controller respondsToSelector:pinSelector]) {
             ((void (*)(id, SEL, id))objc_msgSend)(controller, pinSelector, bundleId);
@@ -5096,7 +5111,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.12 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.13 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);

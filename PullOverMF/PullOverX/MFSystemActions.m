@@ -527,27 +527,134 @@ static BOOL MFSystemActionOpenTranslateApp(void) {
 
 #pragma mark - 【0.6.11】通用自适应调用器（录屏 / 控制中心 / 通知中心共用）
 
-/// 按方法签名自适应调用（0~2 个参数寄存器）：BOOL 参数给 `flagValue`，对象参数一律 nil。
-/// 与截屏同款保护：method 不存在 / 参数再多不敢乱调 / @try 兜底，全程写日志。
+/// 【0.6.13 用户 log53-② 重点排查·安全模式修复】
+/// 0.6.11 的调用器把第二参数寄存器一律塞 `flagValue`（YES=0x1）——若方法实际签名是
+/// **对象参数**（如 `xxxWithCompletion:(id)`），0x1 就是野指针，被调方解引用 →
+/// EXC_BAD_ACCESS。`@try` 只能捕 NSException，**抓不住 BAD_ACCESS** → SpringBoard
+/// 直接崩进安全模式（用户实测：点录屏图标即安全模式，日志连 [sysact] 一行都没有，
+/// 与"崩在 @try 保护范围之外"完全吻合）。
+/// 本版改为**按 objc type encoding 逐参数判型**：
+///   '@'（对象）→ 传 nil；'c'/'B'（BOOL）→ 传 flagValue；整型（i/I/s/S/l/L/q/Q）→ 传 0；
+///   浮点/结构体/指针/位域等 → 整个方法跳过（ABI 不敢乱调）。
+/// 由此保证任何被调方法收到的都是类型合法的值，杜绝野指针。
+
+/// 安全（可合法传值）的参数类型
+static BOOL MFSystemActionArgTypeIsSafe(char t) {
+    switch (t) {
+        case '@': case '#': case ':':
+        case 'c': case 'B':
+        case 'i': case 'I': case 's': case 'S':
+        case 'l': case 'L': case 'q': case 'Q':
+            return YES;
+        default:
+            return NO;   // d/f 浮点、^ 指针、{} 结构体、[] 数组、b 位域、* 字符串 → 不敢调
+    }
+}
+
+/// 从 method type encoding 里取第 wantIndex 个**用户参数**的类型。
+/// 编码序列 = 返回类型 + id + SEL + 参数…（前 3 个 token 不是用户参数）。
+/// 解析失败/复合类型一律返回 '?'（调用方按不安全跳过）。
+static char MFSystemActionUserArgType(const char *encoding, NSUInteger wantIndex) {
+    if (encoding == NULL) {
+        return '?';
+    }
+    const char *p = encoding;
+    NSUInteger tokenIndex = 0;
+    while (*p != '\0') {
+        while (*p == 'r' || *p == 'n' || *p == 'N' || *p == 'o' || *p == 'O' || *p == 'V') {
+            p++;   // 限定符不占 token
+        }
+        char start = *p;
+        switch (start) {
+            case '\0':
+                return '?';
+            case '@': case ':': case '#': case 'c': case 'B':
+            case 'i': case 'I': case 's': case 'S':
+            case 'l': case 'L': case 'q': case 'Q':
+            case 'd': case 'f': case 'v':
+                p++;
+                break;
+            case '^':
+                p++;
+                if (*p == '?') {
+                    p++;
+                } else {
+                    while (*p != '\0' && (isalnum((unsigned char)*p) || *p == '_')) {
+                        p++;
+                    }
+                }
+                break;
+            case 'b':   // 位域 bNUM
+                p++;
+                while (isdigit((unsigned char)*p)) {
+                    p++;
+                }
+                break;
+            case '{': case '(': {   // 结构体/联合：配对吞掉
+                char openCh = start, closeCh = (start == '{') ? '}' : ')';
+                int depth = 0;
+                do {
+                    if (*p == openCh) depth++;
+                    else if (*p == closeCh) depth--;
+                    p++;
+                } while (*p != '\0' && depth > 0);
+                break;
+            }
+            case '[':   // 数组：不安全，直接放弃整个解析
+                return '?';
+            default:
+                return '?';
+        }
+        if (tokenIndex >= 3 && tokenIndex - 3 == wantIndex) {
+            if (start == ':' || start == '#' || start == 'v') {
+                return '?';   // SEL/Class/void 槽位不作为参数出现，防御性视为不安全
+            }
+            return start;
+        }
+        tokenIndex++;
+    }
+    return '?';
+}
+
 static BOOL MFSystemActionInvokeAdaptive(id target, SEL selector, NSString *label, BOOL flagValue) {
     Method method = class_getInstanceMethod(object_getClass(target), selector);
     if (method == NULL) {
         return NO;
     }
+    const char *encoding = method_getTypeEncoding(method);
     NSUInteger registers = method_getNumberOfArguments(method);   // 2 + 参数寄存器数
+    if (registers > 4) {
+        MFLog(@"[sysact] %@：参数寄存器 %lu 个，跳过（不敢乱调）",
+              label, (unsigned long)(registers - 2));
+        return NO;
+    }
+    // 逐参数判型：对象槽给 nil、BOOL 槽给 flagValue、整型槽给 0，其他类型整个跳过
+    char type0 = (registers >= 3) ? MFSystemActionUserArgType(encoding, 0) : '@';
+    char type1 = (registers >= 4) ? MFSystemActionUserArgType(encoding, 1) : '@';
+    if ((registers >= 3 && !MFSystemActionArgTypeIsSafe(type0)) ||
+        (registers >= 4 && !MFSystemActionArgTypeIsSafe(type1))) {
+        MFLog(@"[sysact] %@：参数类型不安全（%c / %c），跳过（防野指针崩溃）",
+              label,
+              registers >= 3 ? type0 : '-',
+              registers >= 4 ? type1 : '-');
+        return NO;
+    }
     @try {
         if (registers == 2) {
             ((void (*)(id, SEL))objc_msgSend)(target, selector);
         } else if (registers == 3) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(target, selector, flagValue);
-        } else if (registers == 4) {
-            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(target, selector, flagValue, nil);
+            uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
+            ((void (*)(id, SEL, id))objc_msgSend)(target, selector, (id)scalar0);
         } else {
-            MFLog(@"[sysact] %@：参数寄存器 %lu 个，跳过（不敢乱调）",
-                  label, (unsigned long)(registers - 2));
-            return NO;
+            uintptr_t scalar0 = (type0 == 'c' || type0 == 'B') ? (flagValue ? 1 : 0) : 0;
+            uintptr_t scalar1 = (type1 == 'c' || type1 == 'B') ? (flagValue ? 1 : 0) : 0;
+            ((void (*)(id, SEL, id, id))objc_msgSend)(target, selector,
+                                                      (id)scalar0, (id)scalar1);
         }
-        MFLog(@"[sysact] %@：命中（参数 %lu 个）", label, (unsigned long)(registers - 2));
+        MFLog(@"[sysact] %@：命中（参数 %lu 个，类型 %c/%c）", label,
+              (unsigned long)(registers - 2),
+              registers >= 3 ? type0 : '-',
+              registers >= 4 ? type1 : '-');
         return YES;
     } @catch (NSException *exception) {
         MFLog(@"[sysact] !! %@ 调用异常：%@", label, exception);
@@ -683,13 +790,8 @@ static BOOL MFSystemActionToggleScreenRecording(void) {
                 logged++;
             }
             id instance = MFSystemActionSingletonInstance(name, @"录屏扫描");
-            if (instance == nil) {
-                @try {
-                    instance = [[classes[i] alloc] init];
-                } @catch (__unused NSException *exception) {
-                    instance = nil;
-                }
-            }
+            // 【0.6.13 安全模式修复】不再对未知类 alloc/init 兜底——任意类的 init 都可能
+            //   依赖未初始化的宿主状态（后果是 BAD_ACCESS，@try 抓不住）。只信单例。
             if (instance != nil &&
                 MFSystemActionScanAndInvoke(instance, @[ @"recording" ], @[ @"toggle", @"start", @"begin" ],
                                             [NSString stringWithFormat:@"录屏扫描 %@", name], YES)) {
