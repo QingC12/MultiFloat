@@ -397,15 +397,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     UIView *mfDockStripViewRight;       // 【0.6.0】右条容器（同上）
     NSUInteger mfStripRestoreGeneration; // 【0.6.0】贴片还原 frame 的代次（dispatch_after 防串扰）
     PODockedWindow *mfStripPendingRestore; // 【0.6.0】等待开完还原 frame 的贴片
-    // 【0.6.11 用户指令】贴片还原"连续变形"动画：小窗不先消失，快照从贴片矩形飞进主窗最终矩形。
-    PODockedWindow *mfStripMorphWindow;    // 冻结保留的贴片（还原动画接管前不摘除）
-    UIImage *mfStripMorphSnapshot;         // 贴片快照（实时片 = 现抓视图截图；退路 = snapshotImage）
-    CGRect mfStripMorphFromRect;           // 贴片此刻在窗口里的矩形（变形起点）
+    // 【0.6.16 用户指令】贴片还原"长大"动画：**彻底不抓图片快照**（用户实测旧版"快照图片一闪而过"）。
+    //   改为把主窗容器本身（实时内容）从贴片矩形缩放/平移长大到最终矩形 —— 纯实景、零图片定格。
+    CGRect mfStripRestoreFromRect;         // 还原起点 = 贴片在容器父视图坐标里的矩形
+    BOOL mfStripRestoreFromRectValid;      // 本次还原是否走"长大"路（面板关态还原时置 YES）
     BOOL mfPinAppSkipOpenDelay;            // 【0.6.12】贴片还原免 0.3s 开门延迟（快照静止期减半）
     CGRect mfRingOpenOriginRect;           // 【0.6.13】圆盘打开"图标展开"动画起点（选中图标的屏幕矩形）
     UIView *mfSwapTransitionCover;         // 【0.6.13】多贴片互换主窗的过渡盖片（旧画面截图，新场景发布后淡出）
-    UIImageView *mfStripMorphOverlay;      // 【0.6.15】飞行中的贴片快照 overlay（场景发布时与实时画面交叉淡化）
-    NSString *mfStripMorphOverlayBundleId; // 【0.6.15】overlay 对应的 App（场景发布校验用，防串台）
     BOOL mfCardAppearPopActive;            // 【0.6.12】打开 Q 弹窗口（弹簧持有 transform，重估让路）
     // 【0.6.15 用户 log55-②】键盘会话几何快照：弹出前捕获，收起时**精确还原到打开键盘前的位置**
     //   （用户实测"开键盘自动移动、关键盘弹回默认位置"——不管 mover 是谁，净效果一律兜住；
@@ -1042,12 +1040,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.15 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.6.16 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.15 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.6.16 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -3221,7 +3219,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.6.15 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.6.16 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3594,72 +3592,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [keyboardZoomContainer.layer removeAllAnimations];
     CGFloat progress = MIN(MAX(scrollView.contentOffset.x / CONTENT_SHADOW_FADE_DISTANCE, 0), 1);
     self->shadowView.layer.shadowOpacity = 0;
-    // 【0.6.11 用户指令】贴片还原 = **连续变形**：小窗不先消失——贴片快照从贴片矩形
-    //   弹簧飞进主窗最终矩形，落位瞬间与真实卡片交叉淡接（观感 = 小窗"长"成主窗）。
-    //   仅面板关态还原（贴片可见）+ 基准尺寸时启用；swap / 有缩放档位走 0.6.10 Q 弹退路。
-    if (mfStripMorphWindow != nil && mfStripMorphSnapshot != nil &&
-        mfStripMorphFromRect.size.width > 1.0 && keyboardZoomContainer.window != nil) {
-        // 【0.6.14 用户 log54-② 重点修复】残留 overlay 清理（上一场飞行未收尾就再次还原）
-        if (mfStripMorphOverlay != nil) {
-            [mfStripMorphOverlay removeFromSuperview];
-            mfStripMorphOverlay = nil;
-            mfStripMorphOverlayBundleId = nil;
-        }
-        PODockedWindow *morphWindow = mfStripMorphWindow;
-        UIImage *morphImage = mfStripMorphSnapshot;
-        CGRect fromRect = mfStripMorphFromRect;
-        mfStripMorphWindow = nil;
-        mfStripMorphSnapshot = nil;
-        [self mfDockStripDropWindow:morphWindow animated:NO];   // 同帧摘贴片 → overlay 补位（无空窗）
-        keyboardZoomContainer.alpha = 0.0;
-        UIWindow *hostWindow = keyboardZoomContainer.window;
-        UIView * __weak weakContainer = keyboardZoomContainer;
-        UIImageView *overlay = [[UIImageView alloc] initWithImage:morphImage];
-        overlay.frame = fromRect;
-        overlay.contentMode = UIViewContentModeScaleToFill;   // 快照自带贴片宽高比，直接铺
-        overlay.layer.cornerRadius = 12.0;
-        overlay.layer.masksToBounds = YES;
-        overlay.userInteractionEnabled = NO;
-        [hostWindow addSubview:overlay];
-        // 【0.6.14】overlay 登记成 ivar：等场景发布（实时画面真正就绪）的那一刻交叉淡化。
-        //   0.6.13 的教训（log54 实证）：固定 +0.20s 让主窗在**不透明快照底下**淡入 = 用户
-        //   根本看不见，快照仍然"全程定格 0.52s"。现在只有 didPublishScene 才同时淡出快照、
-        //   淡入主窗 —— 实时画面露出的时刻 = 它真正就绪的时刻，飞行中无定格。
-        mfStripMorphOverlay = overlay;
-        mfStripMorphOverlayBundleId = [morphWindow.bundleId copy];
-        CGRect finalRect = [weakContainer convertRect:weakContainer.bounds toView:hostWindow];
-        // 【0.6.12】飞行弹簧再欠一点阻尼（0.62→0.58）：过冲更明显，落位淡接更顺
-        [UIView animateWithDuration:0.52
-                              delay:0.0
-             usingSpringWithDamping:0.58
-              initialSpringVelocity:0.5
-                            options:(UIViewAnimationOptionCurveEaseOut |
-                                     UIViewAnimationOptionBeginFromCurrentState |
-                                     UIViewAnimationOptionAllowUserInteraction)
-                         animations:^{
-            overlay.frame = finalRect;
-        } completion:^(__unused BOOL finished) {
-            // 【0.6.14】落位兜底：场景若还没发布（极端异步慢），这里强制收场 ——
-            //   快照淡出退场 + 主窗淡入保底，绝不出现"快照飞完了还钉在原地"或"主窗全透明"。
-            if (self->mfStripMorphOverlay == overlay) {
-                self->mfStripMorphOverlay = nil;
-                self->mfStripMorphOverlayBundleId = nil;
-            }
-            if (weakContainer.window != nil) {
-                [UIView animateWithDuration:0.20 animations:^{ weakContainer.alpha = 1.0; }];
-            }
-            [UIView animateWithDuration:0.15
-                                 animations:^{ overlay.alpha = 0.0; }
-                                 completion:^(__unused BOOL innerFinished) {
-                [overlay removeFromSuperview];
-            }];
-            MFLog(@"[card][morph] 飞行落位（+0.52s）→ 快照淡出退场（兜底路）");
-        }];
-        MFLog(@"[card][morph] 连续变形：贴片 %@ → 主窗（0.52s 弹簧 %.0f,%.0f → %.0f,%.0f，实时画面就绪即交叉淡化）",
-              morphWindow.bundleId, fromRect.origin.x, fromRect.origin.y,
-              finalRect.origin.x, finalRect.origin.y);
-        return;
-    }
+    // 【0.6.16 用户指令】贴片还原过渡 = **主窗容器实景"长大"**（不再飞图片快照）：
+    //   起点矩形由 mfDockStripRestore: 记录，在下面的 Q 弹段把容器本身从贴片矩形
+    //   弹簧放大平移到位 —— 全程是真实内容，没有任何图片定格/闪帧。
     keyboardZoomContainer.alpha = 0.0;
     // 【0.6.13 用户指令·复刻视频动画层】圆盘打开主窗 = **图标从选中位置"长"成主窗**：
     //   参考视频（分屏小窗插件实机演示）：点图标 → 窗口从图标位置 zoom 展开。
@@ -3724,19 +3659,28 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     //   （阻尼 0.6，轻微过冲），配合淡入——观感"从指尖冒出来再弹实"。非基准尺寸
     //   （还原带档位）保持纯淡入，transform 交给 applyCardScaleTarget。
     BOOL stripRestoreBounce = [self mfStripRestoreBounceActive];
+    // 【0.6.16 用户指令】贴片还原"长大"（无图片快照）：有贴片起点矩形时，把主窗容器本身
+    //   从贴片矩形弹簧长大到最终矩形 —— 纯实景。无起点（热切换/异常）退 0.88 原位 Q 弹。
+    BOOL stripGrow = stripRestoreBounce && self->mfStripRestoreFromRectValid &&
+        keyboardZoomContainer.superview != nil;
     BOOL ringOpenPop = !stripRestoreBounce &&
         fabs(appliedCardScale - 1.0) <= PO_CARD_SCALE_EPSILON;
     BOOL transformPop = stripRestoreBounce || ringOpenPop;
-    if (stripRestoreBounce) {
+    if (stripGrow) {
+        keyboardZoomContainer.transform =
+            [self mfStripGrowTransformFromRect:self->mfStripRestoreFromRect];
+    } else if (stripRestoreBounce) {
         keyboardZoomContainer.transform = CGAffineTransformMakeScale(0.88, 0.88);
     } else if (ringOpenPop) {
         keyboardZoomContainer.transform = CGAffineTransformMakeScale(0.95, 0.95);
     }
+    // 无论是否消费，本次一律清（防起点泄漏到下一次还原）
+    self->mfStripRestoreFromRectValid = NO;
     self->mfCardAppearPopActive = transformPop;
-    [UIView animateWithDuration:0.5
+    [UIView animateWithDuration:(stripGrow ? 0.56 : 0.5)
                           delay:0.0
-         usingSpringWithDamping:stripRestoreBounce ? 0.5 : 0.6
-          initialSpringVelocity:stripRestoreBounce ? 0.7 : 0.6
+         usingSpringWithDamping:(stripGrow ? 0.74 : (stripRestoreBounce ? 0.5 : 0.6))
+          initialSpringVelocity:(stripGrow ? 0.35 : (stripRestoreBounce ? 0.7 : 0.6))
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -3748,11 +3692,42 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->shadowView.layer.shadowOpacity = CONTENT_SHADOW_OPACITY * progress;
     } completion:^(__unused BOOL finished) {
         self->mfCardAppearPopActive = NO;   // 弹簧窗口关闭，后续缩放重估恢复正常
+        if (stripGrow) {
+            // 【0.6.16】长大期间容器带 transform，边带/把手按"带 transform 的 frame"算过 → 落位后补算
+            [self mfUpdateEdgeBands];
+            [self mfUpdateVerticalHandleRailPosition];
+        }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.15 淡入 0.5s %@，阴影浮起 %.2f）",
-          stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
-                             : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入"),
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.6.16 %@，阴影浮起 %.2f）",
+          stripGrow ? @"贴片还原长大（实景，无图片快照）"
+                    : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
+                                          : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
           CONTENT_SHADOW_OPACITY * progress);
+}
+
+/// 【0.6.16 用户指令】贴片还原"长大"起点变换：把主窗容器映射到贴片矩形（纯实景，无图片快照）。
+///   变换以容器 anchorPoint（= center）为基准：center 映射到 fromCenter，整体缩放 s 倍。
+///   坐标统一到容器父视图（transform 的作用空间）。
+-(CGAffineTransform)mfStripGrowTransformFromRect:(CGRect)fromRect{
+    UIView *container = keyboardZoomContainer;
+    if (container == nil || container.superview == nil ||
+        fromRect.size.width <= 1.0 || fromRect.size.height <= 1.0) {
+        return CGAffineTransformIdentity;
+    }
+    CGRect toRect = [container convertRect:container.bounds toView:container.superview];
+    if (toRect.size.width <= 1.0 || toRect.size.height <= 1.0) {
+        return CGAffineTransformIdentity;
+    }
+    CGFloat s = MAX(fromRect.size.width / toRect.size.width,
+                    fromRect.size.height / toRect.size.height);
+    if (!isfinite(s) || s <= 0.02) {
+        s = 0.24;
+    }
+    s = MIN(s, 1.0);
+    CGAffineTransform t = CGAffineTransformMakeScale(s, s);
+    t.tx = CGRectGetMidX(fromRect) - s * CGRectGetMidX(toRect);
+    t.ty = CGRectGetMidY(fromRect) - s * CGRectGetMidY(toRect);
+    return t;
 }
 
 /// 【0.6.10】本次打开是否为"贴片还原到基准尺寸"（Q 弹窗口）。finishPanelSnapToOpenState
@@ -3780,35 +3755,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [cover removeFromSuperview];
     }];
     MFLog(@"[strip][swap] 换位过渡：新场景已发布 → 旧画面交叉淡出");
-}
-
-/// 【0.6.14 用户 log54-② 重点修复】贴片变形快照的**真交叉淡化**：didPublishScene
-///（实时画面就绪）那一刻，快照与主窗同时反向淡变 —— 观感 = 飞行中段内容"活"过来，
-/// 不再有"快照定格 → 落位才换真"的两段式。0.6.13 的教训：固定 +0.20s 让主窗在不透明
-/// 快照底下淡入（log54 实证快照 0.52s 全程不透明、发布 +0.27s），实时画面根本看不见。
-/// 幂等：无 overlay / bundle 不匹配（其它 App 的场景发布）时 no-op。
--(void)mfRetireMorphOverlayOnScenePublish:(NSString *)bundleId{
-    if (self->mfStripMorphOverlay == nil || self->mfStripMorphOverlayBundleId == nil) {
-        return;
-    }
-    if (![bundleId isEqualToString:self->mfStripMorphOverlayBundleId]) {
-        return;   // 别的 App 的场景发布，不管
-    }
-    UIImageView *overlay = self->mfStripMorphOverlay;
-    UIView * __weak weakContainer = keyboardZoomContainer;
-    self->mfStripMorphOverlay = nil;
-    self->mfStripMorphOverlayBundleId = nil;
-    [UIView animateWithDuration:0.28
-                          delay:0.0
-                        options:(UIViewAnimationOptionCurveEaseInOut |
-                                 UIViewAnimationOptionBeginFromCurrentState)
-                     animations:^{
-        weakContainer.alpha = 1.0;
-        overlay.alpha = 0.0;
-    } completion:^(__unused BOOL finished) {
-        [overlay removeFromSuperview];
-    }];
-    MFLog(@"[card][morph] 场景已发布 → 快照交叉淡出（实时画面飞行中接管）");
 }
 
 /// 【0.6.13】圆盘（MFRingPicker）反射写入"选中图标的屏幕矩形"——
@@ -4212,7 +4158,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.15 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.6.16 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4547,12 +4493,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (!w) {
         return;
     }
-    // 【0.6.11】连续变形布防中的贴片：冻结保留（pinApp 的"同 App 去重"等中途摘除一律让位），
-    //   由变形动画启动时显式接管摘除；开失败时由 1.0s 核对块兜底摘除。
-    if (w == mfStripMorphWindow) {
-        MFLog(@"[strip][morph] 摘除请求让位：%@ 冻结保留（变形动画接管中）", w.bundleId);
-        return;
-    }
     // 【0.6.1】实时片先拆保活（App 留后台）、再把寄存视图摘出来——别随贴片动画一起销毁
     if (w.liveStackView) {
         [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
@@ -4768,10 +4708,6 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 /// 点贴片 = 与主窗互换：主窗（若开着别的 App）快照入条，被点的 App 开回主窗并还原停靠前 frame。
 -(void)mfDockStripRestore:(PODockedWindow *)w{
-    if (w != nil && w == mfStripMorphWindow) {
-        MFLog(@"[strip] 贴片点击被拒（%@ 正在连续变形布防中）", w.bundleId);
-        return;
-    }
     if ([self isPanelTransitioning]) {
         MFLog(@"[strip] 贴片点击被拒（面板过渡中）");
         return;
@@ -4797,43 +4733,25 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         MFLog(@"[strip] 互换：主窗 %@ 自动入条（%@侧 实时%d），%@ 上主窗",
               current.bundleId, current.side >= 0 ? @"右" : @"左", live ? 1 : 0, w.bundleId);
     }
-    // 【0.6.1】目标贴片若正保活：先拆保活再开（激活链路会重新拿租约与断言，scene 仍温热）
-    // 【0.6.11 用户指令】连续变形动画：面板关着时（屏上无主窗、贴片可见），在拆保活**之前**
-    //   现抓贴片整视图快照（实时片内容在本进程，drawViewHierarchy 可用；失败退 snapshotImage），
-    //   贴片本体冻结保留（不参加摘除动画），等卡片就位后由变形动画无缝接管——
-    //   观感 = 小窗不消失，直接"长"成主悬浮窗。
+    // 【0.6.16 用户指令】贴片还原过渡 = **主窗容器实景"长大"**（彻底去掉图片快照）。
+    //   旧版(mfStripMorph*)会现抓贴片整视图截图当飞行 overlay → 用户实测"快照图片一闪而过"。
+    //   现在只记录贴片矩形起点，交给 mfAnimateCardAppearIfNeeded 把容器本身放大平移到位。
+    //   仅面板关态（屏上无主窗、贴片可见）启用；热切换仍走原位淡入。
     BOOL closedRestore = (panelState != POPanelStateOpen);
     if (closedRestore) {
-        // 上一次变形还没收尾就又点了还原：把残留冻结片正常摘掉，防叠加
-        if (self->mfStripMorphWindow && self->mfStripMorphWindow != w) {
-            PODockedWindow *stale = self->mfStripMorphWindow;
-            self->mfStripMorphWindow = nil;
-            self->mfStripMorphSnapshot = nil;
-            if (self->mfStripMorphOverlay != nil) {
-                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】残留飞行快照一并收掉
-                self->mfStripMorphOverlay = nil;
-                self->mfStripMorphOverlayBundleId = nil;
-            }
-            [self mfDockStripDropWindow:stale animated:NO];
-        }
-        // 【0.6.15 用户 log55-③】不再按 savedScale 挑剔：0.6.11 的 scaleNeutral 门槛在
-        //   缩放档位被布局抖动带成 1.01 时（本机 epsilon=0.001）整条变形路被跳过 → 贴片
-        //   直接消失走普通淡入 + 快照静止期，用户看到的正是这条退化路。0.6.14 起变形有
-        //   场景发布触发交叉淡化 + 落位兜底强收，任何档位都安全 ⇒ 快照恒抓，变形恒布防。
-        UIImage *morphImage = [self mfCaptureViewSnapshot:w.tileView];
-        if (morphImage == nil) {
-            morphImage = w.snapshotImage;
-        }
         UIWindow *tileWindow = w.tileView.window;
-        if (morphImage != nil && tileWindow != nil) {
-            self->mfStripMorphWindow = w;
-            self->mfStripMorphSnapshot = morphImage;
-            self->mfStripMorphFromRect = [w.tileView convertRect:w.tileView.bounds toView:tileWindow];
-            MFLog(@"[strip][morph] 连续变形布防：%@ 贴片矩形 %@ 快照 %.0fx%.0f（冻结保留）",
-                  w.bundleId, NSStringFromCGRect(self->mfStripMorphFromRect),
-                  morphImage.size.width, morphImage.size.height);
+        if (tileWindow != nil && keyboardZoomContainer.superview != nil) {
+            CGRect fromRect = [w.tileView convertRect:w.tileView.bounds
+                                               toView:keyboardZoomContainer.superview];
+            if (fromRect.size.width > 1.0 && fromRect.size.height > 1.0) {
+                self->mfStripRestoreFromRect = fromRect;
+                self->mfStripRestoreFromRectValid = YES;
+                MFLog(@"[strip][grow] 还原过渡布防（无图片快照）：%@ 贴片矩形 %@ → 主窗容器长大",
+                      w.bundleId, NSStringFromCGRect(fromRect));
+            }
         }
     }
+    // 【0.6.1】目标贴片若正保活：先拆保活再开（激活链路会重新拿租约与断言，scene 仍温热）
     if (w.liveStackView) {
         [[ContextHostManager sharedInstance] releasePinnedLiveTileForBundleId:w.bundleId];
         [self mfTeardownLiveStackForWindow:w];
@@ -4851,18 +4769,13 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     }
     mfStripPendingRestore = w;
     mfStripRestoreGeneration += 1;
-    // 【0.6.12 用户 log52】变形路径免 0.3s 开门延迟：pinApp 的延迟开门会让快照静止期
-    //   多出 0.3s（用户实测"先看 1 秒图片"）。面板已关死（isPanelTransitioning 已挡），
-    //   立即开门是安全的——贴片点击 → 飞行全程 ≤0.6s。
+    // 【0.6.12 用户 log52】还原路径免 0.3s 开门延迟：pinApp 的延迟开门会让过渡期多出 0.3s。
+    //   面板已关死（isPanelTransitioning 已挡），立即开门是安全的。
     self->mfPinAppSkipOpenDelay = (panelState != POPanelStateOpen);
     [self pinAppWithBundleId:w.bundleId];
     self->mfPinAppSkipOpenDelay = NO;
-    if (self->mfStripMorphWindow == w) {
-        // 【0.6.11】变形接管：跳过立即摘除（贴片冻结在原地，等卡片就位后无缝补位）
-        MFLog(@"[strip][morph] 跳过立即摘除：%@ 由变形动画接管", w.bundleId);
-    } else {
-        [self mfDockStripDropWindow:w animated:YES];
-    }
+    // 【0.6.16 用户指令】贴片立即摘除：主窗容器"长大"动画从贴片矩形原地接管（无快照、无冻结）。
+    [self mfDockStripDropWindow:w animated:NO];
     // 【0.6.13 用户 log53】0.6.11 误留的第二行 pinApp 调用已删：面板打开后二次 pinApp
     //   会走 activateBundleId 再接管一次场景（日志"场景已发布"双打、gen 空耗），白添抖动。
     NSUInteger generation = mfStripRestoreGeneration;
@@ -4871,20 +4784,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat targetScale = w.savedScale;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        // 【0.6.11】变形兜底：这次还原没能走到变形动画 → 冻结贴片正常摘除（防永久滞留）
-        if (self->mfStripMorphWindow != nil &&
-            (generation != self->mfStripRestoreGeneration ||
-             ![self->mfStripPendingRestore.bundleId isEqualToString:targetId])) {
-            PODockedWindow *stuck = self->mfStripMorphWindow;
-            self->mfStripMorphWindow = nil;
-            self->mfStripMorphSnapshot = nil;
-            if (self->mfStripMorphOverlay != nil) {
-                [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】飞行快照一并收掉
-                self->mfStripMorphOverlay = nil;
-                self->mfStripMorphOverlayBundleId = nil;
-            }
-            [self mfDockStripDropWindow:stuck animated:YES];
-            MFLog(@"[strip][morph] 还原被作废：冻结贴片 %@ 正常摘除", stuck.bundleId);
+        // 【0.6.16】还原被作废（点了别的贴片/换了 App）：清掉未消费的"长大"起点，防串台
+        if (generation != self->mfStripRestoreGeneration ||
+            ![self->mfStripPendingRestore.bundleId isEqualToString:targetId]) {
+            self->mfStripRestoreFromRectValid = NO;
+            self->mfStripRestoreFromRect = CGRectZero;
         }
         if (generation != self->mfStripRestoreGeneration ||
             ![self->mfStripPendingRestore.bundleId isEqualToString:targetId]) {
@@ -4893,19 +4797,9 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->mfStripPendingRestore = nil;
         if (self->panelState != POPanelStateOpen ||
             ![self->hostSession.activeBundleId isEqualToString:targetId]) {
-            // 【0.6.11】开失败：变形布防若还在（动画没接管），一并收掉
-            if (self->mfStripMorphWindow != nil) {
-                PODockedWindow *stuck = self->mfStripMorphWindow;
-                self->mfStripMorphWindow = nil;
-                self->mfStripMorphSnapshot = nil;
-                if (self->mfStripMorphOverlay != nil) {
-                    [self->mfStripMorphOverlay removeFromSuperview];   // 【0.6.15】飞行快照一并收掉
-                    self->mfStripMorphOverlay = nil;
-                    self->mfStripMorphOverlayBundleId = nil;
-                }
-                [self mfDockStripDropWindow:stuck animated:YES];
-                MFLog(@"[strip][morph] 开盘失败：冻结贴片 %@ 正常摘除", stuck.bundleId);
-            }
+            // 【0.6.16】开失败：清掉未消费的"长大"起点
+            self->mfStripRestoreFromRectValid = NO;
+            self->mfStripRestoreFromRect = CGRectZero;
             MFLog(@"[strip] 还原核对：%@ 未成功打开，跳过 frame 还原", targetId);
             return;
         }
@@ -7250,7 +7144,6 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     showingCantHost = NO;
     [self.contentView bringSubviewToFront:contextView];
     [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
-    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.15】贴片变形：实时画面就绪 → 快照交叉淡出
 
     if (NSProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 &&
         runtimeCategoryTransitionSnapshotActive && presentationSnapshotView &&
@@ -7324,7 +7217,6 @@ hostedInterfaceOrientationDidChange:(UIInterfaceOrientation)orientation
     [self reevaluateKeyboardZoomAnimated:YES];
     [self completeExternallyActivatedApplicationIfNeeded:bundleId];
     [self mfRetireSwapTransitionCoverAnimated];   // 【0.6.13】换位过渡：真实内容就位 → 旧画面淡出
-    [self mfRetireMorphOverlayOnScenePublish:bundleId];   // 【0.6.15】贴片变形：实时画面就绪 → 快照交叉淡出
 }
 
 -(void)hostSessionController:(POHostSessionController *)controller

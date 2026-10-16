@@ -746,33 +746,163 @@ static NSUInteger MFRingMaxIcons(void) {
     return (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingMaxIcons", 24.0), 1.0), 24.0);
 }
 
-/// 用户是否**亲手设置过**圆盘内容。写过（哪怕写的是空数组）就必须尊重用户的选择，
-/// 不再回落到自动枚举 —— 否则"我把圆盘清空"会变成"又冒出一堆你不想要的 App"。
-static BOOL MFRingUserListSet(void) {
-    return ([MFRingDefaults() objectForKey:@"ringApps"] != nil);
-}
-
-/// 你手动指定的圆盘内容（配置 ringApps）—— 纯字符串过滤，不查 SB
-static NSArray<NSString *> *MFRingConfiguredBundleIds(void) {
-    return MFRingFilterBundleIds([MFRingDefaults() arrayForKey:@"ringApps"], 0);
-}
-
 /// 最近一次算出的圆盘内容数量（0.2.3：几何缩放要用它；触摸路径上零开销）
 static NSUInteger gMFRingCount = 0;
 
-/// 圆盘最终内容：**用户配置 > 自动枚举缓存 > 空**。只读内存 / NSUserDefaults。
+/// 【0.6.16 用户 log56-① 重点修复】"圆盘里已添加的应用被重置" —— **列表保命三层通道**。
+///
+///   现场（log56 实证）：log54 用户刚保存了 19 项（启动读到 18 项有效），同一 SpringBoard
+///   进程里**第一次**呼出圆盘仍是 18 项，**第二次**呼出就只剩 8 项 —— 正好等于 ringAppsAuto
+///   （自动枚举列表）的数量。即：`ringApps` 中途读成了空 ⇒ 内容来源退化到自动列表，
+///   用户看到的就是"新版本把我加的应用重置了"。
+///
+///   本版把列表**写三条通道**，读的时候逐条兜底 + 自动回写修复：
+///     ① NSUserDefaults `ringApps`        —— 主通道（沿用原键名，老配置无损升级）
+///     ② NSUserDefaults `ringAppsBackup`  —— 同域备份键（同一份内容）
+///     ③ 独立文件 /var/mobile/Library/Preferences/com.mlgm.pulloverx.ring.json
+///        —— 不走 NSUserDefaults，域级覆写/缓存失效都伤不到它
+///   任何一条读到内容都会**立即回写**其余通道（自愈），并打一行点名日志
+///   （`ringApps 主通道为空 → 从备份键/独立文件恢复 N 项`）⇒ 下一轮日志直接钉死元凶。
+///   ★ 并且：一旦用户设置过（三通道任一命中，或本进程保存过），**永不**回落到自动列表
+///     —— 这是"被重置"最直接的止血点。
+static NSString * const kMFRingAppsBackupKey = @"ringAppsBackup";
+static NSString * const kMFRingAppsStampKey  = @"ringAppsStamp";
+static NSString * const kMFRingAppsFilePath  =
+    @"/var/mobile/Library/Preferences/com.mlgm.pulloverx.ring.json";
+
+static BOOL gMFRingUserEverSet = NO;             // 用户设置过（含只在文件通道里）
+static NSString *gMFRingContentSource = @"空";    // 【0.6.16】本次内容来源（诊断日志用）
+
+/// ③ 文件通道：写（原子写；失败只写日志）
+static void MFRingWriteAppsFile(NSArray<NSString *> *ids) {
+    @try {
+        NSData *data = [NSJSONSerialization dataWithJSONObject:(ids ?: @[]) options:0 error:NULL];
+        if (data == nil) {
+            MFLog(@"[ring] !! 列表文件通道序列化失败");
+            return;
+        }
+        if (![data writeToFile:kMFRingAppsFilePath atomically:YES]) {
+            MFLog(@"[ring] !! 列表文件通道写入失败：%@", kMFRingAppsFilePath);
+        }
+    } @catch (NSException *exception) {
+        MFLog(@"[ring] !! 列表文件通道写入异常：%@", exception);
+    }
+}
+
+/// ③ 文件通道：读（不存在 / 解析失败 → nil）
+static NSArray<NSString *> *MFRingReadAppsFile(void) {
+    @try {
+        NSData *data = [NSData dataWithContentsOfFile:kMFRingAppsFilePath];
+        if (data == nil) {
+            return nil;
+        }
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        return [json isKindOfClass:[NSArray class]] ? (NSArray *)json : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+/// 三通道解析（优先级 ①→②→③）。返回过滤后的列表；`outSource` 回传命中通道名，
+/// `outHadAny` 回传"用户是否设置过"（三通道任一存在即算）。非主通道命中 ⇒ 立刻回写主通道。
+static NSArray<NSString *> *MFRingConfiguredBundleIdsWithSource(NSString **outSource, BOOL *outHadAny) {
+    NSUserDefaults *defaults = MFRingDefaults();
+    id raw = nil;
+    NSString *source = @"默认域";
+    @try {
+        raw = [defaults objectForKey:@"ringApps"];
+    } @catch (__unused NSException *exception) {
+        raw = nil;
+    }
+    if (raw == nil) {
+        @try {
+            raw = [defaults objectForKey:kMFRingAppsBackupKey];
+        } @catch (__unused NSException *exception) {
+            raw = nil;
+        }
+        if (raw != nil) {
+            source = @"备份键";
+        }
+    }
+    if (raw == nil) {
+        raw = MFRingReadAppsFile();
+        if (raw != nil) {
+            source = @"独立文件";
+        }
+    }
+    if (raw == nil) {
+        if (outSource != NULL) {
+            *outSource = @"无";
+        }
+        if (outHadAny != NULL) {
+            *outHadAny = gMFRingUserEverSet;
+        }
+        gMFRingContentSource = gMFRingUserEverSet ? @"用户清空" : @"空（从未设置）";
+        return @[];
+    }
+    NSArray<NSString *> *ids = MFRingFilterBundleIds(raw, 0);
+    if (outSource != NULL) {
+        *outSource = source;
+    }
+    if (outHadAny != NULL) {
+        *outHadAny = YES;
+    }
+    gMFRingUserEverSet = YES;
+    gMFRingContentSource = (ids.count > 0) ? [NSString stringWithFormat:@"用户列表·%@", source]
+                                           : @"用户清空";
+    if (![source isEqualToString:@"默认域"]) {
+        // 自愈：救回来的那份立刻写回主通道 + 文件通道，下一轮读就走主通道
+        MFLog(@"[ring] ringApps 主通道为空 → 从「%@」恢复 %lu 项并回写（列表被重置的现场）",
+              source, (unsigned long)ids.count);
+        @try {
+            [defaults setObject:ids forKey:@"ringApps"];
+            [defaults setObject:ids forKey:kMFRingAppsBackupKey];
+            [defaults synchronize];
+        } @catch (NSException *exception) {
+            MFLog(@"[ring] !! ringApps 回写默认域异常：%@", exception);
+        }
+        MFRingWriteAppsFile(ids);
+    }
+    return ids;
+}
+
+/// 用户是否**亲手设置过**圆盘内容（三通道任一命中即算）。写过就必须尊重用户的选择，
+/// 不再回落到自动枚举 —— 否则"我把圆盘清空"会变成"又冒出一堆你不想要的 App"。
+static BOOL MFRingUserListSet(void) {
+    BOOL hadAny = NO;
+    MFRingConfiguredBundleIdsWithSource(NULL, &hadAny);
+    return hadAny;
+}
+
+/// 用户手动指定的圆盘内容 —— 纯字符串过滤，不查 SB
+static NSArray<NSString *> *MFRingConfiguredBundleIds(void) {
+    return MFRingConfiguredBundleIdsWithSource(NULL, NULL);
+}
+
+/// 圆盘最终内容：**用户列表 > 自动枚举缓存 > 空**。
+/// 【0.6.16】关键止血：只要用户设置过（含"清空"），就**只看用户列表**，
+/// 绝不再因为主通道读空而退化到自动列表（log56 的"被重置"正是这条退路造成的）。
+/// 只读内存 / NSUserDefaults / 一个 json 文件。
 static NSArray<NSString *> *MFRingBundleIds(void) {
     NSUInteger limit = MFRingMaxIcons();
+    NSString *source = nil;
+    BOOL hadAny = NO;
+    NSArray<NSString *> *configured = MFRingConfiguredBundleIdsWithSource(&source, &hadAny);
     NSArray<NSString *> *result = @[];
-    if (MFRingUserListSet()) {
+    if (hadAny) {
         // 写过就以用户为准（空数组 ⇒ 圆盘空，显示"长按边缘添加"提示）
-        NSArray<NSString *> *configured = MFRingConfiguredBundleIds();
         result = (configured.count > limit) ? [configured subarrayWithRange:NSMakeRange(0, limit)]
                                             : configured;
+        gMFRingContentSource = (result.count > 0)
+            ? [NSString stringWithFormat:@"用户列表·%@", source]
+            : @"用户清空";
     } else if (gMFRingAutoBundleIds.count > 0) {
         result = (gMFRingAutoBundleIds.count > limit)
             ? [gMFRingAutoBundleIds subarrayWithRange:NSMakeRange(0, limit)]
             : gMFRingAutoBundleIds;
+        gMFRingContentSource = @"自动列表";
+    } else {
+        gMFRingContentSource = @"空";
     }
     gMFRingCount = result.count;   // 【0.2.3】记录数量 —— 几何缩放与夹取都用它
     return result;
@@ -879,9 +1009,21 @@ static void MFRingStoreAutoBundleIds(NSArray<NSString *> *ids) {
 }
 
 static void MFRingWriteBundleIds(NSArray<NSString *> *ids) {
+    // 【0.6.16】三通道一起写：主键 + 备份键 + 独立文件（任何一条活着，列表就不会丢）
     NSUserDefaults *defaults = MFRingDefaults();
-    [defaults setObject:ids ?: @[] forKey:@"ringApps"];
-    MFLog(@"[ring] ringApps 已保存 %lu 项", (unsigned long)ids.count);
+    NSArray<NSString *> *payload = ids ?: @[];
+    @try {
+        [defaults setObject:payload forKey:@"ringApps"];
+        [defaults setObject:payload forKey:kMFRingAppsBackupKey];
+        [defaults setObject:@([[NSDate date] timeIntervalSince1970]) forKey:kMFRingAppsStampKey];
+        [defaults synchronize];   // 【0.3.22】立即落盘，避免 SpringBoard 被杀导致设置丢失
+    } @catch (NSException *exception) {
+        MFLog(@"[ring] !! ringApps 写默认域异常：%@", exception);
+    }
+    MFRingWriteAppsFile(payload);
+    gMFRingUserEverSet = YES;
+    MFLog(@"[ring] ringApps 已保存 %lu 项（三通道：默认域 + 备份键 + 独立文件）",
+          (unsigned long)payload.count);
 }
 
 #pragma mark - 图标缓存
@@ -1455,6 +1597,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, assign) CGFloat editorContentBaseTop;        // 折叠态内容起始 Y（设置区下方基线）
 @property (nonatomic, strong) UIView *editorOrderDraggingCell;     // 拖拽中的排序格子（layout 跳过它）
 @property (nonatomic, assign) NSUInteger editorOrderDragIndex;     // 拖拽中格子的当前 index
+@property (nonatomic, assign) NSUInteger editorOrderDragSwapCount;  // 【0.6.16】本场拖拽换位次数（诊断）
 @property (nonatomic, assign) CGFloat editorOrderDragGrabOffset;   // 按下点相对格子中心的偏移
 @property (nonatomic, assign) CGFloat editorOrderDragGrabOffsetY;  // 【0.6.11】平铺网格拖拽：Y 向提起偏移
 // 【0.6.10 用户指令】编辑器二级菜单：一级只留菜单行（应用管理/触发条/其他选项），
@@ -1789,7 +1932,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.iconButtons = [NSMutableArray array];
 
         MFLog(@"[ring] 0.3.19 圆盘宿主=%@（%@，配置=%ld）%@ level=%.0f frame=%@ hidden=%d "
-              @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@",
+              @"交互=%d | 触发边=%@ 触发条=%@ 覆盖层=%@ | 配置项=%lu 自动列表=%lu 降级=%@ "
+              @"内容来源=%@",
               self.hostClassName,
               usingStatusBar ? @"状态栏窗口" : @"PullOver 窗口",
               (long)hostMode,
@@ -1800,7 +1944,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
               self.overlayView != nil ? @"已装" : @"无",
               (unsigned long)MFRingConfiguredBundleIds().count,
               (unsigned long)gMFRingAutoBundleIds.count,
-              gMFRingDegraded ? @"是" : @"否");
+              gMFRingDegraded ? @"是" : @"否",
+              gMFRingContentSource);
         if (!CGRectContainsRect(bounds, self.triggerFrame)) {
             MFLog(@"[ring] ⚠️ 触发带 %@ 超出宿主 %@ —— 越界部分收不到触摸（可调 mfTriggerCenterRatio / "
                   @"mfTriggerThickness / mfTriggerEdge，或设 mfRingHostWindow=0 退回 PullOver 窗口）",
@@ -2396,7 +2541,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.6.15 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.6.16 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -2647,7 +2792,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     MFLog(@"[ring] >>> 取圆盘内容（只读配置/缓存，不查 SB）");
     NSArray<NSString *> *bundleIds = ringBundleIds;   // 上面已经取过（同一份内容，避免重复读配置）
     NSUInteger count = bundleIds.count;
-    MFLog(@"[ring] <<< 取圆盘内容 ok：%lu 项", (unsigned long)count);
+    MFLog(@"[ring] <<< 取圆盘内容 ok：%lu 项（来源=%@）", (unsigned long)count,
+          gMFRingContentSource);
 
     if (count == 0) {
         NSString *text = gMFRingDegraded
@@ -3365,7 +3511,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.15 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.16 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -3834,6 +3980,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         UIView *cell = self.editorOrderCells[hit];
         self.editorOrderDraggingCell = cell;
         self.editorOrderDragIndex = hit;
+        self.editorOrderDragSwapCount = 0;   // 【0.6.16】本场拖拽换位计数（诊断用）
         self.editorOrderDragGrabOffset = contentPoint.x - CGRectGetMidX(cell.frame);
         self.editorOrderDragGrabOffsetY = contentPoint.y - CGRectGetMidY(cell.frame);
         strip.scrollEnabled = NO;   // 拖拽期间禁滚动（网格平时全览不滚，防误滚）
@@ -3891,6 +4038,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         gesture.state == UIGestureRecognizerStateCancelled) {
         strip.scrollEnabled = YES;
         self.editorOrderDraggingCell = nil;
+        // 【0.6.16】松手后把实时预览补一次（拖拽期间为保帧率停掉了逐步重建）
+        [self rebuildEditorRingPreview];
         NSUInteger finalIndex = dragIndex;
         UIView * __weak weakCell = dragCell;
         CGRect homeFrame = dragCell.frame;
@@ -3916,8 +4065,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         } completion:nil];
         [self mfRingHapticLight];
         NSString *bid = objc_getAssociatedObject(dragCell, &kMFRingBundleIdKey) ?: @"?";
-        MFLog(@"[ring] 拖拽排序完成：%@ → 第 %lu 位（共 %lu 个，点完成写盘生效）",
-              bid, (unsigned long)(finalIndex + 1), (unsigned long)self.editorOrderCells.count);
+        MFLog(@"[ring] 拖拽排序完成：%@ → 第 %lu 位（共 %lu 个，本场换位 %lu 次，点完成写盘生效）",
+              bid, (unsigned long)(finalIndex + 1), (unsigned long)self.editorOrderCells.count,
+              (unsigned long)self.editorOrderDragSwapCount);
     }
 }
 
@@ -3936,9 +4086,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [cells removeObjectAtIndex:fromIndex];
     [cells insertObject:cell atIndex:toIndex];
     self.editorOrderDragIndex = toIndex;
-    [self layoutEditorOrderCellsAnimated:YES];   // 拖拽中的格子被 layout 跳过（位置跟手）
-    // 【0.6.10】实时预览跟随换位 —— 排序时能看到圆盘真实排布即时变化
-    [self rebuildEditorRingPreview];
+    self.editorOrderDragSwapCount += 1;
+    // 【0.6.16 用户 log56-① 重点修复·卡顿掉帧】
+    //   ① 拖拽期间**不做让位补间**：0.18s 的动画在连续换位时会被反复打断重启
+    //      （BeginFromCurrentState），观感就是"格子在爬、落点不准"；拖拽中的格子本来就
+    //      盖在邻居上面，直接落位反而最跟手。松手（Ended）才做一次收尾。
+    //   ② 实时预览**不再每一步重建**：一次重建 = 拆掉十来个图标视图再整套重画，
+    //      在 60Hz 的拖动里就是实打实的掉帧源 —— 攒到松手/成员变化时重建一次。
+    [self layoutEditorOrderCellsAnimated:(self.editorOrderDraggingCell == nil)];
 }
 
 - (void)mfRingHapticLight {
@@ -5223,7 +5378,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.15 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.16 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);

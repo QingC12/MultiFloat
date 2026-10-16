@@ -716,35 +716,31 @@ static BOOL MFSystemActionScanAndInvoke(id target, NSArray<NSString *> *keywords
     return NO;
 }
 
-/// 拿某个单例类的实例（sharedInstance 优先，mainInstance/alloc/init 兜底）
-static id MFSystemActionSingletonInstance(NSString *className, NSString *label) {
-    Class cls = objc_getClass(className.UTF8String);
-    if (cls == Nil) {
-        MFLog(@"[sysact] %@：类 %@ 不存在", label, className);
-        return nil;
-    }
-    for (NSString *getter in @[ @"sharedInstance", @"mainInstance", @"defaultInstance" ]) {
-        SEL selector = NSSelectorFromString(getter);
-        if ([cls respondsToSelector:selector]) {
-            @try {
-                id instance = ((id (*)(id, SEL))objc_msgSend)(cls, selector);
-                if (instance != nil) {
-                    MFLog(@"[sysact] %@：%@.%@ 可用", label, className, getter);
-                    return instance;
-                }
-            } @catch (NSException *exception) {
-                MFLog(@"[sysact] !! %@ %@.%@ 异常：%@", label, className, getter, exception);
-            }
-        }
-    }
-    return nil;
-}
+// 【0.6.16】旧的 `MFSystemActionSingletonInstance`（sharedInstance/mainInstance 两种来源）
+//   已被 MFSystemActionResolveInstance（多 getter + 窗口层级第二来源）取代，删除以免
+//   留下未使用的 static 函数（本工程 -Werror，未使用即构建中断）。
 
-#pragma mark - 【0.6.15】录屏状态（圆盘红点徽章 / 提示条用）
+#pragma mark - 【0.6.16】录屏（RPScreenRecorder 实证路）
 
-static BOOL gMFSystemActionRecordActive = NO;      // 我方视角的录屏开关状态（系统 isRecording 优先）
+/// 【0.6.16 用户 log56-③ 重点修复 · 取证结论】
+///   1) TrollOpen（同类多浮窗插件）的 dylib 里**唯一**的录屏相关系统类引用是
+///      `_OBJC_CLASS_$_RPScreenRecorder`，与之配套的 selector 字符串正是
+///      `sharedRecorder` / `startSystemRecordingWithMicrophoneEnabled:handler:` /
+///      `stopSystemRecording:` / `isRecording` / `setRecording:`
+///      ⇒ 系统录屏的执行者 = ReplayKit 的 RPScreenRecorder 单例（控制中心那颗按钮
+///        最终也落在它身上）。log56 实机日志同样显示本机 RPScreenRecorder 响应这三件套。
+///   2) 0.6.15 的"全类 selector 指纹扫描"在 log56 里选中了
+///      **REMAuxiliaryChangeInfoType（提醒事项的数据模型类）** —— 幻影类，
+///      在它身上调 startSystemRecording 什么都不会发生（用户实测：点了没反应）；
+///      而且那趟扫描 1 万多个类在主线程占了约 0.7s（正是圆盘呼出第一下的掉帧源）。
+///      ⇒ 整条"指纹扫描 + alloc/init 任意类"的路**全部删除**，只走 RPScreenRecorder。
+///   3) 旧的 SBCCScreenRecording* / SBScreenRecordingManager 候选在本机**一个都没命中**
+///      （历史日志里连"类存在"都没打出来过），一并删除。
+
+static BOOL gMFSystemActionRecordActive = NO;       // 我方视角的录屏开关状态（系统 isRecording 优先）
 static void (^gMFRecordStateObserver)(BOOL active); // 圆盘注册的观察者（toast + 徽章刷新）
-static Class gMFRecordOwnerClass = Nil;            // 录屏 API 宿主类缓存（selector 指纹扫描一次）
+static id gMFRecordRecorder = nil;                  // RPScreenRecorder 单例（惰性取一次）
+static BOOL gMFRecordRecorderResolved = NO;
 
 BOOL MFSystemActionRecordIsActive(void) {
     return gMFSystemActionRecordActive;
@@ -771,108 +767,48 @@ static void MFSystemActionRecordApplyState(BOOL active, NSString *reason) {
     }
 }
 
-/// 录屏 API 宿主类 = 拥有 `startSystemRecordingWithMicrophoneEnabled:handler:` 的类。
-/// 【0.6.14 实证】TrollOpen（同类多浮窗插件）dylib 里就调这几个 selector：
-///   startSystemRecordingWithMicrophoneEnabled:handler: / stopSystemRecording: / isRecording
-/// 【0.6.15 用户 log55 实证】0.6.14 取"第一个响应的类"命中 UIKeyboardCandidateViewStyle
-///   ——一个键盘候选栏样式类，居然三件套全响应 ⇒ 高度怀疑某注入 dylib 在 NSObject
-///   （或公共基类）上加了分类，全类皆响应、首个中签。本版：
-///     1) 全候选列出来（类名 + IMP），最多 12 个；
-///     2) NSObject 响应检测（分类实锤）+ IMP 同源性对比；
-///     3) 只选 IMP **不等于** 幻影 IMP 的类（自有实现），并优先非 UI* 前缀。
-static Class MFSystemActionRecordOwnerClass(void) {
-    if (gMFRecordOwnerClass != Nil) {
-        return gMFRecordOwnerClass;
+/// ReplayKit 录制器单例：`[RPScreenRecorder sharedRecorder]`（老系统叫 `shared`）。
+static id MFSystemActionRecordRecorder(void) {
+    if (gMFRecordRecorderResolved) {
+        return gMFRecordRecorder;
     }
+    gMFRecordRecorderResolved = YES;
     @try {
-        SEL startSelector = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
-        SEL stopSelector = @selector(stopSystemRecording:);
-        SEL isRecSelector = @selector(isRecording);
-        unsigned int classCount = 0;
-        Class *classes = objc_copyClassList(&classCount);
-        Method nsMethod = class_getInstanceMethod([NSObject class], startSelector);
-        IMP nsIMP = nsMethod ? method_getImplementation(nsMethod) : NULL;
-        if (nsMethod != NULL) {
-            MFLog(@"[sysact] 录屏：!! NSObject 自身响应 start selector（IMP %p）——有注入分类挂在公共基类上，全类皆\"响应\"，首个中签全是幻影", nsIMP);
+        Class cls = objc_getClass("RPScreenRecorder");
+        if (cls == Nil) {
+            cls = NSClassFromString(@"RPScreenRecorder");
         }
-        Class picked = Nil;
-        int responderCount = 0;
-        for (unsigned int i = 0; i < classCount; i++) {
-            Method m = class_getInstanceMethod(classes[i], startSelector);
-            if (m == NULL) {
+        if (cls == Nil) {
+            MFLog(@"[sysact] 录屏：RPScreenRecorder 类不存在（ReplayKit 未加载）");
+            return nil;
+        }
+        for (NSString *getter in @[ @"sharedRecorder", @"shared" ]) {
+            SEL selector = NSSelectorFromString(getter);
+            if (![cls respondsToSelector:selector]) {
                 continue;
             }
-            responderCount++;
-            if (responderCount <= 12) {
-                MFLog(@"[sysact] 录屏：候选[%d] %@ IMP=%p%s", responderCount,
-                      NSStringFromClass(classes[i]), method_getImplementation(m),
-                      (nsIMP != NULL && method_getImplementation(m) == nsIMP) ? @"（=NSObject 分类幻影）" : @"");
-            }
-            if (picked != Nil) {
-                continue;   // 继续列清单，不提前停
-            }
-            // 排除幻影：自有 IMP；三件套齐全优先；非 UI* 前缀优先（键盘/UIKit 类大概率无关）
-            if (nsIMP != NULL && method_getImplementation(m) == nsIMP) {
-                continue;
-            }
-            NSString *name = NSStringFromClass(classes[i]);
-            BOOL hasStop = class_getInstanceMethod(classes[i], stopSelector) != NULL;
-            BOOL hasIsRec = class_getInstanceMethod(classes[i], isRecSelector) != NULL;
-            BOOL uiPrefix = [name hasPrefix:@"UI"] || [name hasPrefix:@"_UI"];
-            if (hasStop && hasIsRec && !uiPrefix) {
-                picked = classes[i];
+            id instance = ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+            if (instance != nil) {
+                gMFRecordRecorder = instance;
+                MFLog(@"[sysact] 录屏：RPScreenRecorder.%@ 实例就绪", getter);
+                return instance;
             }
         }
-        if (classes != NULL) {
-            free(classes);
-        }
-        MFLog(@"[sysact] 录屏：指纹扫描完成，响应类 %d 个，自有实现候选 %@",
-              responderCount, picked != Nil ? NSStringFromClass(picked) : @"无");
-        gMFRecordOwnerClass = picked;
-        return picked;
+        MFLog(@"[sysact] 录屏：RPScreenRecorder 无 sharedRecorder/shared 单例");
     } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! 录屏宿主类扫描异常：%@", exception);
-        return Nil;
+        MFLog(@"[sysact] !! 录屏取录制器实例异常：%@", exception);
     }
+    return nil;
 }
 
-/// 录屏宿主实例：单例族优先；都没有才 alloc/init（类已被 selector 指纹精确锁定，
-/// 风险远小于 0.6.11 那种"名字像就 alloc/init"的盲扫——且全程 @try）。
-static id MFSystemActionRecordOwnerInstance(Class owner) {
-    if (owner == Nil) {
-        return nil;
-    }
-    for (NSString *getter in @[ @"sharedInstance", @"mainInstance", @"defaultInstance" ]) {
-        SEL selector = NSSelectorFromString(getter);
-        if ([owner respondsToSelector:selector]) {
-            @try {
-                id instance = ((id (*)(id, SEL))objc_msgSend)(owner, selector);
-                if (instance != nil) {
-                    return instance;
-                }
-            } @catch (__unused NSException *exception) {
-            }
-        }
-    }
-    @try {
-        id instance = [[owner alloc] init];
-        if (instance != nil) {
-            MFLog(@"[sysact] 录屏：宿主类 %@ 走 alloc/init 实例", NSStringFromClass(owner));
-        }
-        return instance;
-    } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! 录屏宿主 alloc/init 异常：%@", exception);
-        return nil;
-    }
-}
-
-/// 读系统侧 isRecording（宿主类没有该 selector 时返回 -1 = 未知）
-static int MFSystemActionRecordSystemState(id instance) {
-    if (instance == nil || ![instance respondsToSelector:@selector(isRecording)]) {
+/// 读系统侧 isRecording（录制器拿不到 / 不响应时返回 -1 = 未知）
+static int MFSystemActionRecordSystemState(void) {
+    id recorder = MFSystemActionRecordRecorder();
+    if (recorder == nil || ![recorder respondsToSelector:@selector(isRecording)]) {
         return -1;
     }
     @try {
-        return ((BOOL (*)(id, SEL))objc_msgSend)(instance, @selector(isRecording)) ? 1 : 0;
+        return ((BOOL (*)(id, SEL))objc_msgSend)(recorder, @selector(isRecording)) ? 1 : 0;
     } @catch (__unused NSException *exception) {
         return -1;
     }
@@ -880,21 +816,17 @@ static int MFSystemActionRecordSystemState(id instance) {
 
 /// 圆盘展开时对齐系统状态（用户可能从控制中心手动停了录屏）
 void MFSystemActionRecordSyncState(void) {
-    Class owner = MFSystemActionRecordOwnerClass();
-    if (owner == Nil) {
-        return;
-    }
-    int state = MFSystemActionRecordSystemState(MFSystemActionRecordOwnerInstance(owner));
+    int state = MFSystemActionRecordSystemState();
     if (state >= 0) {
         MFSystemActionRecordApplyState(state == 1, @"系统 isRecording 对齐");
     }
 }
 
-/// start/stop 的 handler 参数：被调方传什么都收，但**把内容打进日志**——
-///   完成/错误信息（如权限拒绝、广播配置失败）都会从这里露出来（0.6.15 诊断网）
+/// start/stop 的单参 handler：被调方传什么都收，但**把内容打进日志**——
+/// 权限拒绝、广播配置失败这类信息都会从这里露出来。
 static void MFSystemActionRecordNoopHandler(id result) {
     if (result == nil) {
-        MFLog(@"[sysact] 录屏：handler 回调（无附加信息）");
+        MFLog(@"[sysact] 录屏：回调（无附加信息）");
         return;
     }
     @try {
@@ -902,204 +834,250 @@ static void MFSystemActionRecordNoopHandler(id result) {
         if (desc.length > 300) {
             desc = [desc substringToIndex:300];
         }
-        MFLog(@"[sysact] 录屏：handler 回调：%@", desc);
+        MFLog(@"[sysact] 录屏：回调：%@", desc);
     } @catch (__unused NSException *exception) {
-        MFLog(@"[sysact] 录屏：handler 回调（不可描述的结果）");
+        MFLog(@"[sysact] 录屏：回调（不可描述的结果）");
     }
 }
 
-/// 【0.6.15 诊断网】把最有嫌疑的 Siri 动作/触发类的方法表整表 dump（每类一次）：
-///   SADeviceControlStartScreenRecording / SADeviceControlStopScreenRecording /
-///   ATXScreenRecordingTrigger / ARScreenRecording / BMScreenRecording
-/// —— log54 扫描发现的 9 个 ScreenRecording 类里这 5 个最有戏，方法名+类型编码
-///   齐了下一轮就能精确直调，不再盲猜。
-static void MFSystemActionDumpRecordCandidateMethods(void) {
+/// 只在这条路彻底走不通时打一次方法表（下一轮日志据此钉死真实签名）。
+/// 注意：**只 dump 方法名，不调用任何东西**。
+static void MFSystemActionDumpRecordDiagnostics(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSArray<NSString *> *interesting = @[
-            @"SADeviceControlStartScreenRecording",
-            @"SADeviceControlStopScreenRecording",
-            @"ATXScreenRecordingTrigger",
-            @"ARScreenRecording",
-            @"BMScreenRecording",
-        ];
-        for (NSString *className in interesting) {
-            Class cls = NSClassFromString(className);
-            if (cls == Nil) {
-                MFLog(@"[sysact] 录屏诊断：类 %@ 不存在", className);
-                continue;
+        Class cls = objc_getClass("RPScreenRecorder");
+        if (cls == Nil) {
+            MFLog(@"[sysact] 录屏诊断：RPScreenRecorder 类不存在");
+            return;
+        }
+        for (int meta = 0; meta < 2; meta++) {
+            Class target = meta ? object_getClass(cls) : cls;
+            unsigned int count = 0;
+            Method *list = class_copyMethodList(target, &count);
+            MFLog(@"[sysact] 录屏诊断：RPScreenRecorder %s方法 %u 个", meta ? "类" : "实例", count);
+            for (unsigned int i = 0; i < count && i < 80; i++) {
+                const char *types = method_getTypeEncoding(list[i]);
+                MFLog(@"[sysact]   · %@ (%s)", NSStringFromSelector(method_getName(list[i])),
+                      types ? types : "?");
             }
-            for (int meta = 0; meta < 2; meta++) {
-                Class target = meta ? object_getClass(cls) : cls;
-                unsigned int count = 0;
-                Method *list = class_copyMethodList(target, &count);
-                MFLog(@"[sysact] 录屏诊断：%@ %s方法 %u 个", className, meta ? "类" : "实例", count);
-                for (unsigned int i = 0; i < count && i < 40; i++) {
-                    SEL sel = method_getName(list[i]);
-                    const char *types = method_getTypeEncoding(list[i]);
-                    MFLog(@"[sysact]   · %@ (%s)", NSStringFromSelector(sel), types ? types : "?");
-                }
-                if (list != NULL) {
-                    free(list);
-                }
+            if (list != NULL) {
+                free(list);
             }
         }
     });
 }
 
-/// 录屏开关主路（0.6.14）：TrollOpen 实证 selector 直调，类型精确安全：
-///   startSystemRecordingWithMicrophoneEnabled:(BOOL)handler:(id)
-///   stopSystemRecording:(id)
-static BOOL MFSystemActionToggleScreenRecordingModern(void) {
-    // 【0.6.15 诊断网】候选类方法表整表 dump（每类一次，进程生命周期内只打一轮）
-    MFSystemActionDumpRecordCandidateMethods();
-    Class owner = MFSystemActionRecordOwnerClass();
-    if (owner == Nil) {
-        MFLog(@"[sysact] 录屏：指纹扫描无自有实现候选（走旧候选路）");
+/// 录屏开关主路（0.6.16）：`[RPScreenRecorder sharedRecorder]` 上直调，
+/// 私有 system 变体优先、公共 ReplayKit API 兜底；两种都是 (BOOL + block) 或 (block)
+/// 的确定签名 ⇒ 不存在 0.6.11 那种"塞 0x1 当对象"的野指针风险。
+/// 返回 YES 仅表示"已发起"，真实状态以 0.5s / 1.5s 两次 isRecording 复核为准。
+static BOOL MFSystemActionToggleScreenRecording(void) {
+    id recorder = MFSystemActionRecordRecorder();
+    if (recorder == nil) {
+        MFLog(@"[sysact] 录屏：RPScreenRecorder 不可用（无 ReplayKit 单例）");
+        MFSystemActionDumpRecordDiagnostics();
         return NO;
     }
-    id instance = MFSystemActionRecordOwnerInstance(owner);
-    if (instance == nil) {
-        MFLog(@"[sysact] 录屏：宿主类 %@ 拿不到实例（走旧候选路）", NSStringFromClass(owner));
-        return NO;
-    }
-    int systemState = MFSystemActionRecordSystemState(instance);
-    BOOL active = (systemState >= 0) ? (systemState == 1) : gMFSystemActionRecordActive;
-    MFLog(@"[sysact] 录屏：宿主 %@ 当前状态=%@，执行%@",
-          NSStringFromClass(owner),
-          systemState < 0 ? @"未知(用我方缓存)" : (active ? @"录制中" : @"空闲"),
+    int state = MFSystemActionRecordSystemState();
+    BOOL active = (state >= 0) ? (state == 1) : gMFSystemActionRecordActive;
+    MFLog(@"[sysact] 录屏：RPScreenRecorder 当前状态=%@，执行%@",
+          state < 0 ? @"未知(用我方缓存)" : (active ? @"录制中" : @"空闲"),
           active ? @"停止" : @"开始");
-    void (^handler)(id) = ^(id result) {
+
+    void (^oneArg)(id) = ^(id result) {
         MFSystemActionRecordNoopHandler(result);
     };
+    // 公共 stopRecordingWithHandler: 的 block 是两参 (previewViewController, error)
+    void (^twoArg)(id, id) = ^(id preview, id error) {
+        MFLog(@"[sysact] 录屏：停止回调 preview=%@", preview ? @"有" : @"无");
+        MFSystemActionRecordNoopHandler(error);
+    };
+    BOOL wasActive = active;
+
     @try {
         if (active) {
-            SEL stopSelector = @selector(stopSystemRecording:);
-            if ([instance respondsToSelector:stopSelector]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(instance, stopSelector, handler);
-                MFSystemActionRecordApplyState(NO, @"stopSystemRecording 已调");
-                MFLog(@"[sysact] 录屏：已停止（stopSystemRecording:）");
-                return YES;
-            }
-            MFLog(@"[sysact] 录屏：宿主不响应 stopSystemRecording:");
-            return NO;
-        }
-        SEL startSelector = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
-        if ([instance respondsToSelector:startSelector]) {
-            // 麦克风默认关（贴系统录屏按钮的默认行为；要带麦后续再暴露开关）
-            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(instance, startSelector, NO, handler);
-            MFLog(@"[sysact] 录屏：已发起（startSystemRecordingWithMicrophoneEnabled:NO）");
-            // 启动是异步的：立刻读一次，0.6s 后再核一次（弹窗确认/直接开录都会回写 isRecording）
-            int immediate = MFSystemActionRecordSystemState(instance);
-            if (immediate >= 0) {
-                MFSystemActionRecordApplyState(immediate == 1, @"start 后即时 isRecording");
+            SEL systemStop = @selector(stopSystemRecording:);
+            SEL publicStop = @selector(stopRecordingWithHandler:);
+            if ([recorder respondsToSelector:systemStop]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(recorder, systemStop, oneArg);
+                MFLog(@"[sysact] 录屏：已调 stopSystemRecording:");
+            } else if ([recorder respondsToSelector:publicStop]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(recorder, publicStop, twoArg);
+                MFLog(@"[sysact] 录屏：已调 stopRecordingWithHandler:（公共 API 退路）");
             } else {
-                MFSystemActionRecordApplyState(YES, @"start 已调（系统状态不可读，按已开始记账）");
+                MFLog(@"[sysact] 录屏：RPScreenRecorder 两种停止 selector 都不响应");
+                MFSystemActionDumpRecordDiagnostics();
+                return NO;
             }
-            Class ownerClass = owner;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @try {
-                    id ownerInstance = MFSystemActionRecordOwnerInstance(ownerClass);
-                    int state = MFSystemActionRecordSystemState(ownerInstance);
-                    if (state >= 0) {
-                        MFSystemActionRecordApplyState(state == 1, @"start 后 0.6s isRecording 复核");
-                    }
-                } @catch (__unused NSException *exception) {
-                }
-            });
-            return YES;
+        } else {
+            SEL systemStart = @selector(startSystemRecordingWithMicrophoneEnabled:handler:);
+            SEL publicStart = @selector(startRecordingWithMicrophoneEnabled:handler:);
+            SEL plainStart  = @selector(startRecordingWithHandler:);
+            if ([recorder respondsToSelector:systemStart]) {
+                // 麦克风默认关（贴系统录屏按钮的默认行为）
+                ((void (*)(id, SEL, BOOL, id))objc_msgSend)(recorder, systemStart, NO, oneArg);
+                MFLog(@"[sysact] 录屏：已调 startSystemRecordingWithMicrophoneEnabled:NO");
+            } else if ([recorder respondsToSelector:publicStart]) {
+                ((void (*)(id, SEL, BOOL, id))objc_msgSend)(recorder, publicStart, NO, oneArg);
+                MFLog(@"[sysact] 录屏：已调 startRecordingWithMicrophoneEnabled:NO（公共 API 退路）");
+            } else if ([recorder respondsToSelector:plainStart]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(recorder, plainStart, oneArg);
+                MFLog(@"[sysact] 录屏：已调 startRecordingWithHandler:（最老 API 退路）");
+            } else {
+                MFLog(@"[sysact] 录屏：RPScreenRecorder 三种开始 selector 都不响应");
+                MFSystemActionDumpRecordDiagnostics();
+                return NO;
+            }
         }
-        MFLog(@"[sysact] 录屏：宿主不响应 startSystemRecordingWithMicrophoneEnabled:handler:");
-        return NO;
     } @catch (NSException *exception) {
         MFLog(@"[sysact] !! 录屏直调异常：%@", exception);
         return NO;
     }
+
+    // 开始/停止都是异步：0.5s 与 1.5s 各复核一次 isRecording，状态一律以系统为准
+    for (NSNumber *delay in @[ @0.5, @1.5 ]) {
+        NSTimeInterval seconds = delay.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            int now = MFSystemActionRecordSystemState();
+            if (now < 0) {
+                return;
+            }
+            MFSystemActionRecordApplyState(now == 1, wasActive ? @"停止后复核 isRecording"
+                                                               : @"开始后复核 isRecording");
+        });
+    }
+    return YES;
 }
 
-#pragma mark - 动作③：录屏（【0.6.11 用户指令】）
+#pragma mark - 【0.6.16】实例获取（控制中心 / 通知中心共用）
 
-/// 录屏开关（iOS 11+ 的"屏幕录制"由 SpringBoard 侧录制器执行）。
-/// 真实 API 随版本变化 ⇒ 与截屏同套路：已知类/选择器逐个试 + 运行时扫描
-/// （扫所有名字含 ScreenRecording 的类与含 record 字样的方法，结果进日志，
-///   用户回传日志即可钉死本机真实 API）。
-static BOOL MFSystemActionToggleScreenRecording(void) {
-    // 【0.6.14 主路】TrollOpen 实证 selector 指纹直调（类型精确，无野指针风险）
-    if (MFSystemActionToggleScreenRecordingModern()) {
-        return YES;
+/// 在 SpringBoard 的窗口层级里找某个类的实例（递归，深度封顶防炸栈）。
+static id MFSystemActionFindInstanceInView(UIView *view, Class cls, int depth) {
+    if (view == nil || depth > 12) {
+        return nil;
     }
-    NSArray<NSString *> *knownClasses = @[
-        @"SBCCScreenRecordingControlsModule",
-        @"SBCCScreenRecordingModule",
-        @"SBScreenRecordingManager",
-        @"_SBCCScreenRecordingManager",
-    ];
-    for (NSString *className in knownClasses) {
-        id instance = MFSystemActionSingletonInstance(className, @"录屏");
-        if (instance == nil) {
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:cls]) {
+            return sub;
+        }
+        id hit = MFSystemActionFindInstanceInView(sub, cls, depth + 1);
+        if (hit != nil) {
+            return hit;
+        }
+    }
+    return nil;
+}
+
+/// 【0.6.16】通用实例获取：单例族 → **SpringBoard 窗口层级**（第二来源）。
+/// log56 教训：0.6.11 的控制中心分支在"单例取不到"时拿着 nil 继续调（等于什么都没做，
+/// 日志还一片安静）⇒ 用户看到的就是"点了没反应"。控制中心控制器本身就是控制中心窗口的
+/// rootViewController ⇒ 窗口层级这条路一定找得到。
+static id MFSystemActionResolveInstance(NSString *className, NSString *label) {
+    Class cls = objc_getClass(className.UTF8String);
+    if (cls == Nil) {
+        cls = NSClassFromString(className);
+    }
+    if (cls == Nil) {
+        MFLog(@"[sysact] %@：类 %@ 不存在", label, className);
+        return nil;
+    }
+    for (NSString *getter in @[ @"sharedInstance", @"sharedInstanceIfExists", @"mainInstance",
+                                @"defaultInstance", @"shared", @"standardInstance",
+                                @"sharedController", @"sharedManager" ]) {
+        SEL selector = NSSelectorFromString(getter);
+        if (![cls respondsToSelector:selector]) {
             continue;
         }
-        // 先试显式已知选择器，再按关键字扫描该实例的方法
-        for (NSString *name in @[ @"toggleScreenRecording", @"startRecording",
-                                  @"startScreenRecording", @"toggleRecording",
-                                  @"beginRecording" ]) {
-            SEL selector = NSSelectorFromString(name);
-            if ([instance respondsToSelector:selector] &&
-                MFSystemActionInvokeAdaptive(instance, selector,
-                                             [NSString stringWithFormat:@"录屏 %@.%@", className, name],
-                                             YES)) {
-                return YES;
+        @try {
+            id instance = ((id (*)(id, SEL))objc_msgSend)(cls, selector);
+            if (instance != nil) {
+                MFLog(@"[sysact] %@：%@.%@ 可用", label, className, getter);
+                return instance;
             }
-        }
-        if (MFSystemActionScanAndInvoke(instance, @[ @"recording" ], @[ @"toggle", @"start", @"begin" ],
-                                        [NSString stringWithFormat:@"录屏 %@", className], YES)) {
-            return YES;
+        } @catch (NSException *exception) {
+            MFLog(@"[sysact] !! %@ %@.%@ 异常：%@", label, className, getter, exception);
         }
     }
-    // 运行时扫描：所有名字含 ScreenRecording 的类
-    MFLog(@"[sysact] 录屏：已知类全失败，开始运行时扫描（结果在下面，请回传日志）");
     @try {
-        unsigned int classCount = 0;
-        Class *classes = objc_copyClassList(&classCount);
-        unsigned int logged = 0;
-        for (unsigned int i = 0; i < classCount; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            if (![name localizedCaseInsensitiveContainsString:@"screenrecording"]) {
-                continue;
-            }
-            if (logged < 10) {
-                MFLog(@"[sysact] 录屏扫描：发现类 %@", name);
-                logged++;
-            }
-            id instance = MFSystemActionSingletonInstance(name, @"录屏扫描");
-            // 【0.6.13 安全模式修复】不再对未知类 alloc/init 兜底——任意类的 init 都可能
-            //   依赖未初始化的宿主状态（后果是 BAD_ACCESS，@try 抓不住）。只信单例。
-            if (instance != nil &&
-                MFSystemActionScanAndInvoke(instance, @[ @"recording" ], @[ @"toggle", @"start", @"begin" ],
-                                            [NSString stringWithFormat:@"录屏扫描 %@", name], YES)) {
-                if (classes != NULL) {
-                    free(classes);
-                }
-                return YES;
+        UIApplication *application = [UIApplication sharedApplication];
+        NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+        for (UIScene *scene in application.connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
             }
         }
-        if (classes != NULL) {
-            free(classes);
+        [windows addObjectsFromArray:application.windows];
+        for (UIWindow *window in windows) {
+            if ([window isKindOfClass:cls]) {
+                MFLog(@"[sysact] %@：窗口层级命中 %@（window 本体）", label, className);
+                return window;
+            }
+            UIViewController *controller = window.rootViewController;
+            int guard = 0;
+            while (controller != nil && guard < 12) {
+                if ([controller isKindOfClass:cls]) {
+                    MFLog(@"[sysact] %@：窗口层级命中 %@（%@ 的控制器链）", label, className,
+                          NSStringFromClass([window class]));
+                    return controller;
+                }
+                controller = controller.presentedViewController;
+                guard++;
+            }
+            id hit = MFSystemActionFindInstanceInView(window, cls, 0);
+            if (hit != nil) {
+                MFLog(@"[sysact] %@：窗口层级命中 %@（%@ 视图树）", label, className,
+                      NSStringFromClass([window class]));
+                return hit;
+            }
         }
     } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! 录屏运行时扫描异常：%@", exception);
+        MFLog(@"[sysact] !! %@ 窗口层级查找异常：%@", label, exception);
     }
-    return NO;
+    MFLog(@"[sysact] %@：单例与窗口层级都没找到 %@ 的实例", label, className);
+    return nil;
+}
+
+/// 失败时把方法名（含关键字）打进日志——只 dump，不调用。
+static void MFSystemActionDumpMethodsMatching(id target, NSArray<NSString *> *keywords,
+                                              NSString *label) {
+    if (target == nil) {
+        return;
+    }
+    Class cls = object_getClass(target);
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    MFLog(@"[sysact] %@ 诊断：%@ 方法 %u 个，含关键字的结果如下", label,
+          NSStringFromClass(cls), count);
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        for (NSString *keyword in keywords) {
+            if ([name localizedCaseInsensitiveContainsString:keyword]) {
+                const char *types = method_getTypeEncoding(methods[i]);
+                MFLog(@"[sysact]   · %@ (%s)", name, types ? types : "?");
+                break;
+            }
+        }
+    }
+    if (methods != NULL) {
+        free(methods);
+    }
 }
 
 #pragma mark - 动作④：控制中心（【0.6.11 用户指令】）
 
+/// 【0.6.16】控制中心：单例 / 窗口层级两路取实例 → 已知 selector 逐个试 →
+/// 再按关键字扫一遍 → 全失败才 dump。每一条都走类型安全的自适应调用器
+/// （BOOLEAN 槽给 YES、对象槽给 nil），失败只写日志。
 static BOOL MFSystemActionPresentControlCenter(void) {
-    id controller = MFSystemActionSingletonInstance(@"SBControlCenterController", @"控制中心");
+    id controller = MFSystemActionResolveInstance(@"SBControlCenterController", @"控制中心");
     if (controller != nil) {
-        for (NSString *name in @[ @"presentAnimated:completion:", @"presentAnimated:",
-                                  @"presentControlCenterAnimated:", @"present" ]) {
+        NSArray<NSString *> *names = @[ @"presentAnimated:completion:",
+                                        @"presentAnimated:withCompletion:",
+                                        @"presentControlCenterAnimated:",
+                                        @"presentAnimated:",
+                                        @"present" ];
+        for (NSString *name in names) {
             SEL selector = NSSelectorFromString(name);
             if ([controller respondsToSelector:selector] &&
                 MFSystemActionInvokeAdaptive(controller, selector,
@@ -1108,68 +1086,70 @@ static BOOL MFSystemActionPresentControlCenter(void) {
                 return YES;
             }
         }
-    }
-    // 兜底：扫控制中心相关单例的 present 系方法
-    @try {
-        Class cls = objc_getClass("SBControlCenterController");
-        if (cls != Nil) {
-            unsigned int count = 0;
-            Method *methods = class_copyMethodList(cls, &count);
-            for (unsigned int i = 0; i < count; i++) {
-                SEL selector = method_getName(methods[i]);
-                NSString *name = NSStringFromSelector(selector);
-                if (method_getNumberOfArguments(methods[i]) <= 4 &&
-                    [name localizedCaseInsensitiveContainsString:@"present"]) {
-                    if (MFSystemActionInvokeAdaptive(controller, selector,
-                                                     [NSString stringWithFormat:@"控制中心扫描 %@",
-                                                      name], YES)) {
-                        if (methods != NULL) {
-                            free(methods);
-                        }
-                        return YES;
-                    }
-                }
-            }
-            if (methods != NULL) {
-                free(methods);
-            }
+        if (MFSystemActionScanAndInvoke(controller, @[ @"present", @"show", @"toggle", @"controlcenter" ],
+                                        @[ @"present", @"toggle" ],
+                                        @"控制中心 SBControlCenterController", YES)) {
+            return YES;
         }
-    } @catch (NSException *exception) {
-        MFLog(@"[sysact] !! 控制中心扫描异常：%@", exception);
+        MFSystemActionDumpMethodsMatching(controller, @[ @"present", @"show", @"toggle", @"center" ],
+                                          @"控制中心");
     }
+    // 兜底：另一套常见命名（新版 SpringBoard 把 CC 也挂在 presentation manager 上）
+    for (NSString *className in @[ @"SBMainDisplaySceneController", @"SBControlCenterSystemAgent",
+                                   @"SBControlCenterPresentationManager" ]) {
+        id other = MFSystemActionResolveInstance(className, @"控制中心兜底");
+        if (other == nil) {
+            continue;
+        }
+        if (MFSystemActionScanAndInvoke(other, @[ @"controlcenter", @"present" ], @[ @"present" ],
+                                        [NSString stringWithFormat:@"控制中心兜底 %@", className], YES)) {
+            return YES;
+        }
+    }
+    MFLog(@"[sysact] 控制中心：所有候选都没成功（见上面诊断）");
     return NO;
 }
 
 #pragma mark - 动作⑤：通知中心（【0.6.11 用户指令】）
 
+/// 【0.6.16】通知中心：同上——实例两路取，4 参数那个 setCoverSheetPresented 显式调用
+/// （自适应器只支持 ≤2 参数），其余已知 selector 走自适应。
 static BOOL MFSystemActionPresentNotificationCenter(void) {
-    id manager = MFSystemActionSingletonInstance(@"SBCoverSheetPresentationManager", @"通知中心");
+    id manager = MFSystemActionResolveInstance(@"SBCoverSheetPresentationManager", @"通知中心");
     if (manager != nil) {
-        for (NSString *name in @[ @"setCoverSheetPresented:animated:withOptions:withCompletion:",
-                                  @"setCoverSheetPresented:animated:options:completion:",
-                                  @"presentNotificationCenterAnimated:",
-                                  @"presentAnimated:" ]) {
+        // ① 4 参数主路（新版签名）：BOOL presented + BOOL animated + id options + id completion
+        SEL four = NSSelectorFromString(@"setCoverSheetPresented:animated:options:completion:");
+        if ([manager respondsToSelector:four]) {
+            @try {
+                ((void (*)(id, SEL, BOOL, BOOL, id, id))objc_msgSend)(manager, four, YES, YES, nil, nil);
+                MFLog(@"[sysact] 通知中心：命中 setCoverSheetPresented:animated:options:completion:");
+                return YES;
+            } @catch (NSException *exception) {
+                MFLog(@"[sysact] !! 通知中心 4 参数调用异常：%@", exception);
+            }
+        }
+        // ② 其余签名走自适应（≤2 参数）
+        NSArray<NSString *> *names = @[ @"setCoverSheetPresented:animated:withCompletion:",
+                                        @"setCoverSheetPresented:animated:",
+                                        @"presentNotificationCenterAnimated:",
+                                        @"presentAnimated:" ];
+        for (NSString *name in names) {
             SEL selector = NSSelectorFromString(name);
             if ([manager respondsToSelector:selector] &&
                 MFSystemActionInvokeAdaptive(manager, selector,
-                                             [NSString stringWithFormat:@"通知中心 %@",
+                                             [NSString stringWithFormat:@"通知中心 SBCoverSheetPresentationManager %@",
                                               name], YES)) {
                 return YES;
             }
         }
-        // setCoverSheetPresented 系签名参数多（BOOL+BOOL+对象+对象），单独按 4 参数调用
-        SEL selector = NSSelectorFromString(@"setCoverSheetPresented:animated:options:completion:");
-        if ([manager respondsToSelector:selector]) {
-            @try {
-                ((void (*)(id, SEL, BOOL, BOOL, id, id))objc_msgSend)(manager, selector, YES, YES, nil, nil);
-                MFLog(@"[sysact] 通知中心：命中 setCoverSheetPresented:animated:options:completion:（4 参数显式调用）");
-                return YES;
-            } @catch (NSException *exception) {
-                MFLog(@"[sysact] !! 通知中心 setCoverSheetPresented 异常：%@", exception);
-            }
+        if (MFSystemActionScanAndInvoke(manager, @[ @"coversheet", @"present", @"notification" ],
+                                        @[ @"present", @"coversheet" ],
+                                        @"通知中心 SBCoverSheetPresentationManager", YES)) {
+            return YES;
         }
+        MFSystemActionDumpMethodsMatching(manager, @[ @"coversheet", @"present", @"slide" ], @"通知中心");
     }
-    MFLog(@"[sysact] 通知中心：所有候选都没成功");
+    MFLog(@"[sysact] 通知中心：所有候选都没成功（见上面诊断）");
     return NO;
 }
 
