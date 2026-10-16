@@ -435,7 +435,9 @@
 //    mfRingIntroMinScale number 【0.4.2】刚划出（在触发条处）时的圆盘缩放（默认 0.10 = 10%）
 //    mfRingParkRatioY   number 【0.4.2】固定/位移终点圆心纵向 = 屏高 × 该值（默认 0.78 = 屏幕中下中心）
 //    mfRingRings        number 圆盘圈数 1~3（默认 2；装得下时自动收敛为 1 圈）
-//    mfRingInnerRatio   number 内圈半径比例上限 0.35~0.95（默认 0.62，仅多圈时生效）
+//    mfRingRingGap      number 【0.6.21】内外圈可见间距，pt（默认 6）——**恒定值**，不随 App 数量变；
+//                              相邻圈圆心距 = 图标直径 + 本值（越大两圈离得越开）
+//    （mfRingInnerRatio 【0.6.21 起停用】旧的内圈半径比例，已由 mfRingRingGap 取代）
 //    mfRingIconGap      number 图标间距估算值，pt（默认 6；越大每圈能放越少）
 //    mfRingMaxIcons     number 圆盘最多显示几个（默认 24，上限 24）
 //    mfRingHostWindow   number 圆盘/触发条的宿主窗口：**0=只用 PullOver 窗口（0.2.4 默认）** /
@@ -1144,7 +1146,7 @@ typedef struct {
     CGFloat extent;        // ringRoot 半边长（含图标外沿余量）
     CGFloat iconSize;      // 图标直径
     CGFloat step;          // 同圈相邻图标的最小圆心距（= 图标宽 + 间距）
-    CGFloat innerRatio;    // 内圈 / 外圈 的固定比例（上限）
+    CGFloat ringPitch;     // 【0.6.21】相邻圈圆心距：固定 = 图标直径 + mfRingRingGap
     NSUInteger rings;      // 实际可用圈数（>= 1）
     CGFloat scale;         // 【0.2.3】整体缩放（由数量决定，1.0 = 配置原尺寸）
     NSUInteger count;      // 【0.2.3】本次几何是按几个图标算的
@@ -1213,7 +1215,11 @@ static MFRingGeometry MFRingComputeGeometry(CGRect bounds, NSUInteger count) {
     // 【0.2.5】图标尺寸按数量分档、不随圆盘缩放（用户："图标太小了"）；间距固定不缩
     CGFloat iconSize = MFRingIconSizeForCount(want);
     CGFloat gap = MAX(0.0, MFRingNumber(@"mfRingIconGap", 6.0));
-    CGFloat innerRatio = MIN(MAX(MFRingNumber(@"mfRingInnerRatio", 0.62), 0.35), 0.95);
+    // 【0.6.21 用户 log60】内外圈间距**固定**：相邻圈圆心距 = 图标直径 + mfRingRingGap（默认 6pt）。
+    //   旧的 mfRingInnerRatio 只影响"规划阶段"的容量估算，真正绘制的内圈半径来自下面的等距解
+    //   （内圈 = 外圈 × 内圈数/外圈数）⇒ 数量越多内圈越往里缩 ⇒ 内外圈间距越来越大。现改为固定圆心距。
+    CGFloat ringGap = MAX(0.0, MFRingNumber(@"mfRingRingGap", 6.0));
+    CGFloat ringPitch = iconSize + ringGap;
     NSUInteger desiredRings = (NSUInteger)MIN(MAX(MFRingNumber(@"mfRingRings", 2.0), 1.0), 3.0);
     NSUInteger targetCap = want;
 
@@ -1232,7 +1238,7 @@ static MFRingGeometry MFRingComputeGeometry(CGRect bounds, NSUInteger count) {
         CGFloat r = outer;
         for (NSUInteger ring = 0; ring < desiredRings; ring++) {
             if (ring > 0) {
-                r *= innerRatio;
+                r -= ringPitch;
                 if (r < iconSize * 1.15) {
                     break;
                 }
@@ -1250,13 +1256,13 @@ static MFRingGeometry MFRingComputeGeometry(CGRect bounds, NSUInteger count) {
     geo.extent = geo.dialRadius + iconSize * 0.5 + 10.0;
     geo.iconSize = iconSize;
     geo.step = step;
-    geo.innerRatio = innerRatio;
+    geo.ringPitch = ringPitch;
 
     NSUInteger rings = 0;
     CGFloat r = outer;
     for (NSUInteger ring = 0; ring < desiredRings; ring++) {
         if (ring > 0) {
-            r *= innerRatio;
+            r -= ringPitch;
             if (r < iconSize * 1.15) {
                 break;
             }
@@ -1274,6 +1280,173 @@ static MFRingGeometry MFRingComputeGeometry(CGRect bounds, NSUInteger count) {
 static MFRingGeometry MFRingCurrentGeometry(CGRect bounds) {
     return MFRingComputeGeometry(bounds, gMFRingCount);
 }
+/// 【0.6.21 用户 log60】内外圈**固定间距**布局解（呼出圆盘与编辑器实时预览共用，保证排布一致）。
+///
+/// 旧算法：绘制内圈半径 = 外圈半径 × (内圈图标数 / 外圈图标数) ⇒ App 越多 nIn/nOut 越小 ⇒
+///   内圈相对越往中心缩 ⇒ 内外圈间距随数量变大（log60 实测 18 个≈48pt、20 个≈61pt）。
+/// 新算法：相邻圈圆心距 pitch = 图标直径 + mfRingRingGap（默认 6，**固定值**）；
+///   内圈半径 = 外圈半径 − pitch；再按"两圈弧上间距一致"反解外圈半径：
+///     nIn/nOut = rIn/rOut 且 rIn = rOut − pitch  ⇒  rOut = pitch × nOut/(nOut − nIn)。
+///   于是无论圆盘里有多少个 App，内外圈的**可见间距恒等于 mfRingRingGap**。
+typedef struct {
+    NSUInteger rings;         // 实际圈数（1 或 2）
+    NSUInteger counts[3];     // 每圈图标数（由外到内）
+    CGFloat radii[3];         // 每圈图标圆心半径（由外到内）
+    NSUInteger total;         // 实际摆放总数（可能被"所有圈总容量"截断）
+} MFRingLayout;
+
+static MFRingLayout MFRingSolveLayout(MFRingGeometry geo, NSUInteger count) {
+    MFRingLayout lay = (MFRingLayout){ 0, { 0, 0, 0 }, { 0.0, 0.0, 0.0 }, 0 };
+    if (count == 0) {
+        return lay;
+    }
+    CGFloat outerRadius = geo.outerRadius;
+    CGFloat iconSize = geo.iconSize;
+    CGFloat step = geo.step;
+    CGFloat pitch = MAX(geo.ringPitch, 1.0);
+    NSUInteger maxRings = MIN(MAX(geo.rings, (NSUInteger)1), (NSUInteger)3);
+
+    // ① 规划每圈半径 / 容量（由外到内）：半径按**固定** pitch 递减（不再等比收缩）
+    CGFloat planRadii[3] = { 0.0, 0.0, 0.0 };
+    NSUInteger planCaps[3] = { 0, 0, 0 };
+    NSUInteger rings = 0;
+    for (NSUInteger ring = 0; ring < maxRings; ring++) {
+        CGFloat rr = (ring == 0) ? outerRadius : (planRadii[ring - 1] - pitch);
+        if (ring > 0 && rr < iconSize * 1.15) {
+            break;   // 内圈塞不下图标就不再加圈
+        }
+        planRadii[ring] = rr;
+        planCaps[ring] = (NSUInteger)MAX(floor((2.0 * M_PI * rr) / step), 1.0);
+        rings++;
+    }
+    if (rings == 0) {
+        planRadii[0] = outerRadius;
+        planCaps[0] = 1;
+        rings = 1;
+    }
+
+    // ② 单圈收敛（0.2.5 规则不变）：装得下单圈、或"恰好步距"的单圈半径没超规划外圈×1.15
+    CGFloat snugAll = (CGFloat)count * step / (2.0 * M_PI);
+    if (count <= planCaps[0] || snugAll <= outerRadius * 1.15) {
+        rings = 1;
+    } else {
+        while (rings > 1 && planCaps[rings - 1] < 3) {
+            rings--;
+        }
+    }
+    // ③ 单圈：半径按"恰好步距"反算。**不按规划容量截断** —— 规划容量是在规划半径上算的，
+    //   而单圈实际画在 snug 半径（可能更大）上，容量必然 ≥ count。这里顺带修掉老问题：
+    //   App 数 13/14 时会被截成 12 个（加了 App 圆盘却没变化）。
+    if (rings == 1) {
+        lay.rings = 1;
+        lay.total = count;
+        lay.counts[0] = count;
+        CGFloat snug = (CGFloat)count * step / (2.0 * M_PI);
+        lay.radii[0] = MIN(MAX(snug, iconSize * 1.15), outerRadius * 1.35);
+        return lay;
+    }
+
+    NSUInteger totalCap = 0;
+    for (NSUInteger ring = 0; ring < rings; ring++) {
+        totalCap += planCaps[ring];
+    }
+    NSUInteger want = count;
+    if (totalCap > 0 && want > totalCap) {
+        want = totalCap;   // 兜底：超出所有圈总容量时截断
+    }
+    lay.total = want;
+
+    // ④ 双圈：内圈半径 = 外圈 − pitch（圆心距固定）。**优先用规划外圈半径本身** ——
+    //    保持"圆盘大小随数量变化"的既有观感，不为了让图标不重叠而无谓撑大圆盘；
+    //    图标数按两圈半径比例分配（外圈多、内圈少），两圈弧距接近一致。
+    CGFloat maxOuter = MIN(outerRadius * 1.5, outerRadius + iconSize * 0.5 + 16.0);
+    CGFloat planInnerRadius = outerRadius - pitch;
+    if (planInnerRadius >= iconSize * 1.15) {
+        NSUInteger nOut = (NSUInteger)floor((double)want * outerRadius /
+                                            (outerRadius + planInnerRadius) + 0.5);
+        if (nOut > want - 1) {
+            nOut = want - 1;
+        }
+        if (nOut < 1) {
+            nOut = 1;
+        }
+        NSUInteger nIn = want - nOut;
+        CGFloat sOut = (2.0 * M_PI * outerRadius) / (CGFloat)nOut;
+        CGFloat sIn = (nIn > 0) ? (2.0 * M_PI * planInnerRadius) / (CGFloat)nIn : 0.0;
+        if (nIn >= 1 && nOut > nIn && sOut >= step && sIn >= step) {
+            lay.rings = 2;
+            lay.counts[0] = nOut;
+            lay.counts[1] = nIn;
+            lay.radii[0] = outerRadius;
+            lay.radii[1] = planInnerRadius;
+            MFLog(@"[ring] 内外圈固定间距：外 %lu 个 @ r=%.0f、内 %lu 个 @ r=%.0f"
+                  @"（圆心距 %.0f 固定 = 图标 %.0f + 间距 %.0f）",
+                  (unsigned long)nOut, outerRadius, (unsigned long)nIn, planInnerRadius,
+                  pitch, iconSize, pitch - iconSize);
+            return lay;
+        }
+    }
+
+    //  兜底搜索：固定 pitch 下 rOut 由 (nIn, nOut) 唯一确定（rOut = pitch×nOut/(nOut−nIn)），
+    //    取"弧距 ≥ 步距 且最小"的解（外圈尽量满）
+    CGFloat bestOuterRadius = 0.0;
+    CGFloat bestSpacing = 0.0;
+    NSUInteger bestInner = 0;
+    NSUInteger bestOuter = 0;
+    for (NSUInteger nOut = want - 1; nOut >= 2; nOut--) {
+        NSUInteger nIn = want - nOut;
+        if (nIn < 1 || nOut <= nIn) {
+            continue;   // 用户要求：内圈少、外圈多
+        }
+        CGFloat rOut = pitch * (CGFloat)nOut / (CGFloat)(nOut - nIn);
+        if (rOut > maxOuter) {
+            continue;   // 外圈不许顶出底盘安全上限
+        }
+        if (rOut - pitch < iconSize * 1.15) {
+            continue;   // 内圈塞不下图标
+        }
+        CGFloat spacing = (2.0 * M_PI * rOut) / (CGFloat)nOut;   // 等弧距下两圈共用
+        if (spacing < step) {
+            continue;   // 相邻图标不许重叠
+        }
+        if (bestOuter == 0 || spacing < bestSpacing) {
+            bestSpacing = spacing;
+            bestOuterRadius = rOut;
+            bestInner = nIn;
+            bestOuter = nOut;
+        }
+    }
+    if (bestOuter > 0) {
+        lay.rings = 2;
+        lay.counts[0] = bestOuter;
+        lay.counts[1] = bestInner;
+        lay.radii[0] = bestOuterRadius;
+        lay.radii[1] = bestOuterRadius - pitch;
+        MFLog(@"[ring] 固定间距兜底解：外 %lu 个 @ r=%.0f、内 %lu 个 @ r=%.0f（弧距 %.1f 圆心距 %.0f 固定）",
+              (unsigned long)bestOuter, bestOuterRadius,
+              (unsigned long)bestInner, bestOuterRadius - pitch,
+              bestSpacing, pitch);
+        return lay;
+    }
+
+    // 退路：外圈先铺满、剩余进内圈；内圈半径 = 外圈 − pitch（间距仍然固定）
+    NSUInteger left = want;
+    for (NSInteger ring = (NSInteger)rings - 1; ring >= 0 && left > 0; ring--) {
+        NSUInteger take = MIN(planCaps[(NSUInteger)ring], left);
+        lay.counts[(NSUInteger)ring] = take;
+        left -= take;
+    }
+    lay.rings = (lay.counts[1] > 0) ? 2 : 1;
+    lay.radii[0] = outerRadius;
+    if (lay.rings == 2) {
+        lay.radii[1] = MAX(outerRadius - pitch, iconSize * 1.15);
+    }
+    MFLog(@"[ring] 固定间距退路：外 %lu 个 @ r=%.0f、内 %lu 个 @ r=%.0f（圆心距 %.0f）",
+          (unsigned long)lay.counts[0], lay.radii[0],
+          (unsigned long)lay.counts[1], lay.rings == 2 ? lay.radii[1] : 0.0, pitch);
+    return lay;
+}
+
 
 // 【0.6.10】圆盘槽位计算 —— 呼出布局算法的纯函数版（等距双圈求解 / 单圈收敛 / 退路分配 /
 // 内圈错半格，全部与真实呼出一致），编辑器实时预览用它画出"圆盘真实排布"。
@@ -1292,125 +1465,24 @@ static NSUInteger MFRingComputeRingSlots(CGRect hostBounds, NSUInteger count, CG
     CGFloat outerRadius = geo.outerRadius;
     CGFloat iconSize = geo.iconSize;
     CGFloat step = geo.step;
-    CGFloat innerRatio = geo.innerRatio;
     CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);
 
-    // ① 规划每圈半径/容量（由外到内）—— 同呼出布局 ①
-    NSMutableArray<NSNumber *> *ringRadii = [NSMutableArray array];
-    NSMutableArray<NSNumber *> *ringCaps = [NSMutableArray array];
-    for (NSUInteger ring = 0; ring < geo.rings; ring++) {
-        CGFloat ringRadius = (ring == 0) ? outerRadius
-                                         : [ringRadii[ring - 1] doubleValue] * innerRatio;
-        if (ring > 0 && ringRadius < iconSize * 1.15) {
-            break;
-        }
-        [ringRadii addObject:@(ringRadius)];
-        [ringCaps addObject:@(MAX(floor((2.0 * M_PI * ringRadius) / step), 1.0))];
+    // ①–③【0.6.21 用户 log60】统一"内外圈固定间距"布局解（与呼出圆盘共用 MFRingSolveLayout，
+    //   保证编辑器实时预览与真实圆盘排布完全一致）。
+    MFRingLayout layout = MFRingSolveLayout(geo, count);
+    NSUInteger rings = layout.rings;
+    want = MIN(layout.total, maxSlots);
+    CGFloat ringRadiiArr[3] = { 0.0, 0.0, 0.0 };
+    NSUInteger perRingArr[3] = { 0, 0, 0 };
+    for (NSUInteger ring = 0; ring < rings && ring < 3; ring++) {
+        ringRadiiArr[ring] = layout.radii[ring];
+        perRingArr[ring] = layout.counts[ring];
     }
-    NSUInteger rings = ringRadii.count;
-
-    // ② 单圈收敛判定 —— 同呼出布局 ②
-    CGFloat snugAll = (CGFloat)want * step / (2.0 * M_PI);
-    if (want <= [ringCaps[0] unsignedIntegerValue] || snugAll <= outerRadius * 1.15) {
-        if (rings > 1) {
-            [ringRadii removeObjectsInRange:NSMakeRange(1, rings - 1)];
-            [ringCaps removeObjectsInRange:NSMakeRange(1, rings - 1)];
-            rings = 1;
-        }
-    } else {
-        while (rings > 1 && [ringCaps[rings - 1] unsignedIntegerValue] < 3) {
-            [ringRadii removeLastObject];
-            [ringCaps removeLastObject];
-            rings--;
-        }
-    }
-    NSUInteger totalCap = 0;
-    for (NSNumber *cap in ringCaps) {
-        totalCap += [cap unsignedIntegerValue];
-    }
-    if (want > totalCap && totalCap > 0) {
-        want = totalCap;
-    }
-
-    // ③ 等距双圈求解 —— 同呼出布局 ③
-    NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
-    for (NSUInteger ring = 0; ring < rings; ring++) {
-        [perRing addObject:@(0)];
-    }
-    NSMutableArray<NSNumber *> *drawnRadii = [NSMutableArray arrayWithCapacity:rings];
-    BOOL solvedEqualSpacing = NO;
-    if (rings >= 2) {
-        CGFloat minInnerRadius = iconSize * 1.15;
-        NSUInteger maxInner = (NSUInteger)MAX(floor((2.0 * M_PI * minInnerRadius) / step), 1.0);
-        CGFloat bestSpacing = 0.0;
-        CGFloat bestOuterRadius = 0.0;
-        NSUInteger bestInner = 0;
-        NSUInteger bestOuter = 0;
-        for (NSUInteger nIn = MIN(maxInner, want - 1); nIn >= 1; nIn--) {
-            NSUInteger nOut = want - nIn;
-            if (nOut <= nIn) {
-                break;
-            }
-            CGFloat rOutMin = minInnerRadius * ((CGFloat)nOut / (CGFloat)nIn);
-            CGFloat rOutMax = MIN(1.6 * step * ((CGFloat)nOut / (2.0 * M_PI)),
-                                  outerRadius * 1.5);
-            if (rOutMin > rOutMax) {
-                continue;
-            }
-            CGFloat rOut = MIN(outerRadius, rOutMax);
-            if (rOut < rOutMin) {
-                rOut = rOutMin;
-            }
-            CGFloat spacing = (2.0 * M_PI * rOut) / (CGFloat)nOut;
-            if (bestInner == 0 || spacing < bestSpacing) {
-                bestSpacing = spacing;
-                bestOuterRadius = rOut;
-                bestInner = nIn;
-                bestOuter = nOut;
-            }
-        }
-        if (bestInner > 0) {
-            perRing[0] = @(bestOuter);
-            perRing[1] = @(bestInner);
-            [drawnRadii addObject:@(bestOuterRadius)];
-            [drawnRadii addObject:@(bestOuterRadius * ((CGFloat)bestInner / (CGFloat)bestOuter))];
-            if (rings > 2) {
-                rings = 2;
-            }
-            solvedEqualSpacing = YES;
-        }
-    }
-    if (!solvedEqualSpacing) {
-        // 退路：外圈先铺满，剩余进内圈；内圈半径按个数自适应 —— 同呼出布局退路
-        NSUInteger left = want;
-        for (NSInteger ring = (NSInteger)rings - 1; ring >= 0 && left > 0; ring--) {
-            NSUInteger cap = [ringCaps[(NSUInteger)ring] unsignedIntegerValue];
-            NSUInteger take = MIN(cap, left);
-            perRing[(NSUInteger)ring] = @(take);
-            left -= take;
-        }
-        CGFloat outerCount = MAX((CGFloat)[perRing[0] doubleValue], 1.0);
-        for (NSUInteger ring = 0; ring < rings; ring++) {
-            CGFloat drawn = [ringRadii[ring] doubleValue];
-            if (ring == 0 && rings == 1) {
-                CGFloat snug = (CGFloat)want * step / (2.0 * M_PI);
-                drawn = MIN(MAX(snug, iconSize * 1.15), outerRadius * 1.35);
-            }
-            if (ring > 0) {
-                CGFloat innerCount = (CGFloat)[perRing[ring] doubleValue];
-                if (innerCount > 0.5) {
-                    drawn = MIN(MAX(outerRadius * (innerCount / outerCount), outerRadius * 0.42), drawn);
-                }
-            }
-            [drawnRadii addObject:@(drawn)];
-        }
-    }
-
     // ④ 逐圈产出槽位（内圈错半格）—— 同呼出布局 ⑤
     NSUInteger placed = 0;
     for (NSUInteger ring = 0; ring < rings && placed < want; ring++) {
-        CGFloat iconRadius = [drawnRadii[ring] doubleValue];
-        NSUInteger ringCount = [perRing[ring] unsignedIntegerValue];
+        CGFloat iconRadius = (ring < 3) ? ringRadiiArr[ring] : outerRadius;
+        NSUInteger ringCount = (ring < 3) ? perRingArr[ring] : 0;
         for (NSUInteger slot = 0; slot < ringCount && placed < want; slot++, placed++) {
             CGFloat stagger = (ring % 2 == 1) ? (180.0 / (CGFloat)MAX(ringCount, (NSUInteger)1)) : 0.0;
             outSlots[placed].angleDegrees = startAngle + stagger
@@ -1963,10 +2035,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         {
             MFRingGeometry geo = MFRingComputeGeometry(bounds, ringCount);
             MFLog(@"[ring] 圆盘几何：数量=%lu 缩放=%@ 圈数=%lu 有效外圈半径=%.0f 底盘=%.0f 图标=%.0f "
-                  @"步距=%.0f 停留固定=%.1fs | 编辑器入口：长按贴边触发条 0.7 秒（最多 %lu 个图标）",
+                  @"步距=%.0f 内外圈间距=%.0f（固定，不随数量变） 停留固定=%.1fs | "
+                  @"编辑器入口：长按贴边触发条 0.7 秒（最多 %lu 个图标）",
                   (unsigned long)ringCount, MFRingScaleDescription(ringCount),
                   (unsigned long)geo.rings, geo.outerRadius, geo.dialRadius,
-                  geo.iconSize, geo.step,
+                  geo.iconSize, geo.step, geo.ringPitch - geo.iconSize,
                   MAX(0.4, MFRingNumber(@"mfRingLatchDwell", MF_RING_LATCH_DWELL)),
                   (unsigned long)MFRingMaxIcons());
             MFLog(@"[ring] 呼出阈值=%.0fpt | 归档38 提醒：全屏 App 上只有'屏幕边缘/状态栏'这些系统保留区"
@@ -2542,7 +2615,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.6.20 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.6.21 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -2761,7 +2834,6 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGFloat extent = geo.extent;
     CGFloat dialRadius = geo.dialRadius;
     CGFloat outerRadius = geo.outerRadius;
-    CGFloat innerRatio = geo.innerRatio;
     CGFloat rotation = MFRingNumber(@"mfRingRotation", 0.0);
     MFLog(@"[ring] 圆盘缩放 %@ -> 图标 %.0f 半径 %.0f",
           MFRingScaleDescription(geo.count), iconSize, outerRadius);
@@ -2815,130 +2887,17 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     CGFloat startAngle = MFRingNumber(@"mfRingStartAngle", -90.0);   // 默认从正上方开始
     CGPoint localCenter = CGPointMake(extent, extent);
 
-    // ① 算出每一圈的规划半径（由外到内）与该圈最多能放几个
-    NSMutableArray<NSNumber *> *ringRadii = [NSMutableArray array];
-    NSMutableArray<NSNumber *> *ringCaps = [NSMutableArray array];
-    for (NSUInteger ring = 0; ring < geo.rings; ring++) {
-        CGFloat ringRadius = (ring == 0) ? outerRadius
-                                        : [ringRadii[ring - 1] doubleValue] * innerRatio;
-        if (ring > 0 && ringRadius < iconSize * 1.15) {
-            break;   // 内圈塞不下图标就不再加圈
-        }
-        [ringRadii addObject:@(ringRadius)];
-        [ringCaps addObject:@(MAX(floor((2.0 * M_PI * ringRadius) / step), 1.0))];
-    }
-    NSUInteger rings = ringRadii.count;
-
-    // ② 收敛单圈的判定（0.2.5）：数量装得下单圈、**或**"恰好步距"的单圈半径（snug =
-    //    count×step/2π）没超过规划外圈的 1.15 倍 —— 单圈贴步距比双圈稀排更匀；
-    //    再大的量就走等距双圈（24 个仍保持"外多内少"两圈观感）
-    CGFloat snugAll = (CGFloat)count * step / (2.0 * M_PI);
-    if (count <= [ringCaps[0] unsignedIntegerValue] || snugAll <= outerRadius * 1.15) {
-        if (rings > 1) {
-            [ringRadii removeObjectsInRange:NSMakeRange(1, rings - 1)];
-            [ringCaps removeObjectsInRange:NSMakeRange(1, rings - 1)];
-            rings = 1;
-        }
-    } else {
-        while (rings > 1 && [ringCaps[rings - 1] unsignedIntegerValue] < 3) {
-            [ringRadii removeLastObject];
-            [ringCaps removeLastObject];
-            rings--;
-        }
-    }
-    NSUInteger totalCap = 0;
-    for (NSNumber *cap in ringCaps) {
-        totalCap += [cap unsignedIntegerValue];
-    }
-    if (count > totalCap && totalCap > 0) {
-        count = totalCap;   // 兜底：超出所有圈的总容量时截断
-    }
-
-    // ③【0.2.5】等距双圈求解（用户：**内圈少、外圈多，两圈弧上间距一致，都不许出现巨大空隙**）。
-    //    对每个候选 n_in（内圈个数，从多到少），令 n_out = count − n_in：
-    //      · 等距 ⇒ r_in = r_out × n_in/n_out；
-    //      · 内圈塞得下 ⇒ r_in ≥ iconSize×1.15 ⇒ r_out ≥ 1.15×icon×n_out/n_in；
-    //      · 外圈不许有大空隙 ⇒ 间距 ≤ 1.6×step ⇒ r_out ≤ 1.6×step×n_out/2π（且 ≤ 规划外圈×1.5）。
-    //    在可行解里取**外圈间距最小**的 n_in（外圈尽量满），r_out 取 min(规划外圈, 上限)。
-    //    无可行解才退回"外圈铺满、剩余进内圈 + 内圈半径自适应"。
+    // ①–③【0.6.21 用户 log60】统一"内外圈固定间距"布局解：内圈半径 = 外圈半径 − ringPitch，
+    //   无论多少个 App，内外圈的可见间距恒为 mfRingRingGap（默认 6pt）。
+    MFRingLayout layout = MFRingSolveLayout(geo, count);
+    NSUInteger rings = layout.rings;
+    count = layout.total;
     NSMutableArray<NSNumber *> *perRing = [NSMutableArray arrayWithCapacity:rings];
-    for (NSUInteger ring = 0; ring < rings; ring++) {
-        [perRing addObject:@(0)];
-    }
     NSMutableArray<NSNumber *> *drawnRadii = [NSMutableArray arrayWithCapacity:rings];
-    BOOL solvedEqualSpacing = NO;
-    if (rings >= 2) {
-        CGFloat minInnerRadius = iconSize * 1.15;
-        NSUInteger maxInner = (NSUInteger)MAX(floor((2.0 * M_PI * minInnerRadius) / step), 1.0);
-        CGFloat bestSpacing = 0.0;
-        CGFloat bestOuterRadius = 0.0;
-        NSUInteger bestInner = 0;
-        NSUInteger bestOuter = 0;
-        for (NSUInteger nIn = MIN(maxInner, count - 1); nIn >= 1; nIn--) {
-            NSUInteger nOut = count - nIn;
-            if (nOut <= nIn) {
-                break;   // 用户要求：内圈少、外圈多
-            }
-            CGFloat rOutMin = minInnerRadius * ((CGFloat)nOut / (CGFloat)nIn);
-            CGFloat rOutMax = MIN(1.6 * step * ((CGFloat)nOut / (2.0 * M_PI)),
-                                  outerRadius * 1.5);
-            if (rOutMin > rOutMax) {
-                continue;   // 这个 n_in 撑不出均匀解
-            }
-            CGFloat rOut = MIN(outerRadius, rOutMax);
-            if (rOut < rOutMin) {
-                rOut = rOutMin;
-            }
-            CGFloat spacing = (2.0 * M_PI * rOut) / (CGFloat)nOut;
-            if (bestInner == 0 || spacing < bestSpacing) {
-                bestSpacing = spacing;
-                bestOuterRadius = rOut;
-                bestInner = nIn;
-                bestOuter = nOut;
-            }
-        }
-        if (bestInner > 0) {
-            perRing[0] = @(bestOuter);
-            perRing[1] = @(bestInner);
-            [drawnRadii addObject:@(bestOuterRadius)];
-            [drawnRadii addObject:@(bestOuterRadius * ((CGFloat)bestInner / (CGFloat)bestOuter))];
-            if (rings > 2) {
-                rings = 2;   // 等距解只做两圈
-            }
-            solvedEqualSpacing = YES;
-            MFLog(@"[ring] 等距双圈：外 %lu 个 @ r=%.0f（间距 %.1f）、内 %lu 个 @ r=%.0f（等距）",
-                  (unsigned long)bestOuter, bestOuterRadius, bestSpacing,
-                  (unsigned long)bestInner, bestOuterRadius * ((CGFloat)bestInner / (CGFloat)bestOuter));
-        }
+    for (NSUInteger ring = 0; ring < rings; ring++) {
+        [perRing addObject:@(layout.counts[ring])];
+        [drawnRadii addObject:@(layout.radii[ring])];
     }
-    if (!solvedEqualSpacing) {
-        // 退路：**外圈先铺满**，剩余进内圈；内圈半径按个数自适应（下限 0.42×外圈）
-        NSUInteger left = count;
-        for (NSInteger ring = (NSInteger)rings - 1; ring >= 0 && left > 0; ring--) {
-            NSUInteger cap = [ringCaps[(NSUInteger)ring] unsignedIntegerValue];
-            NSUInteger take = MIN(cap, left);
-            perRing[(NSUInteger)ring] = @(take);
-            left -= take;
-        }
-        CGFloat outerCount = MAX((CGFloat)[perRing[0] doubleValue], 1.0);
-        for (NSUInteger ring = 0; ring < rings; ring++) {
-            CGFloat drawn = [ringRadii[ring] doubleValue];
-            if (ring == 0 && rings == 1) {
-                // 【0.2.5】单圈半径 = "恰好步距"（最均匀）：r = count×step/2π；
-                // 下限 1.15×icon（图标塞得下），上限规划外圈×1.35（配合 ② 的收敛条件）
-                CGFloat snug = (CGFloat)count * step / (2.0 * M_PI);
-                drawn = MIN(MAX(snug, iconSize * 1.15), outerRadius * 1.35);
-            }
-            if (ring > 0) {
-                CGFloat innerCount = (CGFloat)[perRing[ring] doubleValue];
-                if (innerCount > 0.5) {
-                    drawn = MIN(MAX(outerRadius * (innerCount / outerCount), outerRadius * 0.42), drawn);
-                }
-            }
-            [drawnRadii addObject:@(drawn)];
-        }
-    }
-
     // 【0.2.5】底盘随"实际外圈半径"重画 —— 等距解 / 单圈收缩可能比规划半径小，
     // 不重画的话图标会缩在底盘里面，观感很差。
     CGFloat actualOuterRadius = [drawnRadii.firstObject doubleValue];
@@ -3512,7 +3471,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.20 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.21 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -5419,7 +5378,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.20 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.21 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
