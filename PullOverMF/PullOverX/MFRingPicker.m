@@ -496,6 +496,7 @@
 #define MF_RING_ORDER_CELL_H 102.0            // 排序条格子高
 #define MF_RING_ORDER_CELL_GAP 6.0            // 格子间距
 #define MF_RING_ORDER_INSET 10.0              // 排序条左右内边距
+#define MF_RING_ORDER_SWAP_DEAD_ZONE 6.0      // 【0.6.17】拖拽换位死区：必须压进目标格内部才换位（防边界抖动）
 
 static char kMFRingBundleIdKey;
 
@@ -2541,7 +2542,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.6.16 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.6.17 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -3511,7 +3512,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.6.16 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.6.17 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -3898,30 +3899,40 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     NSArray<UIView *> *cells = [self.editorOrderCells copy];
     UIScrollView *strip = self.editorOrderScroll;
     NSUInteger columns = [self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)];
+    if (columns == 0) {
+        columns = 1;
+    }
     void (^layout)(void) = ^{
-        for (NSUInteger index = 0; index < cells.count; index++) {
+        const CGFloat stepX = MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP;
+        const CGFloat stepY = MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP;
+        NSUInteger total = cells.count;
+        for (NSUInteger index = 0; index < total; index++) {
             UIView *cell = cells[index];
             if (cell == self.editorOrderDraggingCell) {
                 // 【0.6.8】拖拽中的格子位置由手势跟手控制，layout 只刷新序号装饰
-                [self applyEditorOrderCellDecorations:cell index:index total:cells.count];
+                [self applyEditorOrderCellDecorations:cell index:index total:total];
                 continue;
             }
             CGRect frame = cell.frame;
-            frame.origin.x = MF_RING_ORDER_INSET
-                + (CGFloat)(index % columns) * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP);
-            frame.origin.y = MF_RING_ORDER_INSET
-                + (CGFloat)(index / columns) * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP);
-            cell.frame = frame;
-            [self applyEditorOrderCellDecorations:cell index:index total:cells.count];
+            frame.origin.x = MF_RING_ORDER_INSET + (CGFloat)(index % columns) * stepX;
+            frame.origin.y = MF_RING_ORDER_INSET + (CGFloat)(index / columns) * stepY;
+            // 【0.6.17 用户 log57-①】帧没变就不写：UIView.frame 赋值即触发一次布局，
+            //   拖拽中每次换位都全排 18 格 = 60Hz 下最实在的开销；未动的格子直接跳过。
+            if (!CGRectEqualToRect(cell.frame, frame)) {
+                cell.frame = frame;
+            }
+            [self applyEditorOrderCellDecorations:cell index:index total:total];
         }
         // 【0.6.11】contentSize 纵向撑开（平铺全览，宽度方向不滚）
-        NSUInteger rows = (cells.count + columns - 1) / columns;
-        strip.contentSize = CGSizeMake(MAX(CGRectGetWidth(strip.bounds),
-                                           MF_RING_ORDER_INSET * 2.0
-                                           + (CGFloat)columns * (MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP)),
-                                       MAX(CGRectGetHeight(strip.bounds),
-                                           (CGFloat)MAX(rows, 1) * (MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP)
-                                           + MF_RING_ORDER_INSET * 2.0));
+        NSUInteger rows = (total + columns - 1) / columns;
+        CGSize size = CGSizeMake(MAX(CGRectGetWidth(strip.bounds),
+                                     MF_RING_ORDER_INSET * 2.0
+                                     + (CGFloat)columns * stepX),
+                                 MAX(CGRectGetHeight(strip.bounds),
+                                     (CGFloat)MAX(rows, 1) * stepY + MF_RING_ORDER_INSET * 2.0));
+        if (!CGSizeEqualToSize(strip.contentSize, size)) {
+            strip.contentSize = size;
+        }
     };
     if (animated) {
         [UIView animateWithDuration:0.18
@@ -3932,7 +3943,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                          animations:layout
                          completion:nil];
     } else {
+        // 【0.6.17 用户 log57-①】非动画路径显式关掉 CALayer 隐式动画：
+        //   拖拽期间若还有上一次落位 spring 的图层补间在跑，position 会被再补间一次 ⇒ 闪。
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         layout();
+        [CATransaction commit];
     }
 }
 
@@ -3944,7 +3960,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     (void)total;
     UILabel *order = (UILabel *)[cell viewWithTag:MF_RING_EDITOR_ORDER_INDEX];
     if (order != nil) {
-        order.text = [NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)];
+        // 【0.6.17 用户 log57-①】文本没变不写：UILabel.text 赋值会触发布局+重画，
+        //   拖拽中每帧给十几个格子重设文本是掉帧大户（旧法换位 97 次 ⇒ 文本写 1700+ 次）。
+        NSUInteger shown = (NSUInteger)order.text.integerValue;
+        if (order.text.length == 0 || shown != index + 1) {
+            order.text = [NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)];
+        }
     }
 }
 
@@ -4012,24 +4033,44 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         center.y = contentPoint.y - self.editorOrderDragGrabOffsetY;
         dragCell.center = center;
 
-        // 目标 index：离拖拽格中心**最近**的格子（平铺网格 = 二维最近邻）
-        NSUInteger target = dragIndex;
-        CGFloat bestDistance = CGFLOAT_MAX;
-        for (NSUInteger k = 0; k < self.editorOrderCells.count; k++) {
-            if (k == dragIndex) {
-                continue;
-            }
-            CGPoint neighborCenter = self.editorOrderCells[k].center;
-            CGFloat dx = center.x - neighborCenter.x;
-            CGFloat dy = center.y - neighborCenter.y;
-            CGFloat distance = dx * dx + dy * dy;
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                target = k;
-            }
+        // 【0.6.17 用户 log57-① 重点修复·附近图标狂闪 / 卡顿掉帧】目标格位判定换算法
+        //   旧法「离拖拽格中心最近的那个邻居格子」是**自杀式循环依赖**：邻居的 center 会随
+        //   换位一起改变，换位之后刚被挤开的那一格反而又成了"最近邻" ⇒ 每帧来回换位。
+        //   log57 实测 1.5 秒换位 97 次（≈每帧 1~2 次），视觉上就是附近图标疯狂闪烁、掉帧。
+        //   新法：用**静态网格几何**（只跟格子宽高/间距有关，不随换位变化）反算拖拽格中心
+        //   落在哪个槽位，反馈环被斩断 ⇒ 手指不动就绝不换位；再给目标格留一圈死区
+        //   （必须真正压进目标格矩形内部才换位）⇒ 停在两格缝隙上也只抖不换。
+        NSUInteger columns = [self mfEditorOrderColumnsForWidth:CGRectGetWidth(strip.bounds)];
+        if (columns == 0) {
+            columns = 1;
         }
+        const CGFloat swapStepX = MF_RING_ORDER_CELL_W + MF_RING_ORDER_CELL_GAP;
+        const CGFloat swapStepY = MF_RING_ORDER_CELL_H + MF_RING_ORDER_CELL_GAP;
+        NSUInteger swapCount = self.editorOrderCells.count;
+        NSInteger slotCol = (NSInteger)floor((center.x - MF_RING_ORDER_INSET) / swapStepX);
+        NSInteger slotRow = (NSInteger)floor((center.y - MF_RING_ORDER_INSET) / swapStepY);
+        slotCol = MAX((NSInteger)0, MIN(slotCol, (NSInteger)columns - 1));
+        slotRow = MAX((NSInteger)0, slotRow);
+        NSInteger slotIndex = slotRow * (NSInteger)columns + slotCol;
+        BOOL beyondEnd = (slotIndex >= (NSInteger)swapCount);
+        NSUInteger target = beyondEnd ? (swapCount - 1) : (NSUInteger)slotIndex;
         if (target != dragIndex) {
-            [self moveEditorOrderCellFromIndex:dragIndex toIndex:target];
+            BOOL commit = beyondEnd;   // 拖到网格以外的末尾：直接判给最后一格
+            if (!commit) {
+                CGRect targetRect = CGRectMake(MF_RING_ORDER_INSET
+                                                   + (CGFloat)(target % columns) * swapStepX,
+                                               MF_RING_ORDER_INSET
+                                                   + (CGFloat)(target / columns) * swapStepY,
+                                               MF_RING_ORDER_CELL_W, MF_RING_ORDER_CELL_H);
+                // 死区：目标矩形内缩 ⇒ 格子之间的缝隙 + 两侧余量都不触发换位
+                commit = CGRectContainsPoint(CGRectInset(targetRect,
+                                                         MF_RING_ORDER_SWAP_DEAD_ZONE,
+                                                         MF_RING_ORDER_SWAP_DEAD_ZONE),
+                                             center);
+            }
+            if (commit) {
+                [self moveEditorOrderCellFromIndex:dragIndex toIndex:target];
+            }
         }
         return;
     }
@@ -5378,7 +5419,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.6.16 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.6.17 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
