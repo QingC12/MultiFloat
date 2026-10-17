@@ -1,6 +1,7 @@
 #import "POExternalActivationCoordinator.h"
 
 #import <CoreFoundation/CoreFoundation.h>
+#import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -1454,9 +1455,8 @@ static BOOL POExternalFireBannerDismissTimer(id hub, NSString *role) {
     return NO;
 }
 
-/// 沿类链找第一个「ivar 名含 nameHint、值是 NSString」的字段。
-/// `requesterIdentifier` 这类字段常常只以 ivar 形式存在（没对外 getter）。
-static NSString *POExternalReadIvarString(id object, NSString *nameHint) {
+/// 沿类链找第一个「ivar 名含 nameHint、值为非空对象」的字段（找不到返回 nil）。
+static id POExternalReadIvarObject(id object, NSString *nameHint) {
     if (!object || nameHint.length == 0) {
         return nil;
     }
@@ -1465,11 +1465,10 @@ static NSString *POExternalReadIvarString(id object, NSString *nameHint) {
     while (current && current != [NSObject class] && level < 8) {
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList(current, &count);
-        NSString *found = nil;
+        id found = nil;
         for (unsigned int index = 0; index < count; index++) {
             const char *name = ivar_getName(ivars[index]);
-            const char *encoding = ivar_getTypeEncoding(ivars[index]);
-            if (!name || !encoding || encoding[0] != '@') {
+            if (!name) {
                 continue;
             }
             NSString *ivarName = [NSString stringWithUTF8String:name];
@@ -1482,7 +1481,7 @@ static NSString *POExternalReadIvarString(id object, NSString *nameHint) {
             } @catch (__unused NSException *exception) {
                 value = nil;
             }
-            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+            if (value) {
                 found = value;
                 break;
             }
@@ -1499,37 +1498,38 @@ static NSString *POExternalReadIvarString(id object, NSString *nameHint) {
     return nil;
 }
 
-/// 第二条路：让 bannerDestination 主动撤销自己的 presentable。
-/// `_revokeAllPresentablesWithRequesterIdentifier:reason:options:` 只需要一个 requester 标识符，
-/// 从对象自己读（getter 优先，其次 ivar）；**读不到就不调** —— 绝不拿字符串瞎猜。
-static BOOL POExternalRevokeBannerPresentables(id hub, NSString *role) {
-    if (!POExternalHubResponds(hub, @"_revokeAllPresentablesWithRequesterIdentifier:reason:options:")) {
+/// ★【0.7.12 主路】`_dismissTimer` 是 **GCD 计时器（OS_dispatch_source）**，不是 NSTimer
+///（log72 横幅宿主结构 + `dismissTimer 不是计时器（OS_dispatch_source）` 双实证）。
+/// GCD 计时器没有 "fire"，但有公开 API `dispatch_source_set_timer` 可以把触发时间改到「现在」，
+/// 让系统自己的「5 秒超时收起」处理器立刻执行 —— 依旧只影响当前这条横幅。
+static BOOL POExternalArmDispatchDismissTimer(id hub, NSString *role) {
+    if (!hub) {
         return NO;
     }
-    NSString *requester = nil;
-    id value = POExternalReadObject(hub, NSSelectorFromString(@"requesterIdentifier"));
-    if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
-        requester = value;
-    } else {
-        requester = POExternalReadIvarString(hub, @"requester");
+    id source = nil;
+    if (POExternalHubResponds(hub, @"dismissTimer")) {
+        id value = POExternalReadObject(hub, NSSelectorFromString(@"dismissTimer"));
+        if (value) {
+            source = value;
+        }
     }
-    if (requester.length == 0) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅·%@ 读不到 requesterIdentifier（跳过撤销）",
-                                         role ?: @"?");
+    if (!source) {
+        source = POExternalReadIvarObject(hub, @"dismissTimer");
+    }
+    if (!source) {
         return NO;
     }
-    @try {
-        ((void (*)(id, SEL, id, id, id))objc_msgSend)(
-            hub,
-            NSSelectorFromString(@"_revokeAllPresentablesWithRequesterIdentifier:reason:options:"),
-            requester, @"Wisp 点通知进浮窗", @{});
-        POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ revokeAllPresentables requester=%@）",
-                                         role ?: @"?", requester);
-        return YES;
-    } @catch (NSException *exception) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅 revoke 抛异常（%@）", exception.reason ?: @"?");
+    Class sourceClass = object_getClass(source);
+    NSString *sourceClassName = sourceClass ? NSStringFromClass(sourceClass) : @"";
+    if ([sourceClassName rangeOfString:@"dispatch_source"].location == NSNotFound &&
+        [sourceClassName rangeOfString:@"DispatchSource"].location == NSNotFound) {
+        return NO;
     }
-    return NO;
+    // start = 现在；interval 拉到 146 年（无论 0 是否表示不重复，都不可能再跑一次）；leeway = 0。
+    dispatch_source_set_timer((dispatch_source_t)source, DISPATCH_TIME_NOW, (1ull << 62), 0);
+    POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ 重设 dismissTimer 立即触发，%@）",
+                                     role ?: @"?", sourceClassName);
+    return YES;
 }
 
 /// 横幅宿主的 ivar 结构（每类每会话一行）：ivar 名 + 当前值的类名。
@@ -1601,12 +1601,13 @@ static BOOL POExternalDismissBannersOnHub(id hub, NSString *role) {
     if (!hub) {
         return NO;
     }
-    // ① 首选：把「自动收起计时器」提前触发 —— 就是用户看到的那 5 秒。
-    if (POExternalFireBannerDismissTimer(hub, role)) {
+    // ① 首选（0.7.12）：把 GCD 计时器 `_dismissTimer` 的触发时间改到「现在」——
+    //    log72 实证它是 OS_dispatch_source 而非 NSTimer，"fire NSTimer" 那条路走不通。
+    if (POExternalArmDispatchDismissTimer(hub, role)) {
         return YES;
     }
-    // ② 次选：让宿主撤销自己的 presentable（能读到自己 requesterIdentifier 才调）。
-    if (POExternalRevokeBannerPresentables(hub, role)) {
+    // ② 次选：真 NSTimer 的旧路（其他系统版本上 dismissTimer 可能仍是 NSTimer）。
+    if (POExternalFireBannerDismissTimer(hub, role)) {
         return YES;
     }
 
@@ -1728,6 +1729,23 @@ static void POExternalDismissDeliveredNotification(NSString *bundleId, NSString 
                 if (!POExternalHubListContains(hubs, destination)) {
                     [hubs addObject:@{ @"hub": destination,
                                        @"role": NSStringFromClass(object_getClass(destination)) ?: @"destination" }];
+                }
+                // ★【0.7.12】横幅宿主的 delegate（NCNotificationAlertQueue）与正在展示的 presentable
+                //   也进 hub 清单：收起逻辑可能挂在这两个对象上，至少先拿到它们的能力地图。
+                NSString *destinationClass = NSStringFromClass(object_getClass(destination)) ?: @"";
+                if ([destinationClass rangeOfString:@"Banner"].location != NSNotFound) {
+                    id bannerDelegate = POExternalReadIvarObject(destination, @"_delegate");
+                    if (bannerDelegate && !POExternalHubListContains(hubs, bannerDelegate)) {
+                        [hubs addObject:@{ @"hub": bannerDelegate,
+                                           @"role": [NSString stringWithFormat:@"%@(delegate)",
+                                                     NSStringFromClass(object_getClass(bannerDelegate)) ?: @"delegate"] }];
+                    }
+                    id presented = POExternalReadIvarObject(destination, @"_presentedPresentable");
+                    if (presented && !POExternalHubListContains(hubs, presented)) {
+                        [hubs addObject:@{ @"hub": presented,
+                                           @"role": [NSString stringWithFormat:@"%@(presented)",
+                                                     NSStringFromClass(object_getClass(presented)) ?: @"presentable"] }];
+                    }
                 }
             }
         }
@@ -1903,6 +1921,8 @@ static void POExternalScheduleDismissDeliveredNotification(NSString *bundleId, N
               "（0.7.10 只在 dispatcher 上找列表，而 iOS 17 的请求存在 destination 里 ⇒ 三次全落空）");
         MFLog(@"[notify] 0.7.11 已启用：横幅改成「提前触发它自己的自动收起计时器」（dismissTimer fire）"
               "｜0.7.10 走 dismissAllBanners*，而 SBNotificationBannerDestination 上根本没这个方法 ⇒ 横幅只能等 5 秒走完");
+        MFLog(@"[notify] 0.7.12 已启用：_dismissTimer 实为 GCD 计时器（OS_dispatch_source，非 NSTimer）"
+              "⇒ 用 dispatch_source_set_timer 把触发时间改到「现在」，让系统自己的超时收起立刻执行");
         MFLog(@"[notify] 0.7.9 已启用：点通知恢复（UUID 提取移出主链路 + 全链路异常闸）"
               "｜0.7.8 在打日志阶段就取 UUID，取异常抛出去把整条 open 请求打死 ⇒ 点了没反应、全屏也不开");
     });
