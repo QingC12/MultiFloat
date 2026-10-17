@@ -1432,8 +1432,8 @@ static BOOL POExternalFireBannerDismissTimer(id hub, NSString *role) {
     Class timerClass = object_getClass(timer);
     NSString *timerClassName = timerClass ? NSStringFromClass(timerClass) : @"?";
     if (![timer respondsToSelector:@selector(fire)]) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 不是计时器（%@）", timerClassName);
-        return NO;
+        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 不是计时器（%@，改扫 ivar）", timerClassName);
+        return POExternalFireIvarDismissTimer(hub, role);
     }
     BOOL valid = YES;
     if ([timer respondsToSelector:@selector(isValid)]) {
