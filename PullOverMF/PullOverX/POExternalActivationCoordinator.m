@@ -1358,6 +1358,63 @@ static NSString *POExternalInvokeNotificationWithdraw(id hub, id request) {
     return nil;
 }
 
+/// 兜底：`dismissTimer` 取不到时，在宿主自己的 ivar 里找「名字含 dismiss/timeout 的 NSTimer」并 fire。
+/// 只扫浅层 ivar（值必须是 NSTimer 且 isValid），不会碰 UI 层级，风险面很小。
+static BOOL POExternalFireIvarDismissTimer(id hub, NSString *role) {
+    if (!hub) {
+        return NO;
+    }
+    Class current = object_getClass(hub);
+    NSInteger level = 0;
+    while (current && current != [NSObject class] && level < 6) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(current, &count);
+        BOOL fired = NO;
+        for (unsigned int index = 0; index < count && !fired; index++) {
+            const char *name = ivar_getName(ivars[index]);
+            const char *encoding = ivar_getTypeEncoding(ivars[index]);
+            if (!name || !encoding || encoding[0] != '@') {
+                continue;
+            }
+            NSString *ivarName = [[NSString stringWithUTF8String:name] lowercaseString];
+            if (!ivarName) {
+                continue;
+            }
+            if ([ivarName rangeOfString:@"dismiss"].location == NSNotFound &&
+                [ivarName rangeOfString:@"timeout"].location == NSNotFound) {
+                continue;
+            }
+            id value = nil;
+            @try {
+                value = object_getIvar(hub, ivars[index]);
+            } @catch (__unused NSException *exception) {
+                value = nil;
+            }
+            if (![value isKindOfClass:[NSTimer class]] || ![value isValid]) {
+                continue;
+            }
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(value, @selector(fire));
+                POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ fire ivar %s）",
+                                                 role ?: @"?", name);
+                fired = YES;
+            } @catch (NSException *exception) {
+                POExternalNotificationDismissLog(@"清除通知：收横幅 ivar %s fire 抛异常（%@）",
+                                                 name, exception.reason ?: @"?");
+            }
+        }
+        if (ivars) {
+            free(ivars);
+        }
+        if (fired) {
+            return YES;
+        }
+        current = class_getSuperclass(current);
+        level += 1;
+    }
+    return NO;
+}
+
 /// 横幅自动收起靠 bannerDestination 内部的一个 NSTimer（默认 5 秒）。
 /// 手动 `fire` 一次 = 立刻把这次「超时收起」走完 —— 最精确，且只影响当前正在显示的那条。
 /// 依据（log71 能力地图）：`SBNotificationBannerDestination` 上有 `dismissTimer`(getter) 与
@@ -1368,9 +1425,9 @@ static BOOL POExternalFireBannerDismissTimer(id hub, NSString *role) {
     }
     id timer = POExternalReadObject(hub, NSSelectorFromString(@"dismissTimer"));
     if (!timer) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅·%@ 的 dismissTimer=(无，横幅可能已结束)",
+        POExternalNotificationDismissLog(@"清除通知：收横幅·%@ 的 dismissTimer=(无，改扫 ivar)",
                                          role ?: @"?");
-        return NO;
+        return POExternalFireIvarDismissTimer(hub, role);
     }
     Class timerClass = object_getClass(timer);
     NSString *timerClassName = timerClass ? NSStringFromClass(timerClass) : @"?";
@@ -1383,8 +1440,8 @@ static BOOL POExternalFireBannerDismissTimer(id hub, NSString *role) {
         valid = ((BOOL (*)(id, SEL))objc_msgSend)(timer, @selector(isValid));
     }
     if (!valid) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 已失效（%@）", role ?: @"?");
-        return NO;
+        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 已失效（%@，改扫 ivar）", role ?: @"?");
+        return POExternalFireIvarDismissTimer(hub, role);
     }
     @try {
         ((void (*)(id, SEL))objc_msgSend)(timer, @selector(fire));
