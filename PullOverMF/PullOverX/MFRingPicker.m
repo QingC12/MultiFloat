@@ -494,6 +494,10 @@
 //   排序条改长按拖拽（◀ ▶ 逐格点击已删）。
 #define MF_RING_EDITOR_ORDER_INDEX   991016   // 排序条格子左上角序号
 #define MF_RING_EDITOR_ROW_CHEVRON   991017   // 一级菜单行右侧箭头（布局时定位）
+// 【0.7.5 用户指令】「点通知进悬浮窗」二级页（总开关 / 适用范围 / 应用名单）
+#define MF_RING_NOTIFY_MARK          991018   // 名单行右侧勾选圈
+#define MF_RING_NOTIFY_ROW_H         50.0     // 名单每行高
+#define MF_RING_NOTIFY_ROW_GAP       8.0      // 名单行间距
 #define MF_RING_ORDER_CELL_W 76.0             // 排序条格子宽
 #define MF_RING_ORDER_CELL_H 102.0            // 排序条格子高
 #define MF_RING_ORDER_CELL_GAP 6.0            // 格子间距
@@ -1688,6 +1692,22 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 @property (nonatomic, strong) UIButton *editorRowApps;             // 一级行：应用管理
 @property (nonatomic, strong) UIButton *editorRowTrigger;          // 一级行：触发条
 @property (nonatomic, strong) UIButton *editorRowOther;            // 一级行：其他选项
+// 【0.7.5 用户指令】「点通知进悬浮窗」独立成一级行 + 二级页（总开关 / 全部应用 或 仅选中的应用）
+@property (nonatomic, strong) UIButton *editorRowNotify;           // 一级行：点通知进悬浮窗
+@property (nonatomic, strong) UIView *editorNotifyBox;             // 二级「点通知进悬浮窗」页容器
+@property (nonatomic, weak) UIView *editorVisiblePage;             // 当前可见的二级页（nil = 一级菜单）
+@property (nonatomic, strong) UIButton *editorNotifyBackButton;    // 通知页返回按钮
+@property (nonatomic, strong) UILabel *editorNotifyTitleLabel;     // 通知页标题
+@property (nonatomic, strong) UIView *editorNotifySwitchBox;       // 总开关行底板
+@property (nonatomic, strong) UILabel *editorNotifySwitchLabel;    // 总开关行文字
+@property (nonatomic, strong) UISwitch *editorNotifySwitch;        // 总开关
+@property (nonatomic, strong) UILabel *editorNotifyScopeLabel;     // 「适用范围」小标题
+@property (nonatomic, strong) UIButton *editorNotifyAllButton;     // 范围：全部应用
+@property (nonatomic, strong) UIButton *editorNotifyPickButton;    // 范围：仅选中的应用
+@property (nonatomic, strong) UILabel *editorNotifyHintLabel;      // 状态提示
+@property (nonatomic, strong) UIScrollView *editorNotifyScroll;    // 应用名单滚动容器
+@property (nonatomic, strong) NSMutableArray<UIButton *> *editorNotifyRows;          // 名单行
+@property (nonatomic, strong) NSMutableOrderedSet<NSString *> *editorNotifySelected; // 勾选的 bundleID
 @property (nonatomic, strong) UIButton *editorBackButton;          // 二级页返回按钮
 @property (nonatomic, strong) UIButton *editorTabAddedButton;      // 分段按钮：已添加
 @property (nonatomic, strong) UIButton *editorTabAllButton;        // 分段按钮：未添加
@@ -1797,6 +1817,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)onEditorOtherSwitchChanged:(UISwitch *)switchView;
 - (void)onEditorRadiusSliderChanged:(UISlider *)slider;
 - (void)onEditorOrderStripTap:(UITapGestureRecognizer *)tap;
+// 【0.7.5 用户指令】点通知进悬浮窗：独立一级行 + 二级页（总开关 / 全部应用 或 仅选中的应用）
+- (void)showEditorPage:(UIView *)page animated:(BOOL)animated;
+- (void)onEditorRowNotifyTapped:(UIButton *)sender;
+- (void)buildEditorNotifyPageInPanel:(UIView *)panel width:(CGFloat)width height:(CGFloat)height;
+- (void)layoutEditorNotifyPage;
+- (void)refreshEditorNotifyVisuals;
+- (void)onEditorNotifySwitchChanged:(UISwitch *)switchView;
+- (void)onEditorNotifyScopeTapped:(UIButton *)sender;
+- (void)onEditorNotifyAppTapped:(UIButton *)sender;
 - (void)relayoutEditorGridAnimated:(BOOL)animated;
 - (void)rebuildEditorRingPreview;
 // 【0.6.14 用户 log54-①】录屏状态提示（图标红点徽章 + 开/关提示条）
@@ -2617,7 +2646,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.7.4 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.7.5 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -3196,6 +3225,13 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     }
     self.editorApps = apps;
 
+    static BOOL mfLoggedEditorNotifyPage = NO;
+    if (!mfLoggedEditorNotifyPage) {
+        mfLoggedEditorNotifyPage = YES;
+        MFLog(@"[ring] 0.7.5 已启用：点通知进悬浮窗 = 独立一级行 + 二级页"
+              "（总开关 / 全部应用 或 仅选中的应用 / 应用勾选名单）");
+    }
+
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, height)];
     panel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.87];
     panel.opaque = NO;
@@ -3249,6 +3285,14 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [menuBox addSubview:rowOther];
     self.editorRowOther = rowOther;
 
+    // 【0.7.5 用户指令】点通知进悬浮窗独立成一级行（二级页里选哪些应用）
+    UIButton *rowNotify = [self makeEditorMenuRowWithTitle:@"点通知进悬浮窗"
+                                                  subtitle:@"开关 · 选择哪些应用"];
+    [rowNotify addTarget:self action:@selector(onEditorRowNotifyTapped:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [menuBox addSubview:rowNotify];
+    self.editorRowNotify = rowNotify;
+
     // 【0.6.8】触发条自调区：折叠容器改挂一级菜单盒（0.6.10 行号由 layoutEditorMenuAnimated 统一排）
     const CGFloat rowHeight = 32.0;
     const CGFloat settingsRows = 3.0;
@@ -3262,7 +3306,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorSettingsExpanded = NO;
 
     // 【0.6.10】其他选项折叠容器（默认收起）：双指呼出开关 / 圆盘大小滑杆 / 图标抓取开关
-    const CGFloat otherBoxHeight = 4.0 * 44.0 + 12.0;   // 【0.7.4】3 → 4 行（新增「点通知进悬浮窗」开关）
+    const CGFloat otherBoxHeight = 3.0 * 44.0 + 12.0;   // 【0.7.5】点通知开关独立成一级行 ⇒ 回到 3 行
     UIView *otherBox = [[UIView alloc] initWithFrame:CGRectMake(12.0, 0.0, width - 24.0, otherBoxHeight)];
     otherBox.hidden = YES;
     otherBox.userInteractionEnabled = YES;
@@ -3271,9 +3315,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [menuBox addSubview:otherBox];
     self.otherSettingsBox = otherBox;
 
-    // 【0.7.4·P2】第 3 项 = 点通知进悬浮窗（默认开）
-    NSArray<NSString *> *switchTitles = @[ @"双指贴边呼出（全屏 App 内必中）", @"抓取真实应用图标", @"点通知进悬浮窗" ];
-    NSArray<NSString *> *switchKeys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons", @"mfNotificationClickFloat" ];
+    // 【0.7.5 用户指令】「点通知进悬浮窗」已独立成一级菜单行 ⇒ 这里回到 2 项
+    NSArray<NSString *> *switchTitles = @[ @"双指贴边呼出（全屏 App 内必中）", @"抓取真实应用图标" ];
+    NSArray<NSString *> *switchKeys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons" ];
     for (NSUInteger index = 0; index < switchTitles.count; index++) {
         CGFloat rowY = (CGFloat)index * 44.0 + 6.0;
         UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(16.0, rowY, otherBox.bounds.size.width - 96.0, 32.0)];
@@ -3290,7 +3334,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
          forControlEvents:UIControlEventValueChanged];
         [otherBox addSubview:toggle];
     }
-    CGFloat radiusRowY = 3.0 * 44.0 + 6.0;   // 【0.7.4】前面多了 1 行开关
+    CGFloat radiusRowY = 2.0 * 44.0 + 6.0;   // 【0.7.5】前面 2 行开关
     UILabel *radiusName = [[UILabel alloc] initWithFrame:CGRectMake(16.0, radiusRowY, 96.0, 32.0)];
     radiusName.text = @"圆盘大小";
     radiusName.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
@@ -3313,6 +3357,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [otherBox addSubview:radiusValue];
     self.editorRadiusValueLabel = radiusValue;
     self.editorOtherExpanded = NO;
+
+    // ---- 二级页「点通知进悬浮窗」容器【0.7.5】----
+    [self buildEditorNotifyPageInPanel:panel width:width height:height];
 
     // ---- 二级页「应用管理」容器 ----
     UIView *appsBox = [[UIView alloc] initWithFrame:CGRectMake(0.0, 92.0, width, height - 92.0)];
@@ -3477,7 +3524,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.7.4 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.7.5 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -4142,7 +4189,270 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     return row;
 }
 
-/// 一级菜单统一布局：三行 + 两个可展开区（触发条 / 其他选项），展开的行下方内容整体下移。
+#pragma mark - 【0.7.5】二级页「点通知进悬浮窗」
+
+/// 二级页构建：总开关 / 适用范围（全部应用 · 仅选中的应用）/ 应用名单（勾选）。
+/// 名单数据源 = 编辑器已经枚举好的 `self.editorApps`（**不再二次枚举**，避免再碰 SB 私有数据）；
+/// 系统动作伪 bundleID（mfsys.*）不会有系统通知，直接排除。
+- (void)buildEditorNotifyPageInPanel:(UIView *)panel width:(CGFloat)width height:(CGFloat)height {
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0.0, 92.0, width, height - 92.0)];
+    box.hidden = YES;
+    box.userInteractionEnabled = YES;
+    [panel addSubview:box];
+    self.editorNotifyBox = box;
+
+    UIButton *back = [UIButton buttonWithType:UIButtonTypeCustom];
+    back.frame = CGRectMake(12.0, 6.0, 96.0, 36.0);
+    back.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+    back.layer.cornerRadius = 18.0;
+    back.titleLabel.font = [UIFont boldSystemFontOfSize:14.0];
+    back.contentEdgeInsets = UIEdgeInsetsMake(0.0, 10.0, 0.0, 0.0);
+    back.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [back setTitle:@"‹ 返回" forState:UIControlStateNormal];
+    [back setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [back addTarget:self action:@selector(onEditorBackTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [box addSubview:back];
+    self.editorNotifyBackButton = back;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
+    title.text = @"点通知进悬浮窗";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont boldSystemFontOfSize:15.0];
+    title.textAlignment = NSTextAlignmentRight;
+    [box addSubview:title];
+    self.editorNotifyTitleLabel = title;
+
+    UIView *switchBox = [[UIView alloc] initWithFrame:CGRectZero];
+    switchBox.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+    switchBox.layer.cornerRadius = 14.0;
+    switchBox.userInteractionEnabled = YES;
+    [box addSubview:switchBox];
+    self.editorNotifySwitchBox = switchBox;
+
+    UILabel *switchLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    switchLabel.text = @"点通知进悬浮窗";
+    switchLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+    switchLabel.font = [UIFont systemFontOfSize:13.5];
+    [switchBox addSubview:switchLabel];
+    self.editorNotifySwitchLabel = switchLabel;
+
+    UISwitch *toggle = [[UISwitch alloc] initWithFrame:CGRectZero];
+    toggle.on = MFRingBool(@"mfNotificationClickFloat", YES);
+    toggle.onTintColor = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+    [toggle addTarget:self action:@selector(onEditorNotifySwitchChanged:)
+     forControlEvents:UIControlEventValueChanged];
+    [switchBox addSubview:toggle];
+    self.editorNotifySwitch = toggle;
+
+    UILabel *scopeLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    scopeLabel.text = @"适用范围";
+    scopeLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
+    scopeLabel.font = [UIFont systemFontOfSize:11.5];
+    [box addSubview:scopeLabel];
+    self.editorNotifyScopeLabel = scopeLabel;
+
+    UIButton *allButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    allButton.layer.cornerRadius = 16.0;
+    allButton.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    [allButton setTitle:@"全部应用" forState:UIControlStateNormal];
+    [allButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [allButton addTarget:self action:@selector(onEditorNotifyScopeTapped:)
+        forControlEvents:UIControlEventTouchUpInside];
+    [box addSubview:allButton];
+    self.editorNotifyAllButton = allButton;
+
+    UIButton *pickButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    pickButton.layer.cornerRadius = 16.0;
+    pickButton.titleLabel.font = [UIFont boldSystemFontOfSize:13.0];
+    [pickButton setTitle:@"仅选中的应用" forState:UIControlStateNormal];
+    [pickButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [pickButton addTarget:self action:@selector(onEditorNotifyScopeTapped:)
+         forControlEvents:UIControlEventTouchUpInside];
+    [box addSubview:pickButton];
+    self.editorNotifyPickButton = pickButton;
+
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectZero];
+    hint.textColor = [UIColor colorWithWhite:1.0 alpha:0.62];
+    hint.font = [UIFont systemFontOfSize:11.0];
+    hint.numberOfLines = 2;
+    [box addSubview:hint];
+    self.editorNotifyHintLabel = hint;
+
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    scroll.showsVerticalScrollIndicator = YES;
+    scroll.alwaysBounceVertical = YES;
+    [box addSubview:scroll];
+    self.editorNotifyScroll = scroll;
+
+    NSMutableOrderedSet<NSString *> *selected = [NSMutableOrderedSet orderedSet];
+    id stored = [MFRingDefaults() objectForKey:@"mfNotificationClickFloatApps"];
+    if ([stored isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)stored) {
+            if ([item isKindOfClass:[NSString class]] && [(NSString *)item length] > 0) {
+                [selected addObject:item];
+            }
+        }
+    }
+    self.editorNotifySelected = selected;
+
+    NSMutableArray<UIButton *> *rows = [NSMutableArray array];
+    for (NSDictionary<NSString *, NSString *> *app in self.editorApps) {
+        NSString *bundleId = app[@"id"];
+        if (bundleId.length == 0 || [bundleId hasPrefix:@"mfsys."]) {
+            continue;
+        }
+        NSString *name = (app[@"name"].length > 0) ? app[@"name"] : bundleId;
+        UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
+        row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
+        row.layer.cornerRadius = 12.0;
+        row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        row.contentEdgeInsets = UIEdgeInsetsMake(0.0, 14.0, 0.0, 46.0);
+        row.accessibilityIdentifier = bundleId;
+        [row setTitle:name forState:UIControlStateNormal];
+        [row setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.92] forState:UIControlStateNormal];
+        row.titleLabel.font = [UIFont systemFontOfSize:13.5];
+        row.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [row addTarget:self action:@selector(onEditorNotifyAppTapped:)
+      forControlEvents:UIControlEventTouchUpInside];
+
+        UILabel *mark = [[UILabel alloc] initWithFrame:CGRectZero];
+        mark.tag = MF_RING_NOTIFY_MARK;
+        mark.text = @"";
+        mark.textAlignment = NSTextAlignmentCenter;
+        mark.textColor = [UIColor whiteColor];
+        mark.font = [UIFont boldSystemFontOfSize:13.0];
+        mark.layer.cornerRadius = 11.0;
+        mark.layer.borderWidth = 1.5;
+        mark.userInteractionEnabled = NO;
+        [row addSubview:mark];
+
+        [scroll addSubview:row];
+        [rows addObject:row];
+    }
+    self.editorNotifyRows = rows;
+    MFLog(@"[ring] 点通知进悬浮窗：名单可选项 %lu 个，已勾选 %lu 个",
+          (unsigned long)rows.count, (unsigned long)self.editorNotifySelected.count);
+}
+
+- (void)layoutEditorNotifyPage {
+    UIView *box = self.editorNotifyBox;
+    if (box == nil) {
+        return;
+    }
+    CGFloat w = CGRectGetWidth(box.bounds);
+    CGFloat h = CGRectGetHeight(box.bounds);
+    if (w <= 0.0 || h <= 0.0) {
+        return;
+    }
+    self.editorNotifyBackButton.frame = CGRectMake(12.0, 6.0, 96.0, 36.0);
+    self.editorNotifyTitleLabel.frame = CGRectMake(120.0, 6.0, MAX(60.0, w - 132.0), 36.0);
+
+    self.editorNotifySwitchBox.frame = CGRectMake(12.0, 52.0, w - 24.0, 52.0);
+    self.editorNotifySwitchLabel.frame = CGRectMake(14.0, 0.0, w - 116.0, 52.0);
+    self.editorNotifySwitch.frame = CGRectMake(w - 24.0 - 14.0 - 51.0, 10.5, 51.0, 31.0);
+
+    self.editorNotifyScopeLabel.frame = CGRectMake(18.0, 112.0, w - 36.0, 18.0);
+    CGFloat segmentW = (w - 24.0 - 8.0) / 2.0;
+    self.editorNotifyAllButton.frame = CGRectMake(12.0, 134.0, segmentW, 36.0);
+    self.editorNotifyPickButton.frame = CGRectMake(12.0 + segmentW + 8.0, 134.0, segmentW, 36.0);
+
+    self.editorNotifyHintLabel.frame = CGRectMake(18.0, 178.0, w - 36.0, 32.0);
+
+    CGFloat listTop = 216.0;
+    self.editorNotifyScroll.frame = CGRectMake(0.0, listTop, w, MAX(120.0, h - listTop));
+    CGFloat rowW = w - 24.0;
+    CGFloat y = 0.0;
+    for (UIButton *row in self.editorNotifyRows) {
+        row.frame = CGRectMake(12.0, y, rowW, MF_RING_NOTIFY_ROW_H);
+        UILabel *mark = (UILabel *)[row viewWithTag:MF_RING_NOTIFY_MARK];
+        mark.frame = CGRectMake(rowW - 34.0, (MF_RING_NOTIFY_ROW_H - 22.0) / 2.0, 22.0, 22.0);
+        y += MF_RING_NOTIFY_ROW_H + MF_RING_NOTIFY_ROW_GAP;
+    }
+    self.editorNotifyScroll.contentSize = CGSizeMake(w, MAX(0.0, y));
+}
+
+/// 刷新整页状态：段控高亮、提示文案、名单行勾选圈与可点状态。
+- (void)refreshEditorNotifyVisuals {
+    BOOL on = MFRingBool(@"mfNotificationClickFloat", YES);
+    NSInteger scope = (NSInteger)MFRingNumber(@"mfNotificationClickFloatScope", 0.0);
+    BOOL pickMode = (scope == 1);
+    UIColor *active = [UIColor colorWithRed:0.0 green:0.48 blue:1.0 alpha:1.0];
+    UIColor *idle = [UIColor colorWithWhite:1.0 alpha:0.12];
+
+    self.editorNotifySwitch.on = on;
+    self.editorNotifyAllButton.backgroundColor = pickMode ? idle : active;
+    self.editorNotifyPickButton.backgroundColor = pickMode ? active : idle;
+    self.editorNotifyAllButton.alpha = on ? 1.0 : 0.4;
+    self.editorNotifyPickButton.alpha = on ? 1.0 : 0.4;
+
+    NSUInteger selectedCount = self.editorNotifySelected.count;
+    if (!on) {
+        self.editorNotifyHintLabel.text = @"已关闭：点通知仍按系统原生方式全屏打开。";
+    } else if (!pickMode) {
+        self.editorNotifyHintLabel.text = @"全部应用：任何 App 的通知点开都进悬浮窗。";
+    } else if (selectedCount == 0) {
+        self.editorNotifyHintLabel.text = @"名单为空 ⇒ 不做限制（等同全部应用）。下面勾选要进悬浮窗的 App。";
+    } else {
+        self.editorNotifyHintLabel.text =
+            [NSString stringWithFormat:@"仅这 %lu 个应用的通知进悬浮窗，其余照原生全屏。",
+             (unsigned long)selectedCount];
+    }
+
+    BOOL editable = (on && pickMode);
+    for (UIButton *row in self.editorNotifyRows) {
+        NSString *bundleId = row.accessibilityIdentifier;
+        BOOL picked = (bundleId.length > 0) && [self.editorNotifySelected containsObject:bundleId];
+        UILabel *mark = (UILabel *)[row viewWithTag:MF_RING_NOTIFY_MARK];
+        mark.text = picked ? @"✓" : @"";
+        mark.backgroundColor = picked ? active : [UIColor clearColor];
+        mark.layer.borderColor = (picked ? active : [UIColor colorWithWhite:1.0 alpha:0.28]).CGColor;
+        row.alpha = editable ? 1.0 : 0.45;
+        row.userInteractionEnabled = editable;
+    }
+}
+
+- (void)onEditorNotifySwitchChanged:(UISwitch *)switchView {
+    [MFRingDefaults() setObject:@(switchView.on) forKey:@"mfNotificationClickFloat"];
+    [MFRingDefaults() synchronize];
+    [self refreshEditorNotifyVisuals];
+    MFLog(@"[ring] 点通知进悬浮窗 -> %@（下一次点通知就生效）", switchView.on ? @"开" : @"关");
+}
+
+- (void)onEditorNotifyScopeTapped:(UIButton *)sender {
+    if (self.editorNotifySwitch == nil || !self.editorNotifySwitch.on) {
+        return;
+    }
+    NSInteger scope = (sender == self.editorNotifyPickButton) ? 1 : 0;
+    [MFRingDefaults() setObject:@(scope) forKey:@"mfNotificationClickFloatScope"];
+    [MFRingDefaults() synchronize];
+    [self refreshEditorNotifyVisuals];
+    MFLog(@"[ring] 点通知进悬浮窗：适用范围 -> %@（已勾选 %lu 个，下一次点通知就生效）",
+          (scope == 1) ? @"仅选中的应用" : @"全部应用",
+          (unsigned long)self.editorNotifySelected.count);
+}
+
+- (void)onEditorNotifyAppTapped:(UIButton *)sender {
+    NSString *bundleId = sender.accessibilityIdentifier;
+    if (bundleId.length == 0) {
+        return;
+    }
+    BOOL nowSelected = ![self.editorNotifySelected containsObject:bundleId];
+    if (nowSelected) {
+        [self.editorNotifySelected addObject:bundleId];
+    } else {
+        [self.editorNotifySelected removeObject:bundleId];
+    }
+    [MFRingDefaults() setObject:[self.editorNotifySelected.array copy]
+                         forKey:@"mfNotificationClickFloatApps"];
+    [MFRingDefaults() synchronize];
+    [self refreshEditorNotifyVisuals];
+    MFLog(@"[ring] 通知名单：%@ %@（共 %lu 个）",
+          nowSelected ? @"+" : @"-",
+          bundleId,
+          (unsigned long)self.editorNotifySelected.count);
+}
+
+/// 一级菜单统一布局：四行 + 两个可展开区（触发条 / 其他选项），展开的行下方内容整体下移。
 - (void)layoutEditorMenuAnimated:(BOOL)animated {
     UIView *box = self.editorMenuBox;
     if (box == nil) {
@@ -4175,6 +4485,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
             self.otherSettingsBox.frame = CGRectMake(12.0, y, rowW, CGRectGetHeight(self.otherSettingsBox.frame));
             y += CGRectGetHeight(self.otherSettingsBox.frame) + 10.0;
         }
+        // 【0.7.5】第 4 行：点通知进悬浮窗（独立一级行，点进二级页）
+        self.editorRowNotify.frame = CGRectMake(12.0, y, rowW, 64.0);
+        [(UILabel *)[self.editorRowNotify viewWithTag:MF_RING_EDITOR_ROW_CHEVRON]
+            setFrame:CGRectMake(rowW - 40.0, 0.0, 26.0, 64.0)];
+        y += 72.0;
     };
     if (animated) {
         [UIView animateWithDuration:0.26
@@ -4248,49 +4563,112 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorOrderCellsAnimated:NO];
 }
 
-/// 一级 ↔ 二级 页面切换（淡入淡出 + 轻位移）。
-- (void)showEditorLevel2:(BOOL)level2 {
-    if (self.editorLevel2Visible == level2 || self.editorMenuBox == nil || self.editorAppsBox == nil) {
+/// 一级 ↔ 二级 通用切换（page = nil ⇒ 回一级菜单；淡入淡出 + 轻位移）。
+/// 二级页现在有两个：`editorAppsBox`（应用管理）与 `editorNotifyBox`（点通知进悬浮窗）；
+/// 两个容器都常驻，只用 hidden + 透明度切换 —— 切页不重建任何内容，回退不丢勾选。
+- (void)showEditorPage:(UIView *)page animated:(BOOL)animated {
+    UIView *menu = self.editorMenuBox;
+    if (menu == nil) {
         return;
     }
-    self.editorLevel2Visible = level2;
-    if (level2) {
+    UIView *target = (page != nil) ? page : menu;
+    if (self.editorVisiblePage == target) {
+        return;
+    }
+    self.editorVisiblePage = (page != nil) ? page : nil;
+    self.editorLevel2Visible = (page != nil);
+
+    NSMutableArray<UIView *> *pages = [NSMutableArray arrayWithObject:menu];
+    if (self.editorAppsBox != nil) {
+        [pages addObject:self.editorAppsBox];
+    }
+    if (self.editorNotifyBox != nil) {
+        [pages addObject:self.editorNotifyBox];
+    }
+    // hidden 切换本身没有过渡 ⇒ 先「上膛」再折 alpha。
+    // ★ 本来是隐藏的页必须**当场置 alpha 0**：否则它会从 1.0 淡出，切页瞬间闪一下上一页的内容。
+    NSMutableSet<UIView *> *wasVisible = [NSMutableSet set];
+    for (UIView *view in pages) {
+        if (view.hidden == NO && view.alpha > 0.01) {
+            [wasVisible addObject:view];
+        }
+    }
+    for (UIView *view in pages) {
+        view.hidden = NO;
+        if (view != target && ![wasVisible containsObject:view]) {
+            view.alpha = 0.0;
+            view.transform = CGAffineTransformMakeTranslation((page != nil) ? -24.0 : 0.0, 0.0);
+        }
+    }
+    if (page == self.editorAppsBox) {
         self.editorTabAdded = YES;   // 每次进二级页都落在「已添加」（排序是高频操作）
         [self layoutEditorAppsAnimated:NO];
         [self relayoutEditorGridAnimated:NO];
         [self rebuildEditorRingPreview];
+    } else if (page == self.editorNotifyBox) {
+        [self layoutEditorNotifyPage];
+        [self refreshEditorNotifyVisuals];
     }
-    self.editorMenuBox.hidden = NO;
-    self.editorAppsBox.hidden = NO;
-    self.editorMenuBox.transform = CGAffineTransformIdentity;
-    self.editorAppsBox.transform = CGAffineTransformMakeTranslation(level2 ? -24.0 : 0.0, 0.0);
-    self.editorAppsBox.alpha = level2 ? 0.0 : 1.0;
-    [UIView animateWithDuration:0.24
-                          delay:0.0
-                        options:(UIViewAnimationOptionCurveEaseOut |
-                                 UIViewAnimationOptionBeginFromCurrentState)
-                     animations:^{
-        self.editorMenuBox.alpha = level2 ? 0.0 : 1.0;
-        self.editorMenuBox.transform = CGAffineTransformMakeTranslation(level2 ? -24.0 : 0.0, 0.0);
-        self.editorAppsBox.alpha = level2 ? 1.0 : 0.0;
-        self.editorAppsBox.transform = CGAffineTransformIdentity;
-    } completion:^(__unused BOOL finished) {
-        self.editorMenuBox.hidden = level2;
-        self.editorAppsBox.hidden = !level2;
-        self.editorMenuBox.transform = CGAffineTransformIdentity;
-        self.editorAppsBox.transform = CGAffineTransformIdentity;
-    }];
-    MFLog(@"[ring] 编辑器切到%@", level2 ? @"二级页（应用管理）" : @"一级菜单");
+
+    CGFloat slide = (page != nil) ? -24.0 : 0.0;
+    target.alpha = 0.0;
+    target.transform = CGAffineTransformMakeTranslation(slide, 0.0);
+    void (^changes)(void) = ^{
+        for (UIView *view in pages) {
+            BOOL isTarget = (view == target);
+            view.alpha = isTarget ? 1.0 : 0.0;
+            view.transform = isTarget ? CGAffineTransformIdentity
+                                      : CGAffineTransformMakeTranslation(slide, 0.0);
+        }
+    };
+    void (^finish)(BOOL) = ^(BOOL finished) {
+        (void)finished;
+        for (UIView *view in pages) {
+            BOOL isTarget = (view == target);
+            view.hidden = !isTarget;
+            if (!isTarget) {
+                view.alpha = 1.0;   // 复位：下次进来从 1.0 起淡出
+                view.transform = CGAffineTransformIdentity;
+            }
+        }
+        target.alpha = 1.0;
+        target.transform = CGAffineTransformIdentity;
+    };
+    if (!animated) {
+        changes();
+        finish(YES);
+    } else {
+        [UIView animateWithDuration:0.24
+                              delay:0.0
+                            options:(UIViewAnimationOptionCurveEaseOut |
+                                     UIViewAnimationOptionBeginFromCurrentState)
+                         animations:changes
+                         completion:finish];
+    }
+    MFLog(@"[ring] 编辑器切到%@", (page != nil) ? @"二级页" : @"一级菜单");
+}
+
+/// 【0.6.10】兼容旧调用点：进/出「应用管理」页
+- (void)showEditorLevel2:(BOOL)level2 {
+    [self showEditorPage:(level2 ? self.editorAppsBox : nil) animated:YES];
 }
 
 - (void)onEditorRowAppsTapped:(UIButton *)sender {
     (void)sender;
-    [self showEditorLevel2:YES];
+    [self showEditorPage:self.editorAppsBox animated:YES];
+}
+
+- (void)onEditorRowNotifyTapped:(UIButton *)sender {
+    (void)sender;
+    if (self.editorNotifyBox == nil) {
+        return;
+    }
+    [self showEditorPage:self.editorNotifyBox animated:YES];
 }
 
 - (void)onEditorBackTapped:(UIButton *)sender {
     (void)sender;
-    [self showEditorLevel2:NO];
+    [self showEditorPage:nil animated:YES];
 }
 
 - (void)onEditorTabChanged:(UIButton *)sender {
@@ -4337,13 +4715,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     MFLog(@"[ring] 其他选项：%@", expand ? @"展开" : @"收起");
 }
 
-/// 其他选项开关：tag 1 = 双指贴边呼出（重启 SpringBoard 生效）；tag 2 = 抓取真实图标（下次打开生效）；
-/// tag 3 = 点通知进悬浮窗（【0.7.4·P2】下一次点通知就生效，不用 Respring）。
+/// 其他选项开关：tag 1 = 双指贴边呼出（重启 SpringBoard 生效）；tag 2 = 抓取真实图标（下次打开生效）。
+/// 【0.7.5】「点通知进悬浮窗」已独立成一级行（自己的二级页），不再走这里。
 - (void)onEditorOtherSwitchChanged:(UISwitch *)switchView {
-    NSArray<NSString *> *keys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons", @"mfNotificationClickFloat" ];
+    NSArray<NSString *> *keys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons" ];
     NSArray<NSString *> *effects = @[ @"重启 SpringBoard 后生效",
-                                      @"下次打开编辑器/呼出生效",
-                                      @"下一次点通知就生效" ];
+                                      @"下次打开编辑器/呼出生效" ];
     NSInteger index = switchView.tag - 1;
     if (index < 0 || index >= (NSInteger)keys.count) {
         return;
@@ -4676,6 +5053,21 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorRowApps = nil;
     self.editorRowTrigger = nil;
     self.editorRowOther = nil;
+    self.editorRowNotify = nil;
+    self.editorNotifyBox = nil;
+    self.editorVisiblePage = nil;
+    self.editorNotifyBackButton = nil;
+    self.editorNotifyTitleLabel = nil;
+    self.editorNotifySwitchBox = nil;
+    self.editorNotifySwitchLabel = nil;
+    self.editorNotifySwitch = nil;
+    self.editorNotifyScopeLabel = nil;
+    self.editorNotifyAllButton = nil;
+    self.editorNotifyPickButton = nil;
+    self.editorNotifyHintLabel = nil;
+    self.editorNotifyScroll = nil;
+    self.editorNotifyRows = nil;
+    self.editorNotifySelected = nil;
     self.editorBackButton = nil;
     self.editorTabAddedButton = nil;
     self.editorTabAllButton = nil;
@@ -5395,7 +5787,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.7.4 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.7.5 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);

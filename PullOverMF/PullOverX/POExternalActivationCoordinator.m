@@ -294,15 +294,71 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
 
 #pragma mark - 【0.7.4·P2】点通知 → 悬浮窗
 
-/// 开关：mfNotificationClickFloat（圆盘编辑器「其他选项」里的「点通知进悬浮窗」）
-/// 默认 **开**。直接读 NSUserDefaults（不走 +[POApplicationHelper settings] 的快照），
-/// 所以用户在编辑器里改完，**下一次点通知就生效**，不用 Respring。
+/// 读通知功能的偏好：**CFPreferences 直读**。
+/// 圆盘编辑器用的是另一个 NSUserDefaults 实例（同 suite），同进程的
+/// `+[POApplicationHelper settingsDefaults]` 缓存可能还是旧值 ⇒ 直读才保证
+/// 「编辑器里改完，下一次点通知就生效」。
+static id POExternalNotificationPref(NSString *key) {
+    if (key.length == 0) {
+        return nil;
+    }
+    id value = (__bridge_transfer id)CFPreferencesCopyAppValue((__bridge CFStringRef)key,
+                                                               CFSTR("com.mlgm.pulloverx"));
+    if (value == nil) {
+        value = [[POApplicationHelper settingsDefaults] objectForKey:key];
+    }
+    return value;
+}
+
+/// 总开关：mfNotificationClickFloat（圆盘编辑器一级行「点通知进悬浮窗」）。默认 **开**。
 static BOOL POExternalNotificationClickFloatEnabled(void) {
-    id value = [[POApplicationHelper settingsDefaults] objectForKey:@"mfNotificationClickFloat"];
+    id value = POExternalNotificationPref(@"mfNotificationClickFloat");
     if (value == nil) {
         return YES;
     }
     return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
+}
+
+/// 适用范围的判定：mfNotificationClickFloatScope = 0 全部应用（默认）/ 1 仅选中的应用。
+/// 「仅选」但名单为空 ⇒ 不过滤（否则用户刚切过去、还没勾任何 App 时会以为功能坏了）。
+static BOOL POExternalNotificationTargetAllowed(NSString *targetBundleId,
+                                                NSString * __autoreleasing *outReason) {
+    id scopeValue = POExternalNotificationPref(@"mfNotificationClickFloatScope");
+    NSInteger scope = [scopeValue respondsToSelector:@selector(integerValue)] ? [scopeValue integerValue] : 0;
+    if (scope != 1) {
+        if (outReason) {
+            *outReason = @"范围=全部应用";
+        }
+        return YES;
+    }
+    id listValue = POExternalNotificationPref(@"mfNotificationClickFloatApps");
+    NSArray *list = [listValue isKindOfClass:[NSArray class]] ? (NSArray *)listValue : nil;
+    if (list.count == 0) {
+        if (outReason) {
+            *outReason = @"范围=仅选，名单为空 ⇒ 不过滤";
+        }
+        return YES;
+    }
+    for (id item in list) {
+        NSString *bundleId = nil;
+        if ([item isKindOfClass:[NSString class]]) {
+            bundleId = (NSString *)item;
+        } else if ([item respondsToSelector:@selector(stringValue)]) {
+            bundleId = [item stringValue];
+        }
+        if (bundleId.length > 0 && [bundleId isEqualToString:targetBundleId]) {
+            if (outReason) {
+                *outReason = [NSString stringWithFormat:@"范围=仅选(%lu 个)，命中名单",
+                              (unsigned long)list.count];
+            }
+            return YES;
+        }
+    }
+    if (outReason) {
+        *outReason = [NSString stringWithFormat:@"范围=仅选(%lu 个)，不在名单内",
+                      (unsigned long)list.count];
+    }
+    return NO;
 }
 
 /// 诊断日志预算：这条路径「每次 App 启动都会过一遍」，日志又是无缓冲写盘，
@@ -423,10 +479,23 @@ static BOOL POExternalIsNotificationLaunch(id options,
     if (POExternalIsValidURL(openURL)) {
         return NO;
     }
-    // 系统自己写明了来源 ⇒ 直接信它
+    // 系统自己写明了来源 ⇒ 直接信它。
+    // ★ log66 实测：点通知的 launchOrigin 不是含 "notification" 的字符串，而是
+    //   `BulletinDestinationCoverSheet`（锁屏/通知中心）/ `BulletinDestinationBanner`（横幅）。
+    //   只查 "notification" ⇒ 永远判「非通知」，功能永远不生效 —— 这是 0.7.4 没跑起来的唯一原因。
+    //   反过来，点桌面图标时 launchOrigin 为 **空**（log66 实证），所以这张关键词表不会误伤。
     if (launchOrigin.length > 0) {
-        return [launchOrigin rangeOfString:@"notification"
-                                   options:NSCaseInsensitiveSearch].location != NSNotFound;
+        static NSArray<NSString *> *originNeedles;
+        static dispatch_once_t originOnceToken;
+        dispatch_once(&originOnceToken, ^{
+            originNeedles = @[ @"notification", @"bulletin", @"banner" ];
+        });
+        for (NSString *needle in originNeedles) {
+            if ([launchOrigin rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                return YES;
+            }
+        }
+        return NO;
     }
     // 没写来源，只能靠调用栈（取栈有开销，所以放在最后）
     NSString *frame = nil;
@@ -492,8 +561,9 @@ static NSString *POExternalOptionsSummary(NSDictionary *dictionary) {
     dispatch_once(&onceToken, ^{
         sharedInstance = [POExternalActivationCoordinator new];
         MFLog(@"[notify] 0.7.4 P2 已启用：点通知 → 悬浮窗"
-              "（开关 mfNotificationClickFloat 默认开，圆盘编辑器「其他选项」里可关）"
-              "｜识别 = launchOrigin 含 notification，或调用栈命中 NCNotification/SBNotification/Banner");
+              "（开关 mfNotificationClickFloat 默认开；0.7.5 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
+              "二级页里可选「全部应用」或「仅选中的应用」）"
+              "｜识别 = launchOrigin 含 notification/bulletin/banner，或调用栈命中 NCNotification/SBNotification/Banner");
     });
     return sharedInstance;
 }
@@ -945,6 +1015,11 @@ static NSString *POExternalOptionsSummary(NSDictionary *dictionary) {
         POExternalNotificationLog(@"[notify] 开关=关 ⇒ 放行原生打开 %@", targetBundleId);
         return nil;
     }
+    NSString *scopeReason = nil;
+    if (!POExternalNotificationTargetAllowed(targetBundleId, &scopeReason)) {
+        POExternalNotificationLog(@"[notify] %@ ⇒ 放行原生打开 %@", scopeReason, targetBundleId);
+        return nil;
+    }
     if (POExternalNotificationRouteDuplicate(targetBundleId)) {
         return nil;
     }
@@ -999,6 +1074,11 @@ static NSString *POExternalOptionsSummary(NSDictionary *dictionary) {
     }
     if (!POExternalNotificationClickFloatEnabled()) {
         POExternalNotificationLog(@"[trusted] 开关=关 ⇒ 放行原生");
+        return nil;
+    }
+    NSString *trustedScopeReason = nil;
+    if (!POExternalNotificationTargetAllowed(targetBundleId, &trustedScopeReason)) {
+        POExternalNotificationLog(@"[trusted] %@ ⇒ 放行原生", trustedScopeReason);
         return nil;
     }
     if (POExternalNotificationRouteDuplicate(targetBundleId)) {
