@@ -1164,11 +1164,11 @@ static void _logos_method$_ungrouped$SpringBoard$applicationDidFinishLaunching$(
 
     // 【0.7.1 · P0】设置应用从 2 秒推到 6 秒：避开启动静默期，并前后打点留证
     //   （log62 两次崩溃都落在启动后 0.5~3 秒，这段是最需要证据的位置之一）。
-    MFLog(@"[boot] 0.7.2 applicationDidFinishLaunching -> 6 秒后应用当前设置");
+    MFLog(@"[boot] 0.7.3 applicationDidFinishLaunching -> 6 秒后应用当前设置");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-      MFLog(@"[boot] 0.7.2 应用当前设置（进入，t=%.1fs）", POPosixSecondsSinceBoot());
+      MFLog(@"[boot] 0.7.3 应用当前设置（进入，t=%.1fs）", POPosixSecondsSinceBoot());
       POApplyCurrentSettings();
-      MFLog(@"[boot] 0.7.2 应用当前设置（完成，t=%.1fs）", POPosixSecondsSinceBoot());
+      MFLog(@"[boot] 0.7.3 应用当前设置（完成，t=%.1fs）", POPosixSecondsSinceBoot());
     });
 }
 
@@ -1375,7 +1375,7 @@ static void _po_installEdgePanAfterSilentWindow(void) {
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(remaining * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        MFLog(@"[ring] 0.7.2 静默期结束（t=%.1fs）-> 补装边缘识别器", POPosixSecondsSinceBoot());
+        MFLog(@"[ring] 0.7.3 静默期结束（t=%.1fs）-> 补装边缘识别器", POPosixSecondsSinceBoot());
         MFRingInstallEdgePanGesture();
     });
 }
@@ -1477,7 +1477,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     //    POCaptureCompat.plist。本文件（主 dylib）依旧只注入 SpringBoard，
     //    **一行新 hook 都没加**（前期"不要多个 hook，确保不卡开机"的要求继续满足）。
     //  取证工具：`.workbuddy-ai/tmp/probe_undef.py <deb>` 列未定义符号并标出加载期绑定的全局量。
-    MFLogRawC("=== PullOverMF 0.7.2 加载（SpringBoard）===");
+    MFLogRawC("=== PullOverMF 0.7.3 加载（SpringBoard）===");
 
     // ===== 【0.7.0 · P0 诊断】启动阶段心跳 =====
     //  背景：用户报「每次注销后先触发安全模式」。要定因必须先知道崩在哪一段。
@@ -1488,7 +1488,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     {
         char bootLine[256];
         snprintf(bootLine, sizeof(bootLine),
-                 "[boot] 0.7.2 阶段 1/8：constructor 已进入（pid=%d 崩溃计数=%d 静默期=%.1fs）",
+                 "[boot] 0.7.3 阶段 1/8：constructor 已进入（pid=%d 崩溃计数=%d 静默期=%.1fs）",
                  (int)getpid(), gPOCrashGuardCount, kPOBootSilentWindow);
         MFLogRawC(bootLine);
     }
@@ -1497,7 +1497,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         POPosixDeleteFile(kPOGestureGuardPath);
-        MFLog(@"[guard] 0.7.2 已存活 20 秒（t=%.1fs）⇒ 崩溃标记已撤除，下次注销恢复全功能",
+        MFLog(@"[guard] 0.7.3 已存活 20 秒（t=%.1fs）⇒ 崩溃标记已撤除，下次注销恢复全功能",
               POPosixSecondsSinceBoot());
     });
 
@@ -1507,7 +1507,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(capturedTick * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             char beatLine[128];
-            snprintf(beatLine, sizeof(beatLine), "[beat] 0.7.2 第 %d 秒存活（t=%.1fs）",
+            snprintf(beatLine, sizeof(beatLine), "[beat] 0.7.3 第 %d 秒存活（t=%.1fs）",
                      capturedTick, POPosixSecondsSinceBoot());
             MFLogRawC(beatLine);
         });
@@ -1516,13 +1516,13 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 【0.7.1 · P0】极简模式：连续崩两次 ⇒ 本轮零 hook / 零视图，只写日志。
     //   20 秒后标记已删 ⇒ 下一次注销自动恢复，功能不会被锁死，也不会再连环安全模式。
     if (gPOBootExtremeMode) {
-        MFLogRawC("[guard] 0.7.2 连续崩溃 >=2 次 -> 本轮极简模式（零 hook / 零视图，8 秒后自动恢复）");
+        MFLogRawC("[guard] 0.7.3 连续崩溃 >=2 次 -> 本轮极简模式（零 hook / 零视图，8 秒后自动恢复）");
         // 极简轮什么都没装 ⇒ 存活 8 秒足以证明「不是我们崩的」，提前清标记（不用等 20 秒），
         // 把用户被降级的时长压到最短（8 秒 + 一次注销）。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             POPosixDeleteFile(kPOGestureGuardPath);
-            MFLog(@"[guard] 0.7.2 极简模式已存活 8 秒 ⇒ 标记提前撤除（下次注销即恢复全功能）");
+            MFLog(@"[guard] 0.7.3 极简模式已存活 8 秒 ⇒ 标记提前撤除（下次注销即恢复全功能）");
         });
         return;
     }
@@ -1561,7 +1561,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     // 【0.7.1 · P0】圆盘安装从 2 秒推到**静默期结束（3 秒）**：注销后前 3 秒不碰任何 UI。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPOBootSilentWindow * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        MFLog(@"[boot] 0.7.2 阶段 8/8：圆盘安装回调进入（3 秒静默期已过，t=%.1fs）",
+        MFLog(@"[boot] 0.7.3 阶段 8/8：圆盘安装回调进入（3 秒静默期已过，t=%.1fs）",
               POPosixSecondsSinceBoot());
         MFRingPickerInstall();
     });
@@ -1575,7 +1575,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     {
         char bootLine[256];
         snprintf(bootLine, sizeof(bootLine),
-                 "[boot] 0.7.2 阶段 2/8：进入手势注册段（崩溃计数=%d %s，pid=%d）",
+                 "[boot] 0.7.3 阶段 2/8：进入手势注册段（崩溃计数=%d %s，pid=%d）",
                  gPOCrashGuardCount,
                  (gPOCrashGuardCount > 0 ? "上次启动 20 秒内崩过 -> 本轮降级" : "正常"),
                  (int)getpid());
@@ -1583,7 +1583,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     }
     {
         if (gPOCrashGuardCount > 0) {
-            MFLogRawC("[guard] 0.7.2 降级模式：本轮不注册系统手势 hook（圆盘/浮窗照常；存活 20 秒自动恢复）");
+            MFLogRawC("[guard] 0.7.3 降级模式：本轮不注册系统手势 hook（圆盘/浮窗照常；存活 20 秒自动恢复）");
         } else {
             int registered = 0;
             char summary[384];
@@ -1618,7 +1618,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                 }
             }
             if (registered == 0) {
-                MFLogRawC("PullOverMF 0.7.2: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
+                MFLogRawC("PullOverMF 0.7.3: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
             }
 
             // —— ② 0.2.7 注册 / 0.2.8 完整驱动：SBSystemGestureManager 系统边缘手势（triggr 实证 iOS 15~18）——
@@ -1653,15 +1653,15 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
             }
 
             if (registered > 0) {
-                MFLogRawC("[boot] 0.7.2 阶段 3/8：手势 hook 注册分支已进入");
+                MFLogRawC("[boot] 0.7.3 阶段 3/8：手势 hook 注册分支已进入");
                 char line[512];
                 snprintf(line, sizeof(line),
-                         "PullOverMF 0.7.2: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
+                         "PullOverMF 0.7.3: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
                          registered, (summaryLen > 0 ? summary : "SBSystemGestureManager 边缘手势"));
                 MFLogRawC(line);
                 // 【0.7.1 · P0】不再在这里排"撤标记"：撤标记统一由 constructor 里的
                 //   20 秒自愈负责（降级轮也要撤，否则一次崩溃就永久禁用手势）。
-                MFLog(@"[guard] 0.7.2 崩溃计数已置为 %d（存活 20 秒后自动撤除）",
+                MFLog(@"[guard] 0.7.3 崩溃计数已置为 %d（存活 20 秒后自动撤除）",
                       gPOCrashGuardCount + 1);
                 // 兜底：即使 _init hook 没触发，10 秒后再尝试安装边缘识别器（幂等）
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
@@ -1669,12 +1669,12 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                     MFRingInstallEdgePanGesture();
                 });
             } else {
-                MFLogRawC("PullOverMF 0.7.2: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
+                MFLogRawC("PullOverMF 0.7.3: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
             }
         }
     }
 
-    MFLogRawC("[boot] 0.7.2 阶段 4/8：手势段结束，开始相机授权/设置读取");
+    MFLogRawC("[boot] 0.7.3 阶段 4/8：手势段结束，开始相机授权/设置读取");
     POSetCameraForegroundGrantBundleIdentifier(nil);
     if (POSettingsEnabled([POApplicationHelper settings])) {
         PORegisterScreenBlankObserver();
@@ -1685,7 +1685,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     {
         char bootLine[176];
         snprintf(bootLine, sizeof(bootLine),
-                 "[boot] 0.7.2 阶段 5/8：相机授权+设置读取完成，开始场景类 hook（pid=%d）",
+                 "[boot] 0.7.3 阶段 5/8：相机授权+设置读取完成，开始场景类 hook（pid=%d）",
                  (int)getpid());
         MFLogRawC(bootLine);
     }
@@ -1736,7 +1736,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                             (IMP)&_logos_method$_ungrouped$UIMutableApplicationSceneSettings$setBackgrounded$,
                             (IMP *)&_logos_orig$_ungrouped$UIMutableApplicationSceneSettings$setBackgrounded$);
         }
-        MFLogRawC("[boot] 0.7.2 阶段 6/8：场景类 hook 段完成，开始 SBMainWorkspace 段");
+        MFLogRawC("[boot] 0.7.3 阶段 6/8：场景类 hook 段完成，开始 SBMainWorkspace 段");
         Class mainWorkspaceClass = objc_getClass("SBMainWorkspace");
         SEL handleOpenSelector = NSSelectorFromString(@"systemService:handleOpenApplicationRequest:withCompletion:");
         if ([mainWorkspaceClass instancesRespondToSelector:handleOpenSelector]) {
@@ -1796,7 +1796,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     {
         char bootLine[160];
         snprintf(bootLine, sizeof(bootLine),
-                 "[boot] 0.7.2 阶段 7/8：constructor 全部完成（pid=%d）", (int)getpid());
+                 "[boot] 0.7.3 阶段 7/8：constructor 全部完成（pid=%d）", (int)getpid());
         MFLogRawC(bootLine);
     }
 }

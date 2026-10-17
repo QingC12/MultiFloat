@@ -109,7 +109,10 @@
 // （同一时刻只有一个活跃 scene → ContextHostManager 单会话零改动，回归风险最小；
 //   0.7 计划把贴片升级为实时多 Scene）。
 #define MF_DOCK_STRIP_MAX 5                      // 停靠条容量（用户口径 3~5 个，超出淘汰最旧）
-#define MF_DOCK_STRIP_TILE_W 74.0                // 【0.6.5】贴片宽（9:16 → 高 131.6；5 片 + 4 缝隙 ≈ 690，25% 起放后底边 923 < 屏高 932）
+// 【0.7.3 用户 log64】"停靠小窗有一点小，再次放大一点，因为有时点不到上面的图标" ⇒ 74 → 88（+19%）。
+//   9:16 → 高 156.4；5 片 + 4 缝隙 = 814 > 屏高 75% 剩余空间 ⇒ 顶部由 25%(233) 自动上钳到 y≈114，
+//   仍在刘海/灵动岛安全区（≈59pt）之下；1~3 片时位置与原来一致（不动 25% 基准）。
+#define MF_DOCK_STRIP_TILE_W 88.0
 #define MF_DOCK_STRIP_TILE_GAP 8.0               // 贴片纵向间距
 #define MF_DOCK_STRIP_EDGE_INSET 4.0             // 贴片距屏幕边缘
 #define MF_DOCK_STRIP_TOP_RATIO 0.25             // 【0.6.5】首片起始位置 = 屏高 25%（两侧一致，不置顶）
@@ -1069,12 +1072,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.2 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.3 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.2 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.3 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2128,6 +2131,15 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     if (targetIsBase) {
         targetScale = 1.0;
     }
+    // ★★ 【0.7.3 · 闪烁修复】角把手缩放手势**进行中**时，1.0 只是连续档位上的一个值，
+    //   不是"回基准"意图 ⇒ 下面那段 latch 改写必须整段跳过。
+    //   病根（log64 实证）：慢拖时 target 会落进 1.000±0.001 这条极窄带 ⇒ 被改写成用户档位 1.04
+    //   ⇒ appliedCardScale 被**真的改成 1.04** ⇒ "值相同就早退"的守卫自己失效 ⇒ 下一帧又改写……
+    //   于是在「1.04」与「拖拽值」之间每帧来回跳 = 用户看到的"右边和下边一闪一闪"。
+    //   证据：同一段 12 秒慢拖里 `回基准请求（source=1）被用户档位拦住` 打了 6 次，
+    //   6 次时刻与几何日志里 scale 穿过 1.0 的时刻逐条吻合（21.80/26.33/26.84/28.79/29.25/31.16）。
+    BOOL mfLiveCornerScaleDrag =
+        (source == POCardScaleTransitionSourceHandle && mfEdgeDragMode == 2);
     // 【0.4.12 用户 log38 收口】任何"回基准"请求都先过用户档位这一关：
     //   log38 实证第三条路：reevaluateKeyboardZoomAnimated → applyResolvedCardScale →
     //   resolvedCardScale 在 canApplyCardScale=NO（安全区过渡/滚动 suspension/容器 hidden 等）
@@ -2138,7 +2150,17 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     //   停靠还原 1.0 时 latch 按 restoreScale 是否≠1.0 上锁；键盘避让先清 latch。
     if (targetIsBase) {
         CGFloat manualScale = [self mfLatchedManualCardScale];
-        if (manualScale > 0.0) {
+        if (manualScale > 0.0 && mfLiveCornerScaleDrag) {
+            // 【0.7.3】拖拽路过 1.0：原样按 1.0 生效（保持连续），不再打回用户档位。
+            //   日志限流 0.5s —— 慢拖可能来回穿多次，不限流会自己变成新的掉帧源。
+            static NSTimeInterval mfLastScaleCrossLogAt;
+            NSTimeInterval crossNow = CACurrentMediaTime();
+            if ((crossNow - mfLastScaleCrossLogAt) >= 0.5) {
+                mfLastScaleCrossLogAt = crossNow;
+                MFLog(@"[card] 0.7.3 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
+                      manualScale);
+            }
+        } else if (manualScale > 0.0) {
             MFLog(@"[card] 回基准请求（source=%ld）被用户档位拦住 → 重施 %.2f（0.4.17 缩放保持·收口）",
                   (long)source, manualScale);
             targetScale = manualScale;
@@ -3265,11 +3287,14 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.7.2 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.7.3 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 
     // 【0.7.2·P1】本版专有条幅：动画节奏 + 每帧开销收口（测试时看到这一行 = P1 已生效）
     MFLog(@"[card] 0.7.2 P1 已启用：统一动画节奏（MICRO 0.18 / QUICK 0.22 / SOFT 0.30 / BASE 0.32 / HERO 0.46，阻尼默认 0.82）"
           "｜热区带几何日志节流 0.25s（拖拽不再每帧写盘）｜z 序/圆角路径已去重");
+    // 【0.7.3】本版专有条幅（测试时看到这一行 = 0.7.3 已生效）
+    MFLog(@"[card] 0.7.3 已启用：缩放路过 1.0 不再被「回基准」改写（右边/下边不再闪）"
+          "｜停靠小窗 74x132 → 88x156（顶端图标 24→32pt，更好点）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3766,7 +3791,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self mfUpdateVerticalHandleRailPosition];
         }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.2 %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.3 %@，阴影浮起 %.2f）",
           stripGrow ? @"贴片还原长大（实景，无图片快照）"
                     : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                                           : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
@@ -4232,7 +4257,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.2 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.3 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4647,7 +4672,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     CGFloat tileH = MF_DOCK_STRIP_TILE_W * 16.0 / 9.0;
     UIView *tile = [[UIView alloc] initWithFrame:CGRectMake(0, 0, MF_DOCK_STRIP_TILE_W, tileH)];
     tile.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.94];
-    tile.layer.cornerRadius = 12.0;
+    tile.layer.cornerRadius = 14.0;   // 【0.7.3】12→14（贴片 74→88 同比放大，圆角观感不变）
     tile.layer.masksToBounds = YES;
     tile.layer.borderWidth = 1.0;
     tile.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
@@ -4667,10 +4692,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     w.liveContainerView = liveContainer;
     BOOL iconOnly = (w.snapshotImage == nil);
     // 【0.6.5】图标随贴片宽度自适应（74pt 宽 → 常态 24 / 兜底 35）
-    CGFloat iconSize = iconOnly ? (MF_DOCK_STRIP_TILE_W * 0.48) : (MF_DOCK_STRIP_TILE_W * 0.32);
+    // 【0.7.3】贴片 74→88 的同时把"顶端那枚图标"从 0.32 提到 0.36（24→32pt）：
+    //   用户 log64"有时点不到上面的图标" —— 有实时画面时顶端图标是唯一可辨认的目标，24pt 偏小。
+    CGFloat iconSize = iconOnly ? (MF_DOCK_STRIP_TILE_W * 0.46) : (MF_DOCK_STRIP_TILE_W * 0.36);
     UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectMake(
         (MF_DOCK_STRIP_TILE_W - iconSize) / 2.0,
-        iconOnly ? (tileH - iconSize) / 2.0 : 4.0,
+        iconOnly ? (tileH - iconSize) / 2.0 : 5.0,
         iconSize, iconSize)];
     iconView.image = w.iconImage;
     iconView.contentMode = UIViewContentModeScaleAspectFit;
