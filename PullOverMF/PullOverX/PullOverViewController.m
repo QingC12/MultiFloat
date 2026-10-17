@@ -63,8 +63,20 @@
 //   0.5 / 0.75 / 1.0 三档吸附（0.3.21~0.3.23）已删除。
 #define MF_CARD_SCALE_SCREEN_RATIO 0.95     // 【0.3.24】放大上限：不超过主屏宽/高的 95%
 #define MF_CARD_CORNER_WIDTH_RATIO 0.17     // 【0.3.24】圆角上限 = 卡宽 ×0.17（停靠小窗 135 → 23）
-#define MF_CARD_ANIM_DURATION 0.34          // 【0.3.24】停靠/还原等卡片形变动画时长（Stheno 式弹簧）
-#define MF_CARD_ANIM_DAMPING 0.86           // 弹簧阻尼（欠阻尼 → 收尾有一点点回弹）
+#define MF_CARD_ANIM_DURATION 0.32          // 【0.7.2·P1】停靠/还原等卡片形变动画（0.34→0.32，收得更干脆）
+#define MF_CARD_ANIM_DAMPING 0.82           // 【0.7.2·P1】弹簧阻尼（0.86→0.82，收尾回弹更明显一点）
+// ── 【0.7.2·P1】统一动画节奏表 ──────────────────────────────────────────
+//   以前每处动画各自拍时长/阻尼（0.12/0.16/0.18/0.20/0.22/0.24/0.26/0.30/
+//   0.34/0.38/0.42/0.46/0.48/0.50/0.56 混用）⇒ 观感上"每一下的节奏都不太一样"。
+//   这里收成 4 档时长 + 3 档阻尼，所有动画一律引用 ⇒ 动作之间有了同一套"呼吸"。
+#define MF_ANIM_MICRO       0.18   // 微反馈：抬起/落下、开关脉冲
+#define MF_ANIM_QUICK       0.22   // 淡入淡出：背板、交叉淡化、收起
+#define MF_ANIM_SOFT        0.30   // 小幅位移：越界回弹、行展开
+#define MF_ANIM_BASE        0.32   // 卡片形变：停靠 / 还原 / 缩放
+#define MF_ANIM_HERO        0.46   // 主转场：打开 / 圆盘固定
+#define MF_ANIM_DAMP_SOFT   0.90   // 柔顺落定（几乎不过冲）
+#define MF_ANIM_DAMP_BASE   0.82   // 默认：轻微 Q 弹
+#define MF_ANIM_DAMP_POP    0.62   // 强调：明显过冲（图标弹出 / 贴片长大）
 #define MF_CARD_LIFT_SHADOW_OPACITY 0.42    // 【0.3.24】拖动中的"抬起"阴影（平时 0.28）
 #define MF_CARD_MOVE_RUBBER_BAND 0.25       // 【0.3.24】拖动越界只允许 25% 的越界量（松手弹回）
 #define MF_CARD_EDGE_FLICK_CLOSE_VELOCITY 600.0  // 【0.3.19】甩边关闭的最小右滑速度（pt/s）
@@ -414,6 +426,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL mfPreKeyboardScaleLatched;        // 键盘弹出前的档位 latch
     BOOL mfPreKeyboardCaptured;            // 本次键盘会话已捕获（一次会话只捕一次）
     BOOL mfEdgeDragLoggedChanged;       // 【0.3.20】本次拖动是否已打过"跟手首帧"日志
+    NSTimeInterval mfEdgeBandGeomLogAt; // 【0.7.2·P1】热区带几何日志的上次输出时刻（节流用）
     BOOL mfUserCardPositionPinned;      // 【0.3.20】用户拖过/停靠过 → 布局 passe 不得把卡片拉回标准打开位
     CGFloat mfEdgeDragStartBottomY;     // 【0.3.13】自由移动起点（卡片底边 Y）
     CGFloat mfEdgeDragStartX;           // 【0.3.13】自由移动起点（卡片 origin.x）
@@ -753,6 +766,21 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 都必须走这里 —— 否则停靠小窗（135 宽）还挂着满宽卡的 44 圆角，看着就是个"胶囊"。
 -(void)mfApplyCardCornerChrome{
     CGFloat radius = MFCardCornerRadiusForWidth(CGRectGetWidth(keyboardZoomContainer.bounds));
+    // 【0.7.2·P1】路径缓存：圆角与阴影框都没变就整段跳过。
+    //   停靠/还原/缩放的动画 block 每次都调它，而原来每次都要新建 2 条 UIBezierPath + CGPath
+    //   （每次都是 malloc + 曲线求值），一帧一次纯属白扔。
+    static CGFloat mfChromeLastRadius = -1.0;
+    static CGRect mfChromeLastBounds;
+    static BOOL mfChromeHasLast;
+    CGRect chromeBounds = shadowView.bounds;
+    if (mfChromeHasLast &&
+        fabs(radius - mfChromeLastRadius) <= 0.01 &&
+        CGRectEqualToRect(chromeBounds, mfChromeLastBounds)) {
+        return;
+    }
+    mfChromeHasLast = YES;
+    mfChromeLastRadius = radius;
+    mfChromeLastBounds = chromeBounds;
     if (fabs(self.contentView.layer.cornerRadius - radius) > 0.01) {
         self.contentView.layer.cornerRadius = radius;
     }
@@ -993,7 +1021,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         self->quickSwitchBackdropView.alpha = quickSwitchTargetAlpha;
     };
     if (animated) {
-        [UIView animateWithDuration:0.20
+        // 【0.7.2·P1】背板 0.20 → MF_ANIM_QUICK(0.22)，与其它淡入淡出同一档
+        [UIView animateWithDuration:MF_ANIM_QUICK
                               delay:0
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
@@ -1040,12 +1069,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.1 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.2 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.1 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.2 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2220,11 +2249,26 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     };
 
     if (animated) {
-        [UIView animateWithDuration:[self cardScaleAnimationDurationForSource:source]
-                              delay:0
-                            options:[self cardScaleAnimationOptionsForSource:source]
-                         animations:changes
-                         completion:completion];
+        if (source == POCardScaleTransitionSourceKeyboard) {
+            // 键盘：时长与曲线都由系统键盘通知给出，必须原样跟随（否则缩放和键盘不同步）
+            [UIView animateWithDuration:[self cardScaleAnimationDurationForSource:source]
+                                  delay:0
+                                options:[self cardScaleAnimationOptionsForSource:source]
+                             animations:changes
+                             completion:completion];
+        } else {
+            // 【0.7.2·P1】手动缩放 / 停靠 / 还原 / 重估：EaseInOut 0.25 在"手指停下"的瞬间
+            //   是硬刹；换成 0.32 弹簧（阻尼 0.82）+ 一点初速 ⇒ 收尾像真的"弹到位"。
+            [UIView animateWithDuration:MF_ANIM_BASE
+                                  delay:0.0
+                 usingSpringWithDamping:MF_ANIM_DAMP_BASE
+                  initialSpringVelocity:0.22
+                                options:(UIViewAnimationOptionCurveEaseOut |
+                                         UIViewAnimationOptionBeginFromCurrentState |
+                                         UIViewAnimationOptionAllowUserInteraction)
+                             animations:changes
+                             completion:completion];
+        }
     } else {
         [UIView performWithoutAnimation:changes];
         completion(YES);
@@ -3006,10 +3050,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     // 【0.6.12 用户 log52】吸收动画弹簧化：匀加速 EaseIn 改欠阻尼弹簧（0.78）——
     //   卡片吸向触发条时带一点过冲回弹（缩到比 0.12 略小再弹回），与呼出侧
     //   "从触发条长出来" 的弹性首尾呼应。
-    [UIView animateWithDuration:0.42
+    // 【0.7.2·P1】吸回触发条：0.42→0.38、阻尼 0.78→0.74、初速 0.4→0.5 ⇒ 收得更利落，
+    //   末端那一下回弹更明确（与呼出侧"从触发条长出来"仍是同一对镜像动作）。
+    [UIView animateWithDuration:0.38
                           delay:0
-         usingSpringWithDamping:0.78
-          initialSpringVelocity:0.4
+         usingSpringWithDamping:0.74
+          initialSpringVelocity:0.5
                         options:(UIViewAnimationOptionCurveEaseIn |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -3219,7 +3265,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.7.1 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.7.2 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+
+    // 【0.7.2·P1】本版专有条幅：动画节奏 + 每帧开销收口（测试时看到这一行 = P1 已生效）
+    MFLog(@"[card] 0.7.2 P1 已启用：统一动画节奏（MICRO 0.18 / QUICK 0.22 / SOFT 0.30 / BASE 0.32 / HERO 0.46，阻尼默认 0.82）"
+          "｜热区带几何日志节流 0.25s（拖拽不再每帧写盘）｜z 序/圆角路径已去重");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3325,18 +3375,34 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     mfEdgeBandBottomLeft.hidden  = CGRectIsNull(scaleZoneLeft);
     mfDockedTapView.hidden  = !dockedOverlayVisible;
     mfEdgeBandHost.hidden = NO;
-    [self.view bringSubviewToFront:mfEdgeBandHost];
+    // 【0.7.2·P1】z 序只在"确实不对"时重排：这个函数拖拽/缩放时**每帧**都调，
+    //   而 bringSubviewToFront 会改 subview 数组并让 CA 重排渲染顺序 —— 每帧 4 次是白烧。
+    if (self.view.subviews.lastObject != mfEdgeBandHost) {
+        [self.view bringSubviewToFront:mfEdgeBandHost];
+    }
     // 缩放区压住底带、停靠盖层压住全部（盖层只在小窗内部，不与带子重叠）
-    [mfEdgeBandHost bringSubviewToFront:mfEdgeBandBottomRight];
-    [mfEdgeBandHost bringSubviewToFront:mfEdgeBandBottomLeft];
-    [mfEdgeBandHost bringSubviewToFront:mfDockedTapView];
+    //   判据：最后 bring 的就是 mfDockedTapView ⇒ 它是 lastObject 说明这一组的顺序已经对了。
+    if (mfEdgeBandHost.subviews.lastObject != mfDockedTapView) {
+        [mfEdgeBandHost bringSubviewToFront:mfEdgeBandBottomRight];
+        [mfEdgeBandHost bringSubviewToFront:mfEdgeBandBottomLeft];
+        [mfEdgeBandHost bringSubviewToFront:mfDockedTapView];
+    }
     // 【0.3.22 诊断】卡片矩形一变就打一行（round31 就是靠 `缩放带内=` 全程为 0 判定"热区没被按到"，
     // 但看不出热区到底在哪 —— 这行把每条带的屏幕矩形都写出来，下一轮定因一眼可查）
     static CGRect mfLastBandLoggedCard;
     static BOOL mfHasBandLoggedCard;
-    if (!mfHasBandLoggedCard || !CGRectEqualToRect(mfLastBandLoggedCard, cardRect)) {
+    // 【0.7.2·P1】★ 日志节流（这是拖拽掉帧的头号元凶）：
+    //   拖拽/缩放时 cardRect **每帧都在变** ⇒ 原来每帧打一条。而 MFLog 是 setvbuf(_IONBF)
+    //   无缓冲 ⇒ 每条 = 一次同步 write 系统调用 + 2 次 NSStringFromCGRect + 6 个 %@ 参数装箱。
+    //   60fps 下 = 每秒 60 次同步写盘 ⇒ 必然掉帧。
+    //   改成最快 0.25s 一条；末值由 "拖动收尾几何" 那行在松手时补打，诊断能力不降。
+    NSTimeInterval bandLogNow = CACurrentMediaTime();
+    BOOL bandGeomChanged = !mfHasBandLoggedCard ||
+        !CGRectEqualToRect(mfLastBandLoggedCard, cardRect);
+    if (bandGeomChanged && (bandLogNow - mfEdgeBandGeomLogAt) >= 0.25) {
         mfHasBandLoggedCard = YES;
         mfLastBandLoggedCard = cardRect;
+        mfEdgeBandGeomLogAt = bandLogNow;
         MFLog(@"[card] 热区带几何：卡(%.0f,%.0f,%.0fx%.0f) 左%@ 右%@ 底%@ 缩放区%@ 左下区%@ 停靠盖层%@",
               CGRectGetMinX(cardRect), CGRectGetMinY(cardRect),
               CGRectGetWidth(cardRect), CGRectGetHeight(cardRect),
@@ -3570,7 +3636,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         mfCardGlowView.layer.shouldRasterize = lifting;
         mfCardGlowView.layer.rasterizationScale = UIScreen.mainScreen.scale;
     }
-    [UIView animateWithDuration:lifting ? 0.16 : 0.26
+    // 【0.7.2·P1】抬起/落下统一走 MF_ANIM_MICRO / MF_ANIM_SOFT（原 0.16 / 0.26）
+    [UIView animateWithDuration:lifting ? MF_ANIM_MICRO : MF_ANIM_SOFT
                           delay:0.0
          usingSpringWithDamping:0.9
           initialSpringVelocity:0.0
@@ -3677,10 +3744,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     // 无论是否消费，本次一律清（防起点泄漏到下一次还原）
     self->mfStripRestoreFromRectValid = NO;
     self->mfCardAppearPopActive = transformPop;
-    [UIView animateWithDuration:(stripGrow ? 0.56 : 0.5)
+    // 【0.7.2·P1】打开节奏收紧：0.50/0.56 → 0.46/0.52，阻尼略升（过冲仍在但不再是"晃两下"）。
+    [UIView animateWithDuration:(stripGrow ? 0.52 : MF_ANIM_HERO)
                           delay:0.0
-         usingSpringWithDamping:(stripGrow ? 0.74 : (stripRestoreBounce ? 0.5 : 0.6))
-          initialSpringVelocity:(stripGrow ? 0.35 : (stripRestoreBounce ? 0.7 : 0.6))
+         usingSpringWithDamping:(stripGrow ? 0.78 : (stripRestoreBounce ? 0.56 : 0.66))
+          initialSpringVelocity:(stripGrow ? 0.32 : (stripRestoreBounce ? 0.62 : 0.55))
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -3698,7 +3766,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self mfUpdateVerticalHandleRailPosition];
         }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.1 %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.2 %@，阴影浮起 %.2f）",
           stripGrow ? @"贴片还原长大（实景，无图片快照）"
                     : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                                           : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
@@ -3920,6 +3988,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
                 [self mfApplyCardPositionBottomY:mfEdgeDragStartBottomY + endTranslation.y
                                          originX:mfEdgeDragStartX + endTranslation.x];
             }
+            // 【0.7.2·P1】几何日志被节流后，松手时在这里补一条终值（诊断不降级）
+            CGRect settleRect = [self mfCardVisualScreenRect];
+            MFLog(@"[card] 拖动收尾几何：卡(%.0f,%.0f,%.0fx%.0f) scale %.2f 停靠边=%ld",
+                  CGRectGetMinX(settleRect), CGRectGetMinY(settleRect),
+                  CGRectGetWidth(settleRect), CGRectGetHeight(settleRect),
+                  appliedCardScale, (long)mfDockedSide);
             CGFloat endScreenX = CGRectGetMinX(keyboardZoomBaseFrame) - [self mfCardScrollOffsetX];
             CGFloat cardWidth = CGRectGetWidth(keyboardZoomBaseFrame);
             CGFloat cardRight = endScreenX + cardWidth;
@@ -4034,7 +4108,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [UIView animateWithDuration:MF_CARD_ANIM_DURATION
                               delay:0.0
              usingSpringWithDamping:MF_CARD_ANIM_DAMPING
-              initialSpringVelocity:0.2
+              initialSpringVelocity:0.28
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
@@ -4129,7 +4203,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [UIView animateWithDuration:MF_CARD_ANIM_DURATION
                               delay:0.0
              usingSpringWithDamping:MF_CARD_ANIM_DAMPING
-              initialSpringVelocity:0.2
+              initialSpringVelocity:0.28
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
@@ -4158,7 +4232,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.1 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.2 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }

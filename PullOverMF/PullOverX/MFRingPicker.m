@@ -2559,10 +2559,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         self.ringRoot.alpha = 0.0;
         CGFloat popFrom = introMin * 0.82;
         self.ringRoot.transform = CGAffineTransformMakeScale(popFrom, popFrom);
-        [UIView animateWithDuration:0.16
+        // 【0.7.2·P1】登场微动画 0.16→0.18、阻尼 0.85→0.80（起手多一点弹性），
+        //   BeginFromCurrentState 保留 ⇒ 手指立刻开划时第一帧照旧无缝接管。
+        [UIView animateWithDuration:0.18
                               delay:0.0
-             usingSpringWithDamping:0.85
-              initialSpringVelocity:0.4
+             usingSpringWithDamping:0.80
+              initialSpringVelocity:0.5
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
@@ -2615,7 +2617,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.7.1 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.7.2 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -2661,10 +2663,11 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     // 【0.3.24】再加"缩回边缘"的位移：与呼出（从边缘滑出）严格对称，一来一回都像 Stheno。
     CGPoint collapseCenter = [self ringIntroStartCenterForBounds:self.hostBounds
                                                           target:collapseRoot.center];
-    [UIView animateWithDuration:0.22
+    // 【0.7.2·P1】收起 0.22→0.24、阻尼 0.88→0.84（与呼出侧同一档弹性，一来一回对称）
+    [UIView animateWithDuration:0.24
                           delay:0.0
-         usingSpringWithDamping:0.88
-          initialSpringVelocity:0.5
+         usingSpringWithDamping:0.84
+          initialSpringVelocity:0.55
                         options:(UIViewAnimationOptionCurveEaseIn |
                                  UIViewAnimationOptionBeginFromCurrentState)
                      animations:^{
@@ -2803,10 +2806,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     if (animated) {
         // 【0.4.13】弹簧收尾调稳：0.72 阻尼会明显晃两下才停（用户"别扭"来源之一），
         //   0.82 + 更小初速 = 一次轻微回稳就落定；BeginFromCurrentState 保留（跟手途中补满不跳帧）。
-        [UIView animateWithDuration:0.46
+        // 【0.7.2·P1】固定收尾 0.46→0.42、阻尼 0.82→0.80、初速 0.18→0.22：
+        //   原来"补满"这一下偏慢，手指停住后要等近半秒才落定；现在更跟手。
+        [UIView animateWithDuration:0.42
                               delay:0.0
-             usingSpringWithDamping:0.82
-              initialSpringVelocity:0.18
+             usingSpringWithDamping:0.80
+              initialSpringVelocity:0.22
                             options:(UIViewAnimationOptionCurveEaseOut |
                                      UIViewAnimationOptionBeginFromCurrentState |
                                      UIViewAnimationOptionAllowUserInteraction)
@@ -3471,7 +3476,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.7.1 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.7.2 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -4831,10 +4836,15 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     //   ② 内部图标再叠一层更快更弹的放大（1.18 倍）——图标比底座弹得更高，层次感；
     //   ③ 选中亮起白色光晕（shadow），滑走时弹簧收回。手指划过即触发（BeginFromCurrentState
     //      保证快速连续划过时动画从当前态衔接不跳变）。
-    [UIView animateWithDuration:0.42
+    // 【0.7.2·P1】★ 删掉三行 shadow* 动画 —— 圆盘图标 button 是 `masksToBounds = YES`
+    //   （见 buildRingInContainer，圆角靠裁切实现），**外阴影一律被裁掉** ⇒ 这三行从来就没画出过
+    //   任何光晕，只是每次悬停都让 CA 去算一遍 shadowOpacity/shadowRadius 的插值。
+    //   现在"点亮"改成 borderWidth 1.0 → 2.5 的加粗描边（不吃离屏渲染，观感更硬朗）。
+    //   节奏也统一：0.42/0.30 → 0.38/0.28，切换图标时不再"慢半拍"。
+    [UIView animateWithDuration:0.38
                           delay:0.0
-         usingSpringWithDamping:(selected ? 0.42 : 0.6)
-          initialSpringVelocity:(selected ? 0.7 : 0.0)
+         usingSpringWithDamping:(selected ? 0.46 : 0.6)
+          initialSpringVelocity:(selected ? 0.72 : 0.0)
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -4842,15 +4852,12 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         button.transform = selected ? CGAffineTransformMakeScale(1.38, 1.38) : CGAffineTransformIdentity;
         button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.45 : 0.14];
         button.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:selected ? 0.95 : 0.35].CGColor;
-        button.layer.shadowColor = [UIColor whiteColor].CGColor;
-        button.layer.shadowOpacity = selected ? 0.5 : 0.0;
-        button.layer.shadowRadius = selected ? 9.0 : 0.0;
-        button.layer.shadowOffset = CGSizeZero;
+        button.layer.borderWidth = selected ? 2.5 : 1.0;
     } completion:nil];
-    [UIView animateWithDuration:0.3
+    [UIView animateWithDuration:0.28
                           delay:0.0
-         usingSpringWithDamping:(selected ? 0.4 : 0.6)
-          initialSpringVelocity:(selected ? 0.9 : 0.0)
+         usingSpringWithDamping:(selected ? 0.44 : 0.6)
+          initialSpringVelocity:(selected ? 0.85 : 0.0)
                         options:(UIViewAnimationOptionCurveEaseOut |
                                  UIViewAnimationOptionBeginFromCurrentState |
                                  UIViewAnimationOptionAllowUserInteraction)
@@ -5378,7 +5385,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.7.1 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.7.2 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
