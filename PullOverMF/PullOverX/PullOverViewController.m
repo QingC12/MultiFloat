@@ -822,6 +822,53 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 
 /// 【0.3.24】手动缩放的**下限**：不小于停靠小窗的宽度（用户 log33 指令）。
 /// 停靠小窗宽 = mfDockedCardFrameForSide: 算出来的宽（本机 135），基准卡宽 ≈ 308 → 0.438。
+#pragma mark - 【0.7.9】主悬浮窗尺寸：全局唯一记忆（不按应用分记）
+
+/// 用户口径（log69）：「可以记忆主悬浮窗大小，即使切换应用，那么也不会恢复默认大小，
+/// 只会使用主悬浮窗的记忆大小」。
+/// 0.7.8 及更早：尺寸存在每个应用自己的 PODockedWindow.savedScale 里 ⇒ QQ 记 10、微信记 5，
+/// 点各自的贴片还原时主窗就在两种大小之间来回跳。
+/// 现在：倍率只有**一个**，存偏好，Respring/重启都不丢：
+///   · 用户手动缩放松手（mfSnapCardScaleAnimated）→ 写这里；
+///   · 任何"还原某应用浮窗"（贴片提升 / 预落位）→ **不读 savedScale**，只读这里；
+///   · 面板打开且无待还原项 → 用这里当档位，绝不回默认 1.0。
+static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
+
+/// 读全局记忆（钳进当前上下限）。没有记录 / 读到脏值 → 返回 0（= 没有记忆）。
+-(CGFloat)mfStoredMainCardScale{
+    id stored = [MFGeometryDefaults() objectForKey:MFMainCardScaleKey];
+    if (stored == nil) {
+        return 0.0;
+    }
+    CGFloat value = [stored respondsToSelector:@selector(doubleValue)] ? (CGFloat)[stored doubleValue] : 0.0;
+    if (!isfinite(value) || value <= 0.0) {
+        return 0.0;
+    }
+    CGFloat clamped = MIN(MAX(value, [self mfMinCardScale]), [self mfMaxCardScale]);
+    return isfinite(clamped) ? clamped : 0.0;
+}
+
+/// 写全局记忆。1.0 也要写进去 —— "缩回默认大小"本身就是用户的选择，下次打开就该是默认。
+-(void)mfStoreMainCardScale:(CGFloat)scale{
+    if (!isfinite(scale) || scale <= 0.0) {
+        return;
+    }
+    CGFloat clamped = MIN(MAX(scale, [self mfMinCardScale]), [self mfMaxCardScale]);
+    if (!isfinite(clamped) || clamped <= 0.0) {
+        return;
+    }
+    if (fabs(clamped - 1.0) <= PO_CARD_SCALE_EPSILON) {
+        clamped = 1.0;
+    }
+    CGFloat previous = [self mfStoredMainCardScale];
+    if (fabs(previous - clamped) <= 0.001) {
+        return;   // 没变就不写盘（松手那一下会走到这里，别每次都刷偏好）
+    }
+    [MFGeometryDefaults() setObject:@(clamped) forKey:MFMainCardScaleKey];
+    [(NSUserDefaults *)MFGeometryDefaults() synchronize];
+    MFLog(@"[card] 0.7.9 主窗尺寸已记忆：%.2f（原 %.2f，全局唯一、不随应用变）", clamped, previous);
+}
+
 -(CGFloat)mfMinCardScale{
     CGFloat baseWidth = contentLayoutWidth > 0 ? contentLayoutWidth : CGRectGetWidth(keyboardZoomBaseFrame);
     if (!(baseWidth > 0)) {
@@ -1072,12 +1119,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.8 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.9 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.8 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.9 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2157,7 +2204,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             NSTimeInterval crossNow = CACurrentMediaTime();
             if ((crossNow - mfLastScaleCrossLogAt) >= 0.5) {
                 mfLastScaleCrossLogAt = crossNow;
-                MFLog(@"[card] 0.7.8 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
+                MFLog(@"[card] 0.7.9 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
                       manualScale);
             }
         } else if (manualScale > 0.0) {
@@ -2814,14 +2861,30 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             !CGRectIsEmpty(mfStripPendingRestore.savedFrame)) {
             PODockedWindow *pending = mfStripPendingRestore;
             mfUserCardPositionPinned = YES;
-            BOOL pendingHasScale = fabs(pending.savedScale - 1.0) > PO_CARD_SCALE_EPSILON;
-            mfUserCardScaleOverride = pendingHasScale ? pending.savedScale : 0;
+            // 【0.7.9】倍率改读**全局主窗记忆**（不看 pending.savedScale）：
+            //   各应用各记一份 ⇒ 主窗在两种大小之间来回跳（用户 log69 反馈的原话）。
+            CGFloat pendingMainScale = [self mfStoredMainCardScale];
+            BOOL pendingHasScale = pendingMainScale > 0.0 &&
+                fabs(pendingMainScale - 1.0) > PO_CARD_SCALE_EPSILON;
+            mfUserCardScaleOverride = pendingHasScale ? pendingMainScale : 0;
             mfManualCardScaleLatched = pendingHasScale;
             keyboardZoomBaseFrame = pending.savedFrame;
             [self applyLayoutPreservingHandlePosition:YES];
             MFLog(@"[strip] 预落位：%@ frame %.0fx%.0f scale %.2f（淡入前写回）",
                   pending.bundleId, CGRectGetWidth(pending.savedFrame),
-                  CGRectGetHeight(pending.savedFrame), pending.savedScale);
+                  CGRectGetHeight(pending.savedFrame), pendingMainScale);
+        } else {
+            // 【0.7.9】普通打开（圆盘点应用 / 通知进浮窗）：主窗尺寸用全局记忆，
+            //   绝不回默认 1.0 —— 用户口径「即使切换应用也不会恢复默认大小」。
+            CGFloat openMainScale = [self mfStoredMainCardScale];
+            BOOL openHasScale = openMainScale > 0.0 &&
+                fabs(openMainScale - 1.0) > PO_CARD_SCALE_EPSILON;
+            mfUserCardScaleOverride = openHasScale ? openMainScale : 0;
+            mfManualCardScaleLatched = openHasScale;
+            if (openHasScale) {
+                [self applyLayoutPreservingHandlePosition:YES];
+                MFLog(@"[card] 0.7.9 打开即用主窗记忆尺寸 %.2f（全局唯一）", openMainScale);
+            }
         }
         [self mfAnimateCardAppearIfNeeded];   // 【0.3.24】打开动画：卡片淡入 + 阴影浮起
         // 【0.3.19】保险：打开完成即把 rail 摆到打开态位（跟随卡片右缘），不等下一次滚动回调
@@ -3287,7 +3350,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.7.8 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.7.9 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 
     // 【0.7.2·P1】本版专有条幅：动画节奏 + 每帧开销收口（测试时看到这一行 = P1 已生效）
     MFLog(@"[card] 0.7.2 P1 已启用：统一动画节奏（MICRO 0.18 / QUICK 0.22 / SOFT 0.30 / BASE 0.32 / HERO 0.46，阻尼默认 0.82）"
@@ -3295,6 +3358,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     // 【0.7.3】本版专有条幅（测试时看到这一行 = 0.7.3 已生效）
     MFLog(@"[card] 0.7.3 已启用：缩放路过 1.0 不再被「回基准」改写（右边/下边不再闪）"
           "｜停靠小窗 74x132 → 88x156（顶端图标 24→32pt，更好点）");
+    // 【0.7.9】本版专有条幅（看到这一行 = 本版已生效）
+    MFLog(@"[card] 0.7.9 已启用：主悬浮窗尺寸改成**全局唯一记忆**"
+          "（不再按应用各记一份 ⇒ 切换应用不会在两种大小之间来回跳，也不会回默认大小）"
+          "｜存偏好键 mfMainCardScale，Respring 不丢");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3791,7 +3858,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self mfUpdateVerticalHandleRailPosition];
         }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.8 %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.9 %@，阴影浮起 %.2f）",
           stripGrow ? @"贴片还原长大（实景，无图片快照）"
                     : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                                           : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
@@ -4257,7 +4324,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.8 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.9 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4863,8 +4930,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     //     面板关态（单贴片）时预写回 + finish 预落位双保险，全程无二次跳变。
     if (!CGRectIsEmpty(w.savedFrame)) {
         self->mfUserCardPositionPinned = YES;
-        BOOL preScale = fabs(w.savedScale - 1.0) > PO_CARD_SCALE_EPSILON;
-        self->mfUserCardScaleOverride = preScale ? w.savedScale : 0;
+        // 【0.7.9】预写回用全局主窗记忆（各应用的 savedScale 不再参与主窗尺寸）
+        CGFloat preMainScale = [self mfStoredMainCardScale];
+        BOOL preScale = preMainScale > 0.0 && fabs(preMainScale - 1.0) > PO_CARD_SCALE_EPSILON;
+        self->mfUserCardScaleOverride = preScale ? preMainScale : 0;
         self->mfManualCardScaleLatched = preScale;
         self->keyboardZoomBaseFrame = w.savedFrame;
     }
@@ -4904,9 +4973,11 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             MFLog(@"[strip] 还原核对：%@ 未成功打开，跳过 frame 还原", targetId);
             return;
         }
-        BOOL hasScale = fabs(targetScale - 1.0) > PO_CARD_SCALE_EPSILON;
+        // 【0.7.9】同上：尺寸只认全局记忆
+        CGFloat mainScale = [self mfStoredMainCardScale];
+        BOOL hasScale = mainScale > 0.0 && fabs(mainScale - 1.0) > PO_CARD_SCALE_EPSILON;
         self->mfUserCardPositionPinned = YES;
-        self->mfUserCardScaleOverride = hasScale ? targetScale : 0;
+        self->mfUserCardScaleOverride = hasScale ? mainScale : 0;
         self->mfManualCardScaleLatched = hasScale;
         if (!CGRectIsEmpty(targetFrame)) {
             self->keyboardZoomBaseFrame = targetFrame;
@@ -4914,8 +4985,8 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         [self applyLayoutPreservingHandlePosition:YES];
         // 【0.6.6】0.6.5 的"Q 弹回位"已按用户 log50 指令移除（打开时 frame 已预写回，
         //   这里只剩兜底核对；正常情况下此处的重排是无观感变化的 no-op）。
-        MFLog(@"[strip] 还原完成：%@ frame %.0fx%.0f scale %.2f", targetId,
-              CGRectGetWidth(targetFrame), CGRectGetHeight(targetFrame), targetScale);
+        MFLog(@"[strip] 还原完成：%@ frame %.0fx%.0f scale %.2f（全局主窗记忆）", targetId,
+              CGRectGetWidth(targetFrame), CGRectGetHeight(targetFrame), mainScale);
     });
 }
 
@@ -4975,6 +5046,10 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     BOOL hasManualScale = fabs(clamped - 1.0) > PO_CARD_SCALE_EPSILON;
     mfUserCardScaleOverride = hasManualScale ? clamped : 0.0;
     mfManualCardScaleLatched = hasManualScale;
+    // 【0.7.9】松手 = 用户缩放意图的终点 ⇒ 写全局主窗记忆（停靠态的小窗不是"主窗尺寸"，跳过）
+    if (mfDockedSide == 0) {
+        [self mfStoreMainCardScale:clamped];
+    }
     if (mfDockedSide != 0) {
         // 【0.3.22】停靠小窗不出缩放热区 ⇒ 正常到不了这里；真到了就只改档位、绝不动停靠标记
         // （0.3.21 这里会把 mfDockedSide 清 0 → 小窗盖层消失、点小窗再也不能还原）
