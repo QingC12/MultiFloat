@@ -1260,6 +1260,27 @@ static void POExternalCollectRequestsInHub(id object, NSInteger depth,
         return;
     }
 
+    // ★★ 安全闸（比旧版更严）：只对「通知家族」的对象深挖 ivar。
+    //   横幅 destination 的对象图里混着 UIWindow / UIView / 各种控制器，它们的
+    //   assign / unsafe_unretained 成员可能是野指针 —— object_getIvar 读到就是 EXC_BAD_ACCESS，
+    //   SpringBoard 直接死（@try 拦不住）。通知请求一定挂在 Notification/Destination/Banner/
+    //   Alert/Section/Queue/Bulletin/List/Store 这几类对象下面，限定家族完全够用。
+    static NSArray<NSString *> *allowedClassHints = nil;
+    if (!allowedClassHints) {
+        allowedClassHints = @[@"Notification", @"Destination", @"Banner", @"Alert",
+                              @"Section", @"Queue", @"Bulletin", @"List", @"Store"];
+    }
+    BOOL allowed = NO;
+    for (NSString *hint in allowedClassHints) {
+        if ([className rangeOfString:hint].location != NSNotFound) {
+            allowed = YES;
+            break;
+        }
+    }
+    if (!allowed) {
+        return;
+    }
+
     Class current = cls;
     NSInteger level = 0;
     while (current && current != [NSObject class] && level < 7) {
