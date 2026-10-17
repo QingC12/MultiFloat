@@ -900,7 +900,7 @@ static BOOL POMainLayerIdentitiesEqual(NSArray<FBSceneLayer *> *lhs,
 
         // 【M1/S3+S4】生命周期账本 + 断言/租约探测（探测版）：只记账、只打日志，不改变任何行为。
         MFLog(@"[session] 0.7.0 会话生命周期账本就位（S3）：会话身份 + 窗口认领计数（单窗恒落在 primarySession，行为零变化）");
-        MFLog(@"[session] 0.7.10 断言/租约探测已启用（S4 探测版）：单窗期望 前台租约=1、主租约断言=1、保活断言=片数");
+        MFLog(@"[session] 0.7.11 断言/租约探测已启用（S4 探测版）：单窗期望 前台租约=1、主租约断言=1、保活断言=片数");
         [self mfLogSessionProbe:@"启动基线"];
     }
     return self;
@@ -1103,7 +1103,7 @@ static inline NSString *MFWindowClaimKeyForTile(NSString *bundleId) {
         session.sessionBundleId = [bundleId copy];
     }
     NSUInteger count = [session mf_claimWindow:windowKey];
-    MFLog(@"[session] 0.7.10 账本·认领窗口：%@（bid=%@ 会话=%@ 本会话认领=%lu 全局认领=%lu）",
+    MFLog(@"[session] 0.7.11 账本·认领窗口：%@（bid=%@ 会话=%@ 本会话认领=%lu 全局认领=%lu）",
           windowKey, bundleId ?: @"-",
           (session == self.primarySession) ? @"primary" : @"detached",
           (unsigned long)count, (unsigned long)[self mfTotalWindowClaimCount]);
@@ -1122,7 +1122,7 @@ static inline NSString *MFWindowClaimKeyForTile(NSString *bundleId) {
     if (before == count) {
         return;   // 本就没认领过 ⇒ 不刷日志（防噪声）
     }
-    MFLog(@"[session] 0.7.10 账本·释放窗口：%@（bid=%@ 本会话认领=%lu 全局认领=%lu）",
+    MFLog(@"[session] 0.7.11 账本·释放窗口：%@（bid=%@ 本会话认领=%lu 全局认领=%lu）",
           windowKey, bundleId ?: @"-",
           (unsigned long)count, (unsigned long)[self mfTotalWindowClaimCount]);
 }
@@ -1130,7 +1130,7 @@ static inline NSString *MFWindowClaimKeyForTile(NSString *bundleId) {
 /// 【M1/S4】断言 / 租约探测（**探测版**：只打数，不改行为）。
 /// 单窗期望：前台租约 ∈ {0,1}；主租约断言 ∈ {0,1}；保活断言数 == 保活片数 == 保活 pid 数。
 - (void)mfLogSessionProbe:(NSString *)tag {
-    MFLog(@"[session][probe] 0.7.10 %@：认领=%lu（%@）会话=%@ ｜ 前台租约=%d 主租约断言=%d ｜ 保活片=%lu 保活断言=%lu 保活pid=%lu",
+    MFLog(@"[session][probe] 0.7.11 %@：认领=%lu（%@）会话=%@ ｜ 前台租约=%d 主租约断言=%d ｜ 保活片=%lu 保活断言=%lu 保活pid=%lu",
           tag ?: @"-",
           (unsigned long)[self mfTotalWindowClaimCount],
           [[self.primarySession mf_claimedWindowKeys] componentsJoinedByString:@","],

@@ -1358,6 +1358,184 @@ static NSString *POExternalInvokeNotificationWithdraw(id hub, id request) {
     return nil;
 }
 
+/// 横幅自动收起靠 bannerDestination 内部的一个 NSTimer（默认 5 秒）。
+/// 手动 `fire` 一次 = 立刻把这次「超时收起」走完 —— 最精确，且只影响当前正在显示的那条。
+/// 依据（log71 能力地图）：`SBNotificationBannerDestination` 上有 `dismissTimer`(getter) 与
+/// `_cancelDismissTimer`，但**没有** `dismissAllBanners*`；而「等 5 秒自己消失」正是这个 timer 在跑。
+static BOOL POExternalFireBannerDismissTimer(id hub, NSString *role) {
+    if (!POExternalHubResponds(hub, @"dismissTimer")) {
+        return NO;
+    }
+    id timer = POExternalReadObject(hub, NSSelectorFromString(@"dismissTimer"));
+    if (!timer) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅·%@ 的 dismissTimer=(无，横幅可能已结束)",
+                                         role ?: @"?");
+        return NO;
+    }
+    Class timerClass = object_getClass(timer);
+    NSString *timerClassName = timerClass ? NSStringFromClass(timerClass) : @"?";
+    if (![timer respondsToSelector:@selector(fire)]) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 不是计时器（%@）", timerClassName);
+        return NO;
+    }
+    BOOL valid = YES;
+    if ([timer respondsToSelector:@selector(isValid)]) {
+        valid = ((BOOL (*)(id, SEL))objc_msgSend)(timer, @selector(isValid));
+    }
+    if (!valid) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅·dismissTimer 已失效（%@）", role ?: @"?");
+        return NO;
+    }
+    @try {
+        ((void (*)(id, SEL))objc_msgSend)(timer, @selector(fire));
+        POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ fire dismissTimer，%@）",
+                                         role ?: @"?", timerClassName);
+        return YES;
+    } @catch (NSException *exception) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅 fire 抛异常（%@）", exception.reason ?: @"?");
+    }
+    return NO;
+}
+
+/// 沿类链找第一个「ivar 名含 nameHint、值是 NSString」的字段。
+/// `requesterIdentifier` 这类字段常常只以 ivar 形式存在（没对外 getter）。
+static NSString *POExternalReadIvarString(id object, NSString *nameHint) {
+    if (!object || nameHint.length == 0) {
+        return nil;
+    }
+    Class current = object_getClass(object);
+    NSInteger level = 0;
+    while (current && current != [NSObject class] && level < 8) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(current, &count);
+        NSString *found = nil;
+        for (unsigned int index = 0; index < count; index++) {
+            const char *name = ivar_getName(ivars[index]);
+            const char *encoding = ivar_getTypeEncoding(ivars[index]);
+            if (!name || !encoding || encoding[0] != '@') {
+                continue;
+            }
+            NSString *ivarName = [NSString stringWithUTF8String:name];
+            if (!ivarName || [ivarName rangeOfString:nameHint].location == NSNotFound) {
+                continue;
+            }
+            id value = nil;
+            @try {
+                value = object_getIvar(object, ivars[index]);
+            } @catch (__unused NSException *exception) {
+                value = nil;
+            }
+            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+                found = value;
+                break;
+            }
+        }
+        if (ivars) {
+            free(ivars);
+        }
+        if (found) {
+            return found;
+        }
+        current = class_getSuperclass(current);
+        level += 1;
+    }
+    return nil;
+}
+
+/// 第二条路：让 bannerDestination 主动撤销自己的 presentable。
+/// `_revokeAllPresentablesWithRequesterIdentifier:reason:options:` 只需要一个 requester 标识符，
+/// 从对象自己读（getter 优先，其次 ivar）；**读不到就不调** —— 绝不拿字符串瞎猜。
+static BOOL POExternalRevokeBannerPresentables(id hub, NSString *role) {
+    if (!POExternalHubResponds(hub, @"_revokeAllPresentablesWithRequesterIdentifier:reason:options:")) {
+        return NO;
+    }
+    NSString *requester = nil;
+    id value = POExternalReadObject(hub, NSSelectorFromString(@"requesterIdentifier"));
+    if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+        requester = value;
+    } else {
+        requester = POExternalReadIvarString(hub, @"requester");
+    }
+    if (requester.length == 0) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅·%@ 读不到 requesterIdentifier（跳过撤销）",
+                                         role ?: @"?");
+        return NO;
+    }
+    @try {
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+            hub,
+            NSSelectorFromString(@"_revokeAllPresentablesWithRequesterIdentifier:reason:options:"),
+            requester, @"Wisp 点通知进浮窗", @{});
+        POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ revokeAllPresentables requester=%@）",
+                                         role ?: @"?", requester);
+        return YES;
+    } @catch (NSException *exception) {
+        POExternalNotificationDismissLog(@"清除通知：收横幅 revoke 抛异常（%@）", exception.reason ?: @"?");
+    }
+    return NO;
+}
+
+/// 横幅宿主的 ivar 结构（每类每会话一行）：ivar 名 + 当前值的类名。
+/// timer 那条路万一也不通，这一行就是下一轮定因的唯一依据（能找到 presenter / bannerSource）。
+static void POExternalDumpBannerHostIvars(id hub) {
+    if (!hub) {
+        return;
+    }
+    Class cls = object_getClass(hub);
+    NSString *className = cls ? NSStringFromClass(cls) : @"?";
+    if ([className rangeOfString:@"Banner"].location == NSNotFound) {
+        return;
+    }
+    static NSMutableSet<NSString *> *dumpedClasses = nil;
+    if (!dumpedClasses) {
+        dumpedClasses = [NSMutableSet set];
+    }
+    if ([dumpedClasses containsObject:className]) {
+        return;
+    }
+    [dumpedClasses addObject:className];
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    Class current = cls;
+    NSInteger level = 0;
+    while (current && current != [NSObject class] && level < 6 && parts.count < 24) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(current, &count);
+        for (unsigned int index = 0; index < count && parts.count < 24; index++) {
+            const char *name = ivar_getName(ivars[index]);
+            const char *encoding = ivar_getTypeEncoding(ivars[index]);
+            if (!name) {
+                continue;
+            }
+            NSString *valueClass = @"-";
+            if (encoding && encoding[0] == '@') {
+                id value = nil;
+                @try {
+                    value = object_getIvar(hub, ivars[index]);
+                } @catch (__unused NSException *exception) {
+                    value = nil;
+                }
+                if (value) {
+                    Class valueCls = object_getClass(value);
+                    valueClass = valueCls ? NSStringFromClass(valueCls) : @"?";
+                }
+            }
+            [parts addObject:[NSString stringWithFormat:@"%s:%@", name, valueClass]];
+        }
+        if (ivars) {
+            free(ivars);
+        }
+        current = class_getSuperclass(current);
+        level += 1;
+    }
+    NSString *joined = [parts componentsJoinedByString:@", "];
+    if (joined.length > 900) {
+        joined = [[joined substringToIndex:900] stringByAppendingString:@"…"];
+    }
+    POExternalNotificationDismissLog(@"清除通知·横幅宿主结构 %@：%@",
+                                     className, joined.length > 0 ? joined : @"(空)");
+}
+
 /// 收起横幅：hub 自己 + 它的 bannerManager 都试一遍。
 /// 依据（TrollOpenJB 选择器表）：dismissAllBannersAnimated:reason: 是 **2 参**方法，
 /// 第二个参数在不同系统版本可能是 NSString(reason) 也可能是整数枚举 —— 传字符串在两种签名下都安全；
@@ -1366,6 +1544,15 @@ static BOOL POExternalDismissBannersOnHub(id hub, NSString *role) {
     if (!hub) {
         return NO;
     }
+    // ① 首选：把「自动收起计时器」提前触发 —— 就是用户看到的那 5 秒。
+    if (POExternalFireBannerDismissTimer(hub, role)) {
+        return YES;
+    }
+    // ② 次选：让宿主撤销自己的 presentable（能读到自己 requesterIdentifier 才调）。
+    if (POExternalRevokeBannerPresentables(hub, role)) {
+        return YES;
+    }
+
     NSMutableArray *targets = [NSMutableArray array];
     if (POExternalHubResponds(hub, @"bannerManager")) {
         id manager = POExternalReadObject(hub, NSSelectorFromString(@"bannerManager"));
@@ -1404,6 +1591,23 @@ static BOOL POExternalDismissBannersOnHub(id hub, NSString *role) {
 
 /// 跨 hub 收横幅：先走 bannerDestination（就是正在显示的那条横幅的宿主），再走类单例兜底。
 static BOOL POExternalCollapseNotificationBanners(NSArray *hubs) {
+    // 横幅宿主结构图：timer 那条路万一也不通，下一轮照这一行改
+    for (NSDictionary *item in hubs) {
+        POExternalDumpBannerHostIvars(item[@"hub"]);
+    }
+    // 类单例是否存在（每会话一行）：0.7.10 那条兜底路一直静默，看不出是"类不存在"还是"方法不对"
+    static BOOL loggedBannerClassProbe = NO;
+    if (!loggedBannerClassProbe) {
+        loggedBannerClassProbe = YES;
+        NSMutableArray<NSString *> *probe = [NSMutableArray array];
+        for (NSString *name in @[@"SBBannerManager", @"BNBannerManager", @"SBUIBannerManager",
+                                 @"SBUIBannerController", @"BNBannerSource"]) {
+            [probe addObject:[NSString stringWithFormat:@"%@=%@", name,
+                              NSClassFromString(name) ? @"有" : @"无"]];
+        }
+        POExternalNotificationDismissLog(@"清除通知：收横幅·类单例探测 [%@]",
+                                         [probe componentsJoinedByString:@", "]);
+    }
     for (NSDictionary *item in hubs) {
         if (POExternalDismissBannersOnHub(item[@"hub"], item[@"role"])) {
             return YES;
@@ -1556,7 +1760,10 @@ static void POExternalDismissDeliveredNotification(NSString *bundleId, NSString 
 
         BOOL collapsed = POExternalCollapseNotificationBanners(hubs);
         if (clearedCount > 0) {
-            // 已经清掉 → 横幅那层由清除动作自己收掉；这里补一次只为"点开就没"的观感
+            // 通知清掉了；横幅是**另一层**，必须单独收
+            //（0.7.10 误以为「清掉请求 = 横幅跟着没了」⇒ 用户看到的永远是「等 5 秒自己收」）
+            POExternalNotificationDismissLog(@"清除通知：已清 %ld 条，横幅=%@",
+                                             (long)clearedCount, collapsed ? @"已收" : @"未收");
             return;
         }
         POExternalNotificationDismissLog(@"清除通知：全部路径未命中（UUID=%@，已试 [%@]）横幅=%@",
@@ -1626,7 +1833,7 @@ static void POExternalScheduleDismissDeliveredNotification(NSString *bundleId, N
     dispatch_once(&onceToken, ^{
         sharedInstance = [POExternalActivationCoordinator new];
         MFLog(@"[notify] 0.7.4 P2 已启用：点通知 → 悬浮窗"
-              "（开关 mfNotificationClickFloat 默认开；0.7.10 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
+              "（开关 mfNotificationClickFloat 默认开；0.7.5 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
               "二级页里可选「全部应用」或「仅选中的应用」）"
               "｜识别 = launchOrigin 含 notification/bulletin/banner，或调用栈命中 NCNotification/SBNotification/Banner");
         MFLog(@"[notify] 0.7.7 已启用：点通知进浮窗后自动清除该条通知（标已读）"
@@ -1637,8 +1844,10 @@ static void POExternalScheduleDismissDeliveredNotification(NSString *bundleId, N
         // 【0.7.9】本版专有条幅（看到这一行 = 本版已生效）
         MFLog(@"[notify] 0.7.10 已启用：清通知改「dispatcher + destination」双 hub 扫描 + 横幅立刻收"
               "（0.7.10 只在 dispatcher 上找列表，而 iOS 17 的请求存在 destination 里 ⇒ 三次全落空）");
+        MFLog(@"[notify] 0.7.11 已启用：横幅改成「提前触发它自己的自动收起计时器」（dismissTimer fire）"
+              "｜0.7.10 走 dismissAllBanners*，而 SBNotificationBannerDestination 上根本没这个方法 ⇒ 横幅只能等 5 秒走完");
         MFLog(@"[notify] 0.7.9 已启用：点通知恢复（UUID 提取移出主链路 + 全链路异常闸）"
-              "｜0.7.10 在打日志阶段就取 UUID，取异常抛出去把整条 open 请求打死 ⇒ 点了没反应、全屏也不开");
+              "｜0.7.8 在打日志阶段就取 UUID，取异常抛出去把整条 open 请求打死 ⇒ 点了没反应、全屏也不开");
     });
     return sharedInstance;
 }
