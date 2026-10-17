@@ -1144,6 +1144,10 @@ static void _logos_method$_ungrouped$UIMutableApplicationSceneSettings$setBackgr
     _logos_orig$_ungrouped$UIMutableApplicationSceneSettings$setBackgrounded$(self, _cmd, backgrounded);
 }
 
+// 【0.7.1 · P0】前置声明：启动计时工具定义在文件后半段（constructor 段），
+//   而 applicationDidFinishLaunching 的 hook 在更前面就要用它打点。
+static double POPosixSecondsSinceBoot(void);
+
 #pragma mark - SpringBoard hooks
 
 static void _logos_method$_ungrouped$SpringBoard$applicationDidFinishLaunching$(
