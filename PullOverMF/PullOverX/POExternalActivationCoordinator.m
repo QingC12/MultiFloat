@@ -292,6 +292,172 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
     return NO;
 }
 
+#pragma mark - 【0.7.4·P2】点通知 → 悬浮窗
+
+/// 开关：mfNotificationClickFloat（圆盘编辑器「其他选项」里的「点通知进悬浮窗」）
+/// 默认 **开**。直接读 NSUserDefaults（不走 +[POApplicationHelper settings] 的快照），
+/// 所以用户在编辑器里改完，**下一次点通知就生效**，不用 Respring。
+static BOOL POExternalNotificationClickFloatEnabled(void) {
+    id value = [[POApplicationHelper settingsDefaults] objectForKey:@"mfNotificationClickFloat"];
+    if (value == nil) {
+        return YES;
+    }
+    return [value respondsToSelector:@selector(boolValue)] ? [value boolValue] : YES;
+}
+
+/// 诊断日志预算：这条路径「每次 App 启动都会过一遍」，日志又是无缓冲写盘，
+/// 所以一次会话最多 120 条，超了静默（不影响功能）。
+static NSInteger POExternalNotificationLogBudget = 120;
+
+static void POExternalNotificationLog(NSString *format, ...) {
+    if (POExternalNotificationLogBudget <= 0) {
+        return;
+    }
+    POExternalNotificationLogBudget -= 1;
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    MFLog(@"[notify] %@", message);
+}
+
+/// 「target 都没认出来」的请求单独给 20 条预算：通知请求的字段结构与普通启动
+/// 可能不同，万一认不出 target，这 20 条就是下一版定因的唯一线索。
+static NSInteger POExternalUnknownTargetLogBudget = 20;
+
+static BOOL POExternalUnknownTargetLog(NSString *format, ...) {
+    if (POExternalUnknownTargetLogBudget <= 0) {
+        return NO;
+    }
+    POExternalUnknownTargetLogBudget -= 1;
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    MFLog(@"[notify] %@", message);
+    return YES;
+}
+
+/// 调用栈探测：通知点击最终也是一次 OpenApplication 请求，和「点桌面图标」在
+/// 请求参数上几乎没有区别 —— 唯一稳定的信号是**调用栈里有没有通知中心/横幅的类**。
+/// 只在「URL 为空 + target 是用户 App」时才调用（= 用户启动 App 的次数），开销可忽略。
+static BOOL POExternalCallStackLooksLikeNotification(NSString * __autoreleasing *outFrame) {
+    NSArray<NSString *> *symbols = [NSThread callStackSymbols];
+    if (symbols.count == 0) {
+        return NO;
+    }
+    static NSArray<NSString *> *needles;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        needles = @[
+            @"NCNotification",
+            @"NotificationCenter",
+            @"SBNotification",
+            @"BannerDestination",
+            @"BulletinBoard",
+            @"NCBulletin"
+        ];
+    });
+    NSUInteger limit = MIN(symbols.count, (NSUInteger)24);
+    for (NSUInteger index = 0; index < limit; index++) {
+        NSString *frame = symbols[index];
+        if (![frame isKindOfClass:[NSString class]] || frame.length == 0) {
+            continue;
+        }
+        for (NSString *needle in needles) {
+            if ([frame rangeOfString:needle].location != NSNotFound) {
+                if (outFrame) {
+                    *outFrame = frame;
+                }
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+/// 同一次点击可能同时经过 handleOpenApplicationRequest 与
+/// handleTrustedOpenApplicationRequest 两条入口 —— 1.5 秒内同 target 只接管一次。
+static CFTimeInterval POExternalLastNotificationRouteAt = 0;
+static NSString *POExternalLastNotificationRouteTarget = nil;
+
+static BOOL POExternalNotificationRouteDuplicate(NSString *targetBundleId) {
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (POExternalLastNotificationRouteTarget != nil &&
+        [POExternalLastNotificationRouteTarget isEqualToString:targetBundleId] &&
+        (now - POExternalLastNotificationRouteAt) < 1.5) {
+        return YES;
+    }
+    POExternalLastNotificationRouteTarget = [targetBundleId copy];
+    POExternalLastNotificationRouteAt = now;
+    return NO;
+}
+
+/// 判定一次 OpenApplication 请求是不是「用户点了通知」。
+/// 返回 NO 一律原样放行 —— **识别不出来 = 以前的行为**（安全的失败模式）。
+static BOOL POExternalIsNotificationLaunch(id options,
+                                           NSURL *openURL,
+                                           NSDictionary * __autoreleasing *outDictionary,
+                                           NSString * __autoreleasing *outStackFrame,
+                                           NSString * __autoreleasing *outLaunchOrigin) {
+    NSDictionary *dictionary = POExternalOptionsDictionary(options);
+    if (outDictionary) {
+        *outDictionary = dictionary;
+    }
+
+    NSString *launchOrigin = nil;
+    NSString *launchOriginKey = POExternalStringConstant("FBSOpenApplicationOptionKeyLaunchOrigin");
+    if (launchOriginKey.length > 0) {
+        id value = dictionary[launchOriginKey];
+        if ([value isKindOfClass:[NSString class]]) {
+            launchOrigin = value;
+        } else if ([value respondsToSelector:@selector(stringValue)]) {
+            launchOrigin = [value stringValue];
+        }
+    }
+    if (outLaunchOrigin) {
+        *outLaunchOrigin = launchOrigin;
+    }
+
+    // 带 URL 的请求交给原有 URL 路由（那里已有成熟的跨 App 跳转语义）
+    if (POExternalIsValidURL(openURL)) {
+        return NO;
+    }
+    // 系统自己写明了来源 ⇒ 直接信它
+    if (launchOrigin.length > 0) {
+        return [launchOrigin rangeOfString:@"notification"
+                                   options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }
+    // 没写来源，只能靠调用栈（取栈有开销，所以放在最后）
+    NSString *frame = nil;
+    BOOL stackHit = POExternalCallStackLooksLikeNotification(&frame);
+    if (outStackFrame) {
+        *outStackFrame = frame;
+    }
+    return stackHit;
+}
+
+/// 把 options 里我们关心的键压成一行（诊断用）
+static NSString *POExternalOptionsSummary(NSDictionary *dictionary) {
+    if (![dictionary isKindOfClass:[NSDictionary class]] || dictionary.count == 0) {
+        return @"(空)";
+    }
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (id key in dictionary) {
+        NSString *name = [key isKindOfClass:[NSString class]] ? key : [key description];
+        id value = dictionary[key];
+        NSString *text = [value isKindOfClass:[NSString class]] ? value : [value description];
+        if (text.length > 60) {
+            text = [[text substringToIndex:60] stringByAppendingString:@"…"];
+        }
+        [parts addObject:[NSString stringWithFormat:@"%@=%@", name, text]];
+        if (parts.count >= 8) {
+            break;
+        }
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
 @interface POExternalActivationCoordinator ()
 @property (nonatomic, assign) NSUInteger routeRequestGeneration;
 @property (nonatomic, assign) NSUInteger nativeRouteGeneration;
@@ -307,6 +473,15 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
 - (void)completeNativeRouteForGeneration:(NSUInteger)generation
                           targetBundleId:(NSString *)targetBundleId
                                    error:(NSError *)error;
+- (id)routeNotificationLaunchIfNeeded:(id)request completion:(id)completion;
+- (id)routeNotificationLaunchForTrustedApplication:(id)application
+                                           options:(id)options
+                                            origin:(id)origin
+                                            result:(id)result
+                                      routedResult:(id __autoreleasing *)routedResult;
+- (id)notificationRoutedCompletionForTarget:(NSString *)targetBundleId
+                          prepareSuspended:(BOOL (^)(void))prepareSuspended
+                                 completion:(id)completion;
 @end
 
 @implementation POExternalActivationCoordinator
@@ -316,6 +491,9 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         sharedInstance = [POExternalActivationCoordinator new];
+        MFLog(@"[notify] 0.7.4 P2 已启用：点通知 → 悬浮窗"
+              "（开关 mfNotificationClickFloat 默认开，圆盘编辑器「其他选项」里可关）"
+              "｜识别 = launchOrigin 含 notification，或调用栈命中 NCNotification/SBNotification/Banner");
     });
     return sharedInstance;
 }
@@ -325,6 +503,15 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
         return completion;
     }
 
+
+    // ── 【0.7.4·P2】点通知 → 悬浮窗 ──
+    //   必须放在「URL 必须有效」这条判断**之前**：通知点击几乎不带 URL
+    //   （只有带 deep link 的通知才有），原逻辑会在这里直接放行原生。
+    id notificationCompletion = [self routeNotificationLaunchIfNeeded:request
+                                                              completion:completion];
+    if (notificationCompletion) {
+        return notificationCompletion;
+    }
 
     NSURL *openURL = POExternalOpenURL(request);
     if (!POExternalIsValidURL(openURL)) {
@@ -467,6 +654,20 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
     NSString *targetBundleId = [application isKindOfClass:[NSString class]]
         ? application
         : POExternalBundleIdentifier(application);
+    // ── 【0.7.4·P2】点通知 → 悬浮窗（trusted 入口）──
+    id notificationResult = result;
+    id notificationOptions = [self routeNotificationLaunchForTrustedApplication:application
+                                                                        options:options
+                                                                         origin:origin
+                                                                         result:result
+                                                                   routedResult:&notificationResult];
+    if (notificationOptions) {
+        if (routedResult) {
+            *routedResult = notificationResult;
+        }
+        return notificationOptions;
+    }
+
     NSURL *openURL = POExternalURLFromOptions(options);
     if (!POExternalIsUserApplicationBundleIdentifier(targetBundleId) ||
         !POExternalIsValidURL(openURL)) {
@@ -695,6 +896,210 @@ static BOOL POExternalTransitionContainsBundleIdentifier(id transitionRequest,
 
     POXWindow *pullOverWindow = (POXWindow *)[POXWindow sharedWindow];
     [pullOverWindow.controller prepareForNativeApplicationTakeover:targetBundleId];
+}
+
+- (id)routeNotificationLaunchIfNeeded:(id)request completion:(id)completion {
+    if (!NSThread.isMainThread || !request) {
+        return nil;
+    }
+
+    NSString *targetBundleId = POExternalTargetBundleIdentifierFromRequest(request);
+    BOOL targetIsUserApp = POExternalIsUserApplicationBundleIdentifier(targetBundleId);
+    NSURL *openURL = POExternalOpenURL(request);
+    if (!targetIsUserApp && !POExternalIsValidURL(openURL)) {
+        // 连 target 都认不出：留 20 条线索（万一通知请求就是这种形状，下一版才有据可依）
+        id unknownClient = POExternalReadObject(request, NSSelectorFromString(@"clientProcess"));
+        POExternalUnknownTargetLog(@"openApplication(未识别 target)：target=%@ 来源=%@ options=%@",
+                                   targetBundleId ?: @"(无)",
+                                   POExternalBundleIdentifierOrString(unknownClient) ?: @"(无)",
+                                   POExternalOptionsSummary(POExternalOpenOptionsDictionary(request)));
+        return nil;
+    }
+
+    id clientProcess = POExternalReadObject(request, NSSelectorFromString(@"clientProcess"));
+    NSString *originBundleId = POExternalBundleIdentifierOrString(clientProcess);
+    NSDictionary *dictionary = nil;
+    NSString *stackFrame = nil;
+    NSString *launchOrigin = nil;
+    BOOL notificationLaunch = POExternalIsNotificationLaunch(POExternalOpenOptions(request),
+                                                             openURL,
+                                                             &dictionary,
+                                                             &stackFrame,
+                                                             &launchOrigin);
+
+    POExternalNotificationLog(@"openApplication：target=%@ 来源=%@ launchOrigin=%@ URL=%@ 判定=%@",
+                              targetBundleId ?: @"(无)",
+                              originBundleId ?: @"(无)",
+                              launchOrigin ?: @"(无)",
+                              openURL.absoluteString ?: @"(无)",
+                              notificationLaunch ? @"通知" : @"非通知");
+    if (notificationLaunch) {
+        POExternalNotificationLog(@"  栈帧=%@", stackFrame ?: @"(未命中，靠 launchOrigin)");
+        POExternalNotificationLog(@"  options=%@", POExternalOptionsSummary(dictionary));
+    }
+
+    if (!notificationLaunch || !targetIsUserApp) {
+        return nil;
+    }
+    if (!POExternalNotificationClickFloatEnabled()) {
+        POExternalNotificationLog(@"[notify] 开关=关 ⇒ 放行原生打开 %@", targetBundleId);
+        return nil;
+    }
+    if (POExternalNotificationRouteDuplicate(targetBundleId)) {
+        return nil;
+    }
+    return [self notificationRoutedCompletionForTarget:targetBundleId
+                                     prepareSuspended:^BOOL{
+        return POExternalPrepareSuspendedOpenRequest(request);
+    }
+                                            completion:completion];
+}
+
+- (id)routeNotificationLaunchForTrustedApplication:(id)application
+                                           options:(id)options
+                                            origin:(id)origin
+                                            result:(id)result
+                                      routedResult:(id __autoreleasing *)routedResult {
+    if (routedResult) {
+        *routedResult = result;
+    }
+    if (!NSThread.isMainThread) {
+        return nil;
+    }
+
+    NSString *targetBundleId = [application isKindOfClass:[NSString class]]
+        ? application
+        : POExternalBundleIdentifier(application);
+    if (!POExternalIsUserApplicationBundleIdentifier(targetBundleId)) {
+        return nil;
+    }
+    NSURL *openURL = POExternalURLFromOptions(options);
+    if (POExternalIsValidURL(openURL)) {
+        return nil;
+    }
+
+    NSString *originBundleId = POExternalOriginBundleIdentifier(origin);
+    NSDictionary *dictionary = nil;
+    NSString *stackFrame = nil;
+    NSString *launchOrigin = nil;
+    BOOL notificationLaunch = POExternalIsNotificationLaunch(options,
+                                                             openURL,
+                                                             &dictionary,
+                                                             &stackFrame,
+                                                             &launchOrigin);
+
+    POExternalNotificationLog(@"[trusted] target=%@ 来源=%@ launchOrigin=%@ 判定=%@ 栈帧=%@",
+                              targetBundleId ?: @"(无)",
+                              originBundleId ?: @"(无)",
+                              launchOrigin ?: @"(无)",
+                              notificationLaunch ? @"通知" : @"非通知",
+                              stackFrame ?: @"(未命中)");
+    if (!notificationLaunch) {
+        return nil;
+    }
+    if (!POExternalNotificationClickFloatEnabled()) {
+        POExternalNotificationLog(@"[trusted] 开关=关 ⇒ 放行原生");
+        return nil;
+    }
+    if (POExternalNotificationRouteDuplicate(targetBundleId)) {
+        return nil;
+    }
+
+    // suspended 选项的写入交给下面的路由决策（只有真的接管才写）——
+    // 给 options 加上 suspended 之后 App 就不上前台了，提前写会污染原生路径。
+    __block id preparedOptions = nil;
+    id routedResultValue = [self notificationRoutedCompletionForTarget:targetBundleId
+                                                     prepareSuspended:^BOOL{
+        preparedOptions = POExternalOptionsByAddingActivateSuspended(options);
+        return preparedOptions != nil;
+    }
+                                                           completion:result];
+    if (!routedResultValue) {
+        return nil;
+    }
+    if (routedResult) {
+        *routedResult = routedResultValue;
+    }
+    return preparedOptions;
+}
+
+- (id)notificationRoutedCompletionForTarget:(NSString *)targetBundleId
+                          prepareSuspended:(BOOL (^)(void))prepareSuspended
+                                 completion:(id)completion {
+    ContextHostManager *manager = [ContextHostManager sharedInstance];
+    NSString *hostedBundleId = [ContextHostManager activeHostedBundleId];
+    POXWindow *pullOverWindow = (POXWindow *)[POXWindow sharedWindow];
+    PullOverViewController *controller = pullOverWindow.controller;
+    BOOL hostedRouteAvailable = manager.isForegroundLeaseActive &&
+        hostedBundleId.length > 0 && controller.isPanelActive;
+
+    // ── A. 浮窗正开着 → 换掉主窗里的 App（与「浮窗里点链接跳到别的 App」同一语义）
+    if (hostedRouteAvailable) {
+        if ([targetBundleId isEqualToString:hostedBundleId]) {
+            POExternalNotificationLog(@"目标就是当前浮窗里的 App ⇒ 不接管（避免内容重载）");
+            return nil;
+        }
+        if (!prepareSuspended()) {
+            POExternalNotificationLog(@"suspended 选项不可写 ⇒ 放行原生");
+            return nil;
+        }
+        NSUInteger hostGeneration = manager.activeLeaseGeneration;
+        NSUInteger routeGeneration = ++self.routeRequestGeneration;
+        NSString *sourceBundleId = [hostedBundleId copy];
+        POExternalOpenCompletion originalCompletion = completion;
+        POExternalOpenCompletion routedCompletion = ^(NSError *error) {
+            if (originalCompletion) {
+                originalCompletion(error);
+            }
+            if (error) {
+                POExternalNotificationLog(@"OpenApplication 失败（%@）⇒ 放弃接管", error.localizedDescription);
+                return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ContextHostManager *currentManager = [ContextHostManager sharedInstance];
+                NSString *currentHostedBundleId = [ContextHostManager activeHostedBundleId];
+                if (routeGeneration != self.routeRequestGeneration ||
+                    !currentManager.isForegroundLeaseActive ||
+                    currentManager.activeLeaseGeneration != hostGeneration ||
+                    ![currentHostedBundleId isEqualToString:sourceBundleId]) {
+                    return;
+                }
+                POXWindow *currentWindow = (POXWindow *)[POXWindow sharedWindow];
+                POExternalNotificationLog(@"浮窗换内容 → %@", targetBundleId);
+                [currentWindow.controller routeExternalApplicationInsidePullOver:targetBundleId];
+            });
+        };
+        return [routedCompletion copy];
+    }
+
+    // ── B. 浮窗关着 → 先以 suspended 起 App（不上前台，屏幕不会闪一下全屏），
+    //     OpenApplication 成功后由既有「外部激活」通道把浮窗打开并加载它。
+    if (!POExternalPullOverIsStableClosed()) {
+        POExternalNotificationLog(@"浮窗正在过渡/不空闲 ⇒ 放行原生");
+        return nil;
+    }
+    // 先占住在途标记，再写 suspended 选项 —— 写失败就立刻回滚，绝不污染原生路径
+    if (![self beginNativeRouteForTargetBundleId:targetBundleId sourceBundleId:@"notification"]) {
+        POExternalNotificationLog(@"已有一路接管在途 ⇒ 放行原生");
+        return nil;
+    }
+    if (!prepareSuspended()) {
+        [self finishNativeRouteForGeneration:self.nativeRouteGeneration];
+        POExternalNotificationLog(@"suspended 选项不可写 ⇒ 放行原生");
+        return nil;
+    }
+    NSUInteger nativeGeneration = self.nativeRouteGeneration;
+    POExternalOpenCompletion originalCompletion = completion;
+    POExternalOpenCompletion routedCompletion = ^(NSError *error) {
+        if (originalCompletion) {
+            originalCompletion(error);
+        }
+        [self completeNativeRouteForGeneration:nativeGeneration
+                                targetBundleId:targetBundleId
+                                         error:error];
+    };
+    POExternalNotificationLog(@"浮窗关着 ⇒ 起 App 后开浮窗加载 %@", targetBundleId);
+    return [routedCompletion copy];
 }
 
 @end

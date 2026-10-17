@@ -2617,7 +2617,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.7.3 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.7.4 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -3262,7 +3262,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorSettingsExpanded = NO;
 
     // 【0.6.10】其他选项折叠容器（默认收起）：双指呼出开关 / 圆盘大小滑杆 / 图标抓取开关
-    const CGFloat otherBoxHeight = 3.0 * 44.0 + 12.0;
+    const CGFloat otherBoxHeight = 4.0 * 44.0 + 12.0;   // 【0.7.4】3 → 4 行（新增「点通知进悬浮窗」开关）
     UIView *otherBox = [[UIView alloc] initWithFrame:CGRectMake(12.0, 0.0, width - 24.0, otherBoxHeight)];
     otherBox.hidden = YES;
     otherBox.userInteractionEnabled = YES;
@@ -3271,8 +3271,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [menuBox addSubview:otherBox];
     self.otherSettingsBox = otherBox;
 
-    NSArray<NSString *> *switchTitles = @[ @"双指贴边呼出（全屏 App 内必中）", @"抓取真实应用图标" ];
-    NSArray<NSString *> *switchKeys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons" ];
+    // 【0.7.4·P2】第 3 项 = 点通知进悬浮窗（默认开）
+    NSArray<NSString *> *switchTitles = @[ @"双指贴边呼出（全屏 App 内必中）", @"抓取真实应用图标", @"点通知进悬浮窗" ];
+    NSArray<NSString *> *switchKeys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons", @"mfNotificationClickFloat" ];
     for (NSUInteger index = 0; index < switchTitles.count; index++) {
         CGFloat rowY = (CGFloat)index * 44.0 + 6.0;
         UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(16.0, rowY, otherBox.bounds.size.width - 96.0, 32.0)];
@@ -3289,7 +3290,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
          forControlEvents:UIControlEventValueChanged];
         [otherBox addSubview:toggle];
     }
-    CGFloat radiusRowY = 2.0 * 44.0 + 6.0;
+    CGFloat radiusRowY = 3.0 * 44.0 + 6.0;   // 【0.7.4】前面多了 1 行开关
     UILabel *radiusName = [[UILabel alloc] initWithFrame:CGRectMake(16.0, radiusRowY, 96.0, 32.0)];
     radiusName.text = @"圆盘大小";
     radiusName.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
@@ -3476,7 +3477,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.7.3 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.7.4 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -4336,15 +4337,24 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     MFLog(@"[ring] 其他选项：%@", expand ? @"展开" : @"收起");
 }
 
-/// 其他选项开关：tag 1 = 双指贴边呼出（重启 SpringBoard 生效）；tag 2 = 抓取真实图标（下次打开生效）。
+/// 其他选项开关：tag 1 = 双指贴边呼出（重启 SpringBoard 生效）；tag 2 = 抓取真实图标（下次打开生效）；
+/// tag 3 = 点通知进悬浮窗（【0.7.4·P2】下一次点通知就生效，不用 Respring）。
 - (void)onEditorOtherSwitchChanged:(UISwitch *)switchView {
-    NSString *key = (switchView.tag == 1) ? @"mfRingTwoFingerSummon" : @"mfRingFetchIcons";
+    NSArray<NSString *> *keys = @[ @"mfRingTwoFingerSummon", @"mfRingFetchIcons", @"mfNotificationClickFloat" ];
+    NSArray<NSString *> *effects = @[ @"重启 SpringBoard 后生效",
+                                      @"下次打开编辑器/呼出生效",
+                                      @"下一次点通知就生效" ];
+    NSInteger index = switchView.tag - 1;
+    if (index < 0 || index >= (NSInteger)keys.count) {
+        return;
+    }
+    NSString *key = keys[(NSUInteger)index];
     [MFRingDefaults() setObject:@(switchView.on) forKey:key];
     [MFRingDefaults() synchronize];
     MFLog(@"[ring] 其他选项：%@ -> %@（%@）",
           key,
           switchView.on ? @"开" : @"关",
-          switchView.tag == 1 ? @"重启 SpringBoard 后生效" : @"下次打开编辑器/呼出生效");
+          effects[(NSUInteger)index]);
 }
 
 /// 圆盘大小滑杆（mfRingRadius）：下次呼出即生效（呼出时按配置半径重算几何）。
@@ -5385,7 +5395,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.7.3 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.7.4 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);

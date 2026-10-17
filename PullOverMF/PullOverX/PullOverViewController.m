@@ -1072,12 +1072,12 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.3 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.4 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.3 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.4 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2157,7 +2157,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             NSTimeInterval crossNow = CACurrentMediaTime();
             if ((crossNow - mfLastScaleCrossLogAt) >= 0.5) {
                 mfLastScaleCrossLogAt = crossNow;
-                MFLog(@"[card] 0.7.3 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
+                MFLog(@"[card] 0.7.4 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
                       manualScale);
             }
         } else if (manualScale > 0.0) {
@@ -3287,7 +3287,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.7.3 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.7.4 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 
     // 【0.7.2·P1】本版专有条幅：动画节奏 + 每帧开销收口（测试时看到这一行 = P1 已生效）
     MFLog(@"[card] 0.7.2 P1 已启用：统一动画节奏（MICRO 0.18 / QUICK 0.22 / SOFT 0.30 / BASE 0.32 / HERO 0.46，阻尼默认 0.82）"
@@ -3791,7 +3791,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
             [self mfUpdateVerticalHandleRailPosition];
         }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.3 %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.4 %@，阴影浮起 %.2f）",
           stripGrow ? @"贴片还原长大（实景，无图片快照）"
                     : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                                           : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
@@ -4257,7 +4257,7 @@ static CGFloat POPresentationAngleForOrientation(UIInterfaceOrientation orientat
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.3 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.4 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
