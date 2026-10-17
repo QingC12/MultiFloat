@@ -866,7 +866,96 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
     }
     [MFGeometryDefaults() setObject:@(clamped) forKey:MFMainCardScaleKey];
     [(NSUserDefaults *)MFGeometryDefaults() synchronize];
-    MFLog(@"[card] 0.7.9 主窗尺寸已记忆：%.2f（原 %.2f，全局唯一、不随应用变）", clamped, previous);
+    MFLog(@"[card] 0.7.10 主窗尺寸已记忆：%.2f（原 %.2f，全局唯一、不随应用变）", clamped, previous);
+}
+
+static NSString *const MFMainCardPositionXKey = @"mfMainCardPosX";   // 屏幕坐标（已扣掉 contentOffset，存屏幕值才不随滚动变）
+static NSString *const MFMainCardPositionYKey = @"mfMainCardPosY";
+
+/// 【0.7.10】主窗**位置**的全局记忆（用户 log70：尺寸已全局，位置还是按应用存 ⇒ 切换应用回默认位）。
+/// 与尺寸同一套思路：只有一个位置，存偏好，Respring/重启都不丢。
+///   · 用户拖动松手 / 停靠前 → 写这里；
+///   · 任何"打开浮窗"（普通打开 / 贴片还原）→ 读这里；
+///   · 位置按**屏幕坐标折算后**再存（内容坐标随 contentOffset 变，存屏幕值才稳）。
+-(BOOL)mfStoredMainCardPositionX:(CGFloat *)outX y:(CGFloat *)outY{
+    id storedX = [MFGeometryDefaults() objectForKey:MFMainCardPositionXKey];
+    id storedY = [MFGeometryDefaults() objectForKey:MFMainCardPositionYKey];
+    if (storedX == nil || storedY == nil) {
+        return NO;
+    }
+    CGFloat x = [storedX respondsToSelector:@selector(doubleValue)] ? (CGFloat)[storedX doubleValue] : NAN;
+    CGFloat y = [storedY respondsToSelector:@selector(doubleValue)] ? (CGFloat)[storedY doubleValue] : NAN;
+    if (!isfinite(x) || !isfinite(y)) {
+        return NO;
+    }
+    if (outX) {
+        *outX = x;
+    }
+    if (outY) {
+        *outY = y;
+    }
+    return YES;
+}
+
+/// 写全局位置记忆：存**屏幕坐标**（base frame 的左上角，已扣掉 contentOffset）。
+/// 停靠小窗的位置不是"主窗位置"，直接跳过（否则停靠一次就把主窗位置记到角落）。
+-(void)mfStoreMainCardPosition{
+    if (mfDockedSide != 0) {
+        return;
+    }
+    CGRect base = keyboardZoomBaseFrame;
+    if (CGRectIsEmpty(base)) {
+        return;
+    }
+    CGFloat screenX = CGRectGetMinX(base) - [self mfCardScrollOffsetX];
+    CGFloat screenY = CGRectGetMinY(base);
+    if (!isfinite(screenX) || !isfinite(screenY)) {
+        return;
+    }
+    CGFloat previousX = 0, previousY = 0;
+    BOOL hadPrevious = [self mfStoredMainCardPositionX:&previousX y:&previousY];
+    if (hadPrevious && fabs(previousX - screenX) <= 0.5 && fabs(previousY - screenY) <= 0.5) {
+        return;   // 没变就不写盘
+    }
+    [MFGeometryDefaults() setObject:@(screenX) forKey:MFMainCardPositionXKey];
+    [MFGeometryDefaults() setObject:@(screenY) forKey:MFMainCardPositionYKey];
+    [(NSUserDefaults *)MFGeometryDefaults() synchronize];
+    MFLog(@"[card] 0.7.10 主窗位置已记忆：屏(%.0f,%.0f)%@（全局唯一、不随应用变）",
+          screenX, screenY, hadPrevious ? @"" : @"（首次）");
+}
+
+/// 读全局位置并写回 keyboardZoomBaseFrame（钳进屏内，用当前档位的**视觉**尺寸算边界）。
+/// 返回是否真的应用了（没有记录 / 尺寸都没有 → NO）。
+-(BOOL)mfApplyStoredMainCardPosition{
+    CGFloat storedX = 0, storedY = 0;
+    if (![self mfStoredMainCardPositionX:&storedX y:&storedY]) {
+        return NO;
+    }
+    CGRect base = keyboardZoomBaseFrame;
+    if (CGRectIsEmpty(base)) {
+        return NO;
+    }
+    CGFloat screenW = CGRectGetWidth(self.view.bounds);
+    CGFloat screenH = CGRectGetHeight(self.view.bounds);
+    if (!(screenW > 0) || !(screenH > 0)) {
+        return NO;
+    }
+    CGFloat offsetX = [self mfCardScrollOffsetX];
+    CGFloat scale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
+    CGFloat visualW = CGRectGetWidth(base) * scale;
+    CGFloat visualH = CGRectGetHeight(base) * scale;
+    CGFloat minScreenX = [self mfCardScreenMinX];
+    CGFloat maxScreenX = MAX(minScreenX, screenW - CONTENT_EDGE_GAP - visualW);
+    CGFloat minScreenY = CONTENT_EDGE_GAP;
+    CGFloat maxScreenY = MAX(minScreenY, screenH - CONTENT_EDGE_GAP - visualH);
+    CGFloat screenX = MIN(MAX(storedX, minScreenX), maxScreenX);
+    CGFloat screenY = MIN(MAX(storedY, minScreenY), maxScreenY);
+    base.origin.x = screenX + offsetX;
+    base.origin.y = screenY;
+    keyboardZoomBaseFrame = base;
+    portraitHostedLandscapeHandleAnchorY = CGRectGetMaxY(base) + HANDLE_EDGE_GAP;
+    mfUserCardPositionPinned = YES;   // 布局 passe 不得把卡片拉回标准打开位
+    return YES;
 }
 
 -(CGFloat)mfMinCardScale{
@@ -1119,12 +1208,12 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
         return;
     }
     if (p.x < cardLeft - 4.0) {
-        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.9 贴片制）", p.x);
+        MFLog(@"[card] 左缘外点击（屏 %.0f）→ 停靠入左条（0.7.10 贴片制）", p.x);
         [self mfDockCardToStrip:NO];
         return;
     }
     if (p.x > cardRight + 4.0) {
-        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.9 贴片制）", p.x);
+        MFLog(@"[card] 右缘外点击（屏 %.0f）→ 停靠入右条（0.7.10 贴片制）", p.x);
         [self mfDockCardToStrip:YES];
         return;
     }
@@ -2204,7 +2293,7 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
             NSTimeInterval crossNow = CACurrentMediaTime();
             if ((crossNow - mfLastScaleCrossLogAt) >= 0.5) {
                 mfLastScaleCrossLogAt = crossNow;
-                MFLog(@"[card] 0.7.9 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
+                MFLog(@"[card] 0.7.10 缩放路过 1.0：拖拽中不按「回基准」改写（用户档位 %.2f 仍保留）",
                       manualScale);
             }
         } else if (manualScale > 0.0) {
@@ -2869,6 +2958,8 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
             mfUserCardScaleOverride = pendingHasScale ? pendingMainScale : 0;
             mfManualCardScaleLatched = pendingHasScale;
             keyboardZoomBaseFrame = pending.savedFrame;
+            // 【0.7.10】位置也是全局的：还原到"用户上次把主窗放在哪"，不按应用各记一份
+            [self mfApplyStoredMainCardPosition];
             [self applyLayoutPreservingHandlePosition:YES];
             MFLog(@"[strip] 预落位：%@ frame %.0fx%.0f scale %.2f（淡入前写回）",
                   pending.bundleId, CGRectGetWidth(pending.savedFrame),
@@ -2881,9 +2972,14 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
                 fabs(openMainScale - 1.0) > PO_CARD_SCALE_EPSILON;
             mfUserCardScaleOverride = openHasScale ? openMainScale : 0;
             mfManualCardScaleLatched = openHasScale;
-            if (openHasScale) {
+            // 【0.7.10】位置也全局：打开就落在用户上次拖到的地方（切换应用不跳回默认位）
+            BOOL openHasPosition = [self mfApplyStoredMainCardPosition];
+            if (openHasScale || openHasPosition) {
                 [self applyLayoutPreservingHandlePosition:YES];
-                MFLog(@"[card] 0.7.9 打开即用主窗记忆尺寸 %.2f（全局唯一）", openMainScale);
+                MFLog(@"[card] 0.7.10 打开即用主窗记忆：尺寸 %.2f（%@）位置 %@",
+                      openMainScale,
+                      openHasScale ? @"已应用" : @"默认",
+                      openHasPosition ? @"已恢复" : @"无记录");
             }
         }
         [self mfAnimateCardAppearIfNeeded];   // 【0.3.24】打开动画：卡片淡入 + 阴影浮起
@@ -3350,7 +3446,7 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
     [mfEdgeBandHost addSubview:mfDockedTapView];
     [self.view addSubview:mfEdgeBandHost];
     mfEdgeBandHost.hidden = YES;   // 卡片未打开前不参与 hitTest
-    MFLog(@"[card] 0.7.9 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
+    MFLog(@"[card] 0.7.10 卡外热区带已安装（左右=点按停靠/拖动移动 底=拖动移动+双击关闭 右下角+左下角=缩放 点贴片=与主窗互换 长按贴片=移除 多片实时保活）");
 
     // 【0.7.2·P1】本版专有条幅：动画节奏 + 每帧开销收口（测试时看到这一行 = P1 已生效）
     MFLog(@"[card] 0.7.2 P1 已启用：统一动画节奏（MICRO 0.18 / QUICK 0.22 / SOFT 0.30 / BASE 0.32 / HERO 0.46，阻尼默认 0.82）"
@@ -3362,6 +3458,9 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
     MFLog(@"[card] 0.7.9 已启用：主悬浮窗尺寸改成**全局唯一记忆**"
           "（不再按应用各记一份 ⇒ 切换应用不会在两种大小之间来回跳，也不会回默认大小）"
           "｜存偏好键 mfMainCardScale，Respring 不丢");
+    // 【0.7.10】本版专有条幅（看到这一行 = 本版已生效）
+    MFLog(@"[card] 0.7.10 已启用：主悬浮窗**位置**也改成全局唯一记忆"
+          "（拖动松手/停靠前写偏好键 mfMainCardPosX/Y，普通打开与贴片还原都读它 ⇒ 切换应用不回默认位）");
 }
 
 /// 【0.3.19】热区带跟随：按卡片"屏幕矩形"外扩 20pt 摆四条带，空隙（卡片本体）透传。
@@ -3858,7 +3957,7 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
             [self mfUpdateVerticalHandleRailPosition];
         }
     }];
-    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.9 %@，阴影浮起 %.2f）",
+    MFLog(@"[card] 打开动画：卡片淡入 0 → 1（0.7.10 %@，阴影浮起 %.2f）",
           stripGrow ? @"贴片还原长大（实景，无图片快照）"
                     : (stripRestoreBounce ? @"贴片还原 Q 弹 0.88→1.0"
                                           : (ringOpenPop ? @"圆盘打开 Q 弹 0.95→1.0" : @"纯淡入")),
@@ -4104,6 +4203,8 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
                   endTranslation.x, endTranslation.y,
                   endScreenX, CGRectGetMaxY(keyboardZoomBaseFrame));
             [self mfSettleCardPositionAnimated];   // 【0.3.24】越界部分弹簧弹回
+            // 【0.7.10】松手 = 用户摆位的终点 ⇒ 写全局位置记忆（下一版打开/切换应用都用它）
+            [self mfStoreMainCardPosition];
         }
         mfEdgeDragMode = 0;
         [self resetAutoNubTimer];
@@ -4324,7 +4425,7 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
 /// 实际落位见 mfSnapCardToSide:（平移 + 贴边锚缩放，否则满宽卡片下平移不可见）。
 -(void)mfCardSideTap:(UITapGestureRecognizer *)tap{
     BOOL toRight = tap.view.tag == MF_CARD_EDGE_HOTZONE_TAG_RIGHT;
-    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.9 贴片制）",
+    MFLog(@"[card] 侧边点击（%@侧） canDrag=%d → 停靠入%@条（0.7.10 贴片制）",
           toRight ? @"右" : @"左", [self mfCanDragCardEdgeNow], toRight ? @"右" : @"左");
     [self mfDockCardToStrip:toRight];
 }
@@ -4621,6 +4722,8 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
     w.iconImage = [POApplicationHelper imageForBundleId:bid];
     w.snapshotImage = [self mfCaptureCardContentSnapshotForBundleId:bid];
     BOOL live = [self mfArmLiveTileForWindow:w];   // 【0.6.3】先截快照再布防（布防不动租约，快照仍可用）
+    // 【0.7.10】停靠前先记下主窗位置（此刻 base frame 还是满尺寸卡片，不是 9:16 小窗）
+    [self mfStoreMainCardPosition];
     w.savedFrame = keyboardZoomBaseFrame;
     w.savedScale = (appliedCardScale > 0 && isfinite(appliedCardScale)) ? appliedCardScale : 1.0;
     w.side = toRight ? 1 : -1;
@@ -5062,6 +5165,8 @@ static NSString *const MFMainCardScaleKey = @"mfMainCardScale";
         mfDockedSide = 0;   // 回到满尺寸 = 不再是小窗
     }
     [self mfClampBaseFrameIntoScreenForScale:clamped];
+    // 【0.7.10】放大后钳位可能挪了原点 ⇒ 顺手更新全局位置记忆
+    [self mfStoreMainCardPosition];
     [self applyCardScaleTarget:clamped animated:animated source:POCardScaleTransitionSourceHandle];
     MFLog(@"[card] 缩放收尾：%.2f -> %.2f（范围 %.2f..%.2f，override=%.2f，记住=%d，停靠边=%ld）",
           current, clamped, minScale, maxScale, mfUserCardScaleOverride,

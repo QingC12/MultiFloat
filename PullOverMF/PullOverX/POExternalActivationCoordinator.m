@@ -1013,71 +1013,26 @@ static NSArray *POExternalNotificationDispatchers(void) {
     return candidates;
 }
 
-/// 每类只 dump 一次：沿**父类链**把这几个关键字的方法名全部打出来。
-/// 0.7.7 用 class_copyMethodList 只看本类 ⇒ 打出空列表（log68 行 83），是假象。
-static void POExternalDumpNotificationDispatcherSelectors(id dispatcher) {
-    if (!dispatcher) {
-        return;
-    }
-    static NSMutableSet<NSString *> *dumpedClasses = nil;
-    if (!dumpedClasses) {
-        dumpedClasses = [NSMutableSet set];
-    }
-    Class cls = object_getClass(dispatcher);
-    if (!cls) {
-        return;
-    }
-    NSString *className = NSStringFromClass(cls);
-    if (!className || [dumpedClasses containsObject:className]) {
-        return;
-    }
-    [dumpedClasses addObject:className];
+// ─────────────────────────────────────────────────────────────────────────────
+// 0.7.10 清通知：hub 化重做
+//
+// log70 实证（三次点通知，日志逐行对得上）：
+//   · UUID 已经取到了（2064220898762199564_2）⇒ 提取这一步不是问题；
+//   · `SBNCNotificationDispatcher` 自己只有 34 个方法：**没有** withdraw/remove/dismiss，
+//     也没有任何列表 API（`已试 [SBNCNotificationDispatcher列表(无)]`）；
+//   · 但它身上有 4 个 destination getter：bannerDestination / dashBoardDestination /
+//     notificationCenterDestination / carDestination ⇒ iOS 17 的通知请求**存在 destination 里**，
+//     不在 dispatcher 上。
+//   · TrollOpenJB 选择器表（iOS 17 实证存在）：withdrawNotificationRequest: /
+//     withdrawNotificationWithRequest: / dismissAllBannersAnimated:reason:（2 参）/
+//     dismissAllBannersInAllWindowScenesAnimated:reason: / bannerManager（getter）。
+//
+// 所以本版把 dispatcher 和它的 destination 一起当「hub」，逐个：能力地图 → 找请求 → withdraw；
+// **最后无论清没清掉都收一次横幅** —— 用户看到的就是"浮窗一起来、横幅立刻没了"，不再等系统 5 秒。
+// ─────────────────────────────────────────────────────────────────────────────
 
-    NSArray<NSString *> *keywords = @[@"ithdraw", @"ismiss", @"emove", @"lear",
-                                      @"equest", @"ection", @"ounce", @"estination"];
-    NSMutableArray<NSString *> *hits = [NSMutableArray array];
-    NSMutableArray<NSString *> *chain = [NSMutableArray array];
-    NSInteger total = 0;
-    Class current = cls;
-    NSInteger level = 0;
-    while (current && current != [NSObject class] && level < 8) {
-        [chain addObject:NSStringFromClass(current)];
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(current, &count);
-        total += (NSInteger)count;
-        for (unsigned int index = 0; index < count; index++) {
-            NSString *name = NSStringFromSelector(method_getName(methods[index]));
-            if (name.length == 0) {
-                continue;
-            }
-            for (NSString *keyword in keywords) {
-                if ([name rangeOfString:keyword].location != NSNotFound) {
-                    if (hits.count < 40 && ![hits containsObject:name]) {
-                        [hits addObject:name];
-                    }
-                    break;
-                }
-            }
-        }
-        if (methods) {
-            free(methods);
-        }
-        current = class_getSuperclass(current);
-        level += 1;
-    }
-    NSString *joined = [hits componentsJoinedByString:@", "];
-    if (joined.length > 1100) {
-        joined = [[joined substringToIndex:1100] stringByAppendingString:@"…"];
-    }
-    POExternalNotificationDismissLog(@"清除通知·API 地图：类=%@ 链=[%@] 本链方法 %ld 个｜相关方法 [%@]",
-                                     className,
-                                     [chain componentsJoinedByString:@" ← "],
-                                     (long)total,
-                                     joined.length > 0 ? joined : @"(空)");
-}
-
-/// 从一个 dispatcher 上收集该 App 名下的通知请求。返回 nil = 一个列表 selector 都没有。
-/// 第二个出参 sectionScoped 表示「列表已按 bundleId 收窄」（决定能不能用「只剩一条」兜底）。
+/// 从一个 hub 上收集该 App 名下的通知请求（老路，保住"系统真给了列表 API"的版本）。
+/// 返回 nil = 一个列表 selector 都没有。出参 sectionScoped 表示列表已按 bundleId 收窄。
 static NSArray *POExternalCollectNotificationRequests(id dispatcher,
                                                       NSString *bundleId,
                                                       BOOL *sectionScoped,
@@ -1157,144 +1112,436 @@ static NSArray *POExternalCollectNotificationRequests(id dispatcher,
     return collected.count > 0 ? collected : nil;
 }
 
-/// 调 dispatcher 上的清除方法，返回实际生效的 selector 名（没成功返回 nil）。
-static NSString *POExternalInvokeNotificationClear(id dispatcher, id request) {
-    for (NSString *name in @[@"withdrawNotificationRequest:", @"dismissNotificationRequest:",
-                             @"removeNotificationRequest:", @"clearNotificationRequest:"]) {
-        SEL selector = NSSelectorFromString(name);
-        if (![dispatcher respondsToSelector:selector]) {
+/// respondsToSelector 守门（Class 与实例都能用），异常也吞掉。
+static BOOL POExternalHubResponds(id hub, NSString *selectorName) {
+    if (!hub || selectorName.length == 0) {
+        return NO;
+    }
+    @try {
+        return [hub respondsToSelector:NSSelectorFromString(selectorName)];
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
+}
+
+/// 本类链上「跟清除相关」的方法名（只用于日志诊断，不用来做存在性判断）。
+/// ★ 能力判断一律用 POExternalHubResponds（它天然沿父类链），
+///   class_copyMethodList 只看本类 —— log68 / log70 两次都被它骗过。
+static NSString *POExternalNotificationRelevantMethods(id hub) {
+    if (!hub) {
+        return @"(空)";
+    }
+    NSArray<NSString *> *keywords = @[@"ithdraw", @"ismiss", @"emove", @"lear",
+                                      @"equest", @"ection", @"ounce", @"estination"];
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    Class current = object_getClass(hub);
+    NSInteger level = 0;
+    while (current && current != [NSObject class] && level < 8) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(current, &count);
+        for (unsigned int index = 0; index < count; index++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[index]));
+            if (name.length == 0) {
+                continue;
+            }
+            for (NSString *keyword in keywords) {
+                if ([name rangeOfString:keyword].location != NSNotFound) {
+                    if (hits.count < 26 && ![hits containsObject:name]) {
+                        [hits addObject:name];
+                    }
+                    break;
+                }
+            }
+        }
+        if (methods) {
+            free(methods);
+        }
+        current = class_getSuperclass(current);
+        level += 1;
+    }
+    NSString *joined = [hits componentsJoinedByString:@","];
+    if (joined.length > 760) {
+        joined = [[joined substringToIndex:760] stringByAppendingString:@"…"];
+    }
+    return joined.length > 0 ? joined : @"(空)";
+}
+
+/// 每个类每会话一行「能力地图」：类名 + 关键能力 + 本类链相关方法名。
+/// 这行是「还没清掉」时唯一需要看的东西 —— 下次照它给出的类名/方法名直接改，不用再猜。
+static void POExternalDumpNotificationHubAPI(id hub, NSString *role) {
+    if (!hub) {
+        return;
+    }
+    static NSMutableSet<NSString *> *dumpedKeys = nil;
+    if (!dumpedKeys) {
+        dumpedKeys = [NSMutableSet set];
+    }
+    Class cls = object_getClass(hub);
+    NSString *className = cls ? NSStringFromClass(cls) : @"?";
+    NSString *key = [NSString stringWithFormat:@"%@|%@", role ?: @"?", className];
+    if ([dumpedKeys containsObject:key]) {
+        return;
+    }
+    [dumpedKeys addObject:key];
+    POExternalNotificationDismissLog(
+        @"清除通知·能力地图 %@：类=%@｜withdraw=%@ dismissBanners=%@ bannerManager=%@｜相关方法 [%@]",
+        role ?: @"?", className,
+        POExternalHubResponds(hub, @"withdrawNotificationRequest:") ? @"有" : @"无",
+        POExternalHubResponds(hub, @"dismissAllBannersAnimated:reason:") ? @"有" : @"无",
+        POExternalHubResponds(hub, @"bannerManager") ? @"有" : @"无",
+        POExternalNotificationRelevantMethods(hub));
+}
+
+/// dispatcher 上的通知目的地。log70 的 API 地图实证这 4 个 getter 就在 dispatcher 自己身上。
+/// ★ 故意不收 carDestination（CarPlay 未连接时去动它有撞断言的历史）。
+static NSArray *POExternalNotificationDestinations(id dispatcher) {
+    NSMutableArray *result = [NSMutableArray array];
+    if (!dispatcher) {
+        return result;
+    }
+    for (NSString *name in @[@"bannerDestination", @"dashBoardDestination",
+                             @"notificationCenterDestination"]) {
+        if (!POExternalHubResponds(dispatcher, name)) {
             continue;
         }
-        @try {
-            ((void (*)(id, SEL, id))objc_msgSend)(dispatcher, selector, request);
-            return name;
-        } @catch (NSException *exception) {
-            POExternalNotificationDismissLog(@"清除通知：%@ 抛异常（%@）⇒ 试下一个", name, exception.reason);
+        id value = POExternalReadObject(dispatcher, NSSelectorFromString(name));
+        if (value && ![result containsObject:value]) {
+            [result addObject:value];
+        }
+    }
+    return result;
+}
+
+/// 在 hub 的对象图里收「类名含 NotificationRequest」的实例（最多 8 个）。
+/// 与旧的 finder 同一套安全闸：容器随便走，普通对象的 ivar 只在前几层深挖
+/// （深层 assign/unsafe_unretained 成员可能是野指针，object_getIvar 读它就是 EXC_BAD_ACCESS）。
+static void POExternalCollectRequestsInHub(id object, NSInteger depth,
+                                           POExternalGraphScanContext *context,
+                                           NSMutableArray *out) {
+    if (!object || depth < 0 || out.count >= 8 || POExternalGraphScanExhausted(context)) {
+        return;
+    }
+    if ([object isKindOfClass:[NSString class]] || [object isKindOfClass:[NSNumber class]] ||
+        [object isKindOfClass:[NSNull class]] || [object isKindOfClass:[NSData class]]) {
+        return;
+    }
+
+    Class cls = object_getClass(object);
+    NSString *className = cls ? NSStringFromClass(cls) : @"";
+    if ([className rangeOfString:@"NotificationRequest"].location != NSNotFound) {
+        if (![out containsObject:object]) {
+            [out addObject:object];
+        }
+        return;
+    }
+
+    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)object];
+    if ([context->visited containsObject:key]) {
+        return;
+    }
+    [context->visited addObject:key];
+    context->budget -= 1;
+
+    if ([object isKindOfClass:[NSDictionary class]] || [object isKindOfClass:[NSArray class]] ||
+        [object isKindOfClass:[NSSet class]]) {
+        id children = [object isKindOfClass:[NSDictionary class]]
+            ? [(NSDictionary *)object allValues]
+            : object;
+        for (id value in children) {
+            POExternalCollectRequestsInHub(value, depth - 1, context, out);
+            if (out.count >= 8 || POExternalGraphScanExhausted(context)) {
+                return;
+            }
+        }
+        return;
+    }
+
+    if (depth < 3) {
+        return;
+    }
+
+    Class current = cls;
+    NSInteger level = 0;
+    while (current && current != [NSObject class] && level < 7) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(current, &count);
+        for (unsigned int index = 0; index < count; index++) {
+            const char *encoding = ivar_getTypeEncoding(ivars[index]);
+            if (!encoding || encoding[0] != '@') {
+                continue;
+            }
+            id value = nil;
+            @try {
+                value = object_getIvar(object, ivars[index]);
+            } @catch (__unused NSException *exception) {
+                value = nil;
+            }
+            if (!value) {
+                continue;
+            }
+            POExternalCollectRequestsInHub(value, depth - 1, context, out);
+            if (out.count >= 8 || POExternalGraphScanExhausted(context)) {
+                break;
+            }
+        }
+        if (ivars) {
+            free(ivars);
+        }
+        current = class_getSuperclass(current);
+        level += 1;
+    }
+}
+
+/// 通知请求归属的 section（一般等于 bundleId）。只读、无参、respondsToSelector 守门。
+static NSString *POExternalSectionOfNotificationRequest(id request) {
+    if (!request) {
+        return nil;
+    }
+    for (NSString *name in @[@"sectionIdentifier", @"sectionID", @"bundleIdentifier"]) {
+        id value = POExternalReadObject(request, NSSelectorFromString(name));
+        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+            return value;
+        }
+    }
+    id section = POExternalReadObject(request, NSSelectorFromString(@"section"));
+    if (section) {
+        for (NSString *name in @[@"sectionIdentifier", @"identifier"]) {
+            id value = POExternalReadObject(section, NSSelectorFromString(name));
+            if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+                return value;
+            }
         }
     }
     return nil;
 }
 
-/// 清成功后收横幅：只调**无参**的 dismissAllBanners，别的一概不猜。
-/// 有些系统的 banner 源在清通知后仍挂 1~2 秒，主动收一次更贴合「点开就没了」的预期。
-static void POExternalCollapseNotificationBanners(void) {
-    Class bannerManagerClass = NSClassFromString(@"SBBannerManager");
-    if (!bannerManagerClass) {
-        return;
+/// 在某一个 hub 上请求撤销这条通知。返回真正生效的 selector 名（没成功返回 nil）。
+static NSString *POExternalInvokeNotificationWithdraw(id hub, id request) {
+    if (!hub || !request) {
+        return nil;
     }
-    id manager = nil;
-    for (NSString *name in @[@"sharedInstance", @"sharedManager", @"bannerManager"]) {
-        SEL selector = NSSelectorFromString(name);
-        if (![bannerManagerClass respondsToSelector:selector]) {
+    for (NSString *name in @[@"withdrawNotificationRequest:", @"withdrawNotificationWithRequest:",
+                             @"removeNotificationRequest:", @"dismissNotificationRequest:"]) {
+        if (!POExternalHubResponds(hub, name)) {
             continue;
         }
         @try {
-            manager = ((id (*)(id, SEL))objc_msgSend)(bannerManagerClass, selector);
-        } @catch (__unused NSException *exception) {
-            manager = nil;
+            ((void (*)(id, SEL, id))objc_msgSend)(hub, NSSelectorFromString(name), request);
+            return name;
+        } @catch (NSException *exception) {
+            POExternalNotificationDismissLog(@"清除通知：%@ %@ 抛异常（%@）⇒ 试下一个",
+                                             NSStringFromClass(object_getClass(hub)), name,
+                                             exception.reason ?: @"?");
         }
-        if (manager) {
-            break;
-        }
     }
-    if (!manager) {
-        return;
-    }
-    SEL dismiss = NSSelectorFromString(@"dismissAllBanners");
-    if (![manager respondsToSelector:dismiss]) {
-        return;
-    }
-    @try {
-        ((void (*)(id, SEL))objc_msgSend)(manager, dismiss);
-        POExternalNotificationDismissLog(@"清除通知：已收起通知横幅（SBBannerManager -dismissAllBanners）");
-    } @catch (NSException *exception) {
-        POExternalNotificationDismissLog(@"清除通知：收横幅抛异常（%@）", exception.reason);
-    }
+    return nil;
 }
 
-/// 按 UUID 清掉一条已投递的通知。**拿不到就什么都不做**。
+/// 收起横幅：hub 自己 + 它的 bannerManager 都试一遍。
+/// 依据（TrollOpenJB 选择器表）：dismissAllBannersAnimated:reason: 是 **2 参**方法，
+/// 第二个参数在不同系统版本可能是 NSString(reason) 也可能是整数枚举 —— 传字符串在两种签名下都安全；
+/// 若只响应无参的 dismissAllBanners，就走无参版本。
+static BOOL POExternalDismissBannersOnHub(id hub, NSString *role) {
+    if (!hub) {
+        return NO;
+    }
+    NSMutableArray *targets = [NSMutableArray array];
+    if (POExternalHubResponds(hub, @"bannerManager")) {
+        id manager = POExternalReadObject(hub, NSSelectorFromString(@"bannerManager"));
+        if (manager) {
+            [targets addObject:manager];
+        }
+    }
+    [targets addObject:hub];
+
+    for (id target in targets) {
+        for (NSString *name in @[@"dismissAllBannersAnimated:reason:",
+                                 @"dismissAllBannersInAllWindowScenesAnimated:reason:",
+                                 @"dismissAllBanners"]) {
+            if (!POExternalHubResponds(target, name)) {
+                continue;
+            }
+            @try {
+                if ([name rangeOfString:@"reason:"].location != NSNotFound) {
+                    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(target, NSSelectorFromString(name),
+                                                               YES, @"Wisp 点通知进浮窗");
+                } else {
+                    ((void (*)(id, SEL))objc_msgSend)(target, NSSelectorFromString(name));
+                }
+                POExternalNotificationDismissLog(@"清除通知：已收起横幅（%@ %@ %@）",
+                                                 role ?: @"?", NSStringFromClass(object_getClass(target)),
+                                                 name);
+                return YES;
+            } @catch (NSException *exception) {
+                POExternalNotificationDismissLog(@"清除通知：收横幅 %@ 抛异常（%@）",
+                                                 name, exception.reason ?: @"?");
+            }
+        }
+    }
+    return NO;
+}
+
+/// 跨 hub 收横幅：先走 bannerDestination（就是正在显示的那条横幅的宿主），再走类单例兜底。
+static BOOL POExternalCollapseNotificationBanners(NSArray *hubs) {
+    for (NSDictionary *item in hubs) {
+        if (POExternalDismissBannersOnHub(item[@"hub"], item[@"role"])) {
+            return YES;
+        }
+    }
+    for (NSString *className in @[@"SBBannerManager", @"BNBannerManager",
+                                  @"SBUIBannerManager", @"SBUIBannerController"]) {
+        Class cls = NSClassFromString(className);
+        if (!cls) {
+            continue;
+        }
+        for (NSString *sharedName in @[@"sharedInstance", @"sharedManager", @"bannerManager"]) {
+            if (!POExternalHubResponds(cls, sharedName)) {
+                continue;
+            }
+            id manager = nil;
+            @try {
+                manager = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(sharedName));
+            } @catch (__unused NSException *exception) {
+                manager = nil;
+            }
+            if (!manager) {
+                continue;
+            }
+            if (POExternalDismissBannersOnHub(manager, className)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL POExternalHubListContains(NSArray *items, id hub) {
+    for (NSDictionary *item in items) {
+        if (item[@"hub"] == hub) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// 按 UUID 清掉一条已投递的通知，并**无论成败都收一次横幅**。
+/// ★ 安全边界（与 0.7.7 一致）：只清「UUID 匹配」或「同一 section 且仅此一条」的那条；
+///   匹配不上就一条都不动，绝不按「全系统只剩一条」乱删。
 static void POExternalDismissDeliveredNotification(NSString *bundleId, NSString *identifier) {
     @try {
         NSArray *dispatchers = POExternalNotificationDispatchers();
         if (dispatchers.count == 0) {
             POExternalNotificationDismissLog(@"清除通知：拿不到 notificationDispatcher（放弃，不影响开窗）");
+            POExternalCollapseNotificationBanners(nil);
             return;
         }
-        NSMutableArray<NSString *> *triedNotes = [NSMutableArray array];
-        for (id dispatcher in dispatchers) {
-            POExternalDumpNotificationDispatcherSelectors(dispatcher);
 
+        // hub 清单：dispatcher + 它的 banner / dashBoard / notificationCenter destination
+        NSMutableArray *hubs = [NSMutableArray array];
+        for (id dispatcher in dispatchers) {
+            if (!POExternalHubListContains(hubs, dispatcher)) {
+                [hubs addObject:@{ @"hub": dispatcher, @"role": @"dispatcher" }];
+            }
+            for (id destination in POExternalNotificationDestinations(dispatcher)) {
+                if (!POExternalHubListContains(hubs, destination)) {
+                    [hubs addObject:@{ @"hub": destination,
+                                       @"role": NSStringFromClass(object_getClass(destination)) ?: @"destination" }];
+                }
+            }
+        }
+
+        NSMutableArray<NSString *> *triedNotes = [NSMutableArray array];
+        CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+        NSInteger clearedCount = 0;
+
+        for (NSDictionary *item in hubs) {
+            if (CFAbsoluteTimeGetCurrent() - startedAt > 0.35) {
+                [triedNotes addObject:@"(扫描超时，余下 hub 跳过)"];
+                break;
+            }
+            id hub = item[@"hub"];
+            NSString *role = item[@"role"];
+            POExternalDumpNotificationHubAPI(hub, role);
+
+            // ① 老路：hub 上直接有「按 section 列请求」的 API（dispatcher 上没有，destination 上偶有）
             BOOL sectionScoped = NO;
             NSString *usedSelector = nil;
-            NSArray *requests = POExternalCollectNotificationRequests(dispatcher, bundleId,
-                                                                     &sectionScoped, &usedSelector);
-            [triedNotes addObject:[NSString stringWithFormat:@"%@列表%@",
-                                   NSStringFromClass(object_getClass(dispatcher)),
-                                   usedSelector ?: @"(无)"]];
-            if (requests.count == 0) {
+            NSArray *listed = POExternalCollectNotificationRequests(hub, bundleId,
+                                                                   &sectionScoped, &usedSelector);
+            if (usedSelector.length > 0) {
+                [triedNotes addObject:[NSString stringWithFormat:@"%@列表(%@ %lu 条)",
+                                       role, usedSelector, (unsigned long)listed.count]];
+            }
+
+            // ② 新路：在 hub 的对象图里找 NCNotificationRequest（destination 才是真正持有者）
+            NSMutableArray *found = [NSMutableArray array];
+            if (listed.count > 0) {
+                [found addObjectsFromArray:listed];
+            }
+            POExternalGraphScanContext context;
+            POExternalGraphScanInit(&context, 700, 14.0);
+            POExternalCollectRequestsInHub(hub, 6, &context, found);
+            if (found.count == 0) {
                 continue;
             }
 
+            // 按 UUID 匹配（最准）
             id target = nil;
             if (identifier.length > 0) {
-                for (id request in requests) {
-                    NSString *candidate = POExternalIdentifierOfNotificationRequest(request);
-                    if ([candidate isEqualToString:identifier]) {
+                for (id request in found) {
+                    if ([POExternalIdentifierOfNotificationRequest(request) isEqualToString:identifier]) {
                         target = request;
                         break;
                     }
                 }
             }
-            // 兜底：UUID 没取到，但该 App 名下只剩一条 ⇒ 就是刚点的那条。
-            // ★ 只在 sectionScoped 成立时用：全系统列表里「只剩一条」可能是别的 App 的通知。
-            if (!target && sectionScoped && identifier.length == 0 && requests.count == 1) {
-                target = requests.firstObject;
+            // 兜底：该 App 名下（section == bundleId）恰好只剩一条 ⇒ 就是刚点的那条
+            if (!target && bundleId.length > 0) {
+                NSMutableArray *sameBundle = [NSMutableArray array];
+                for (id request in found) {
+                    if ([POExternalSectionOfNotificationRequest(request) isEqualToString:bundleId]) {
+                        [sameBundle addObject:request];
+                    }
+                }
+                if (sameBundle.count == 1) {
+                    target = sameBundle.firstObject;
+                }
             }
             if (!target) {
-                [triedNotes addObject:[NSString stringWithFormat:@"%@共 %lu 条但未匹配",
-                                       usedSelector ?: @"列表",
-                                       (unsigned long)requests.count]];
+                [triedNotes addObject:[NSString stringWithFormat:@"%@对象图 %lu 条未匹配",
+                                       role, (unsigned long)found.count]];
                 continue;
             }
 
-            NSString *clearSelector = POExternalInvokeNotificationClear(dispatcher, target);
+            NSString *clearSelector = POExternalInvokeNotificationWithdraw(hub, target);
             if (!clearSelector) {
-                POExternalNotificationDismissLog(@"清除通知：%@ 上没有可用的清除方法（withdraw/dismiss/remove/clear 都不响应）",
-                                                 NSStringFromClass(object_getClass(dispatcher)));
+                [triedNotes addObject:[NSString stringWithFormat:@"%@ 无 withdraw 方法", role]];
                 continue;
             }
+            clearedCount += 1;
             POExternalNotificationDismissLog(@"清除通知：已清除 %@ 的 1 条（UUID=%@，%@ %@）",
                                              bundleId,
-                                             identifier.length > 0 ? identifier : @"(按唯一一条兜底)",
-                                             NSStringFromClass(object_getClass(dispatcher)),
-                                             clearSelector);
-            POExternalCollapseNotificationBanners();
-            return;
-        }
+                                             identifier.length > 0 ? identifier : @"(该 App 唯一一条)",
+                                             role, clearSelector);
 
-        // ── 最后兜底：在 dispatcher 对象图里直接找 uuid 匹配的 NCNotificationRequest ──
-        if (identifier.length > 0) {
+            // dispatcher 上也补一刀（各 destination 各持一份，dispatcher 是总闸）
             for (id dispatcher in dispatchers) {
-                POExternalGraphScanContext context;
-                POExternalGraphScanInit(&context, 900, 30.0);
-                id request = POExternalGraphFindNotificationRequest(dispatcher, identifier, 6, &context);
-                if (!request) {
+                if (dispatcher == hub) {
                     continue;
                 }
-                NSString *clearSelector = POExternalInvokeNotificationClear(dispatcher, request);
-                if (clearSelector) {
-                    POExternalNotificationDismissLog(@"清除通知：已清除 %@ 的 1 条（对象图兜底，%@ %@）",
-                                                     bundleId, NSStringFromClass(object_getClass(dispatcher)),
-                                                     clearSelector);
-                    POExternalCollapseNotificationBanners();
-                    return;
-                }
+                POExternalInvokeNotificationWithdraw(dispatcher, target);
             }
         }
 
-        POExternalNotificationDismissLog(@"清除通知：全部路径未命中（UUID=%@，已试 [%@]）",
+        BOOL collapsed = POExternalCollapseNotificationBanners(hubs);
+        if (clearedCount > 0) {
+            // 已经清掉 → 横幅那层由清除动作自己收掉；这里补一次只为"点开就没"的观感
+            return;
+        }
+        POExternalNotificationDismissLog(@"清除通知：全部路径未命中（UUID=%@，已试 [%@]）横幅=%@",
                                          identifier.length > 0 ? identifier : @"(无)",
-                                         [triedNotes componentsJoinedByString:@" ｜ "]);
+                                         [triedNotes componentsJoinedByString:@" ｜ "],
+                                         collapsed ? @"已收" : @"未收");
     } @catch (NSException *exception) {
         POExternalNotificationDismissLog(@"清除通知异常：%@", exception.reason);
     }
@@ -1358,7 +1605,7 @@ static void POExternalScheduleDismissDeliveredNotification(NSString *bundleId, N
     dispatch_once(&onceToken, ^{
         sharedInstance = [POExternalActivationCoordinator new];
         MFLog(@"[notify] 0.7.4 P2 已启用：点通知 → 悬浮窗"
-              "（开关 mfNotificationClickFloat 默认开；0.7.9 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
+              "（开关 mfNotificationClickFloat 默认开；0.7.10 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
               "二级页里可选「全部应用」或「仅选中的应用」）"
               "｜识别 = launchOrigin 含 notification/bulletin/banner，或调用栈命中 NCNotification/SBNotification/Banner");
         MFLog(@"[notify] 0.7.7 已启用：点通知进浮窗后自动清除该条通知（标已读）"
@@ -1367,8 +1614,10 @@ static void POExternalScheduleDismissDeliveredNotification(NSString *bundleId, N
         MFLog(@"[notify] 0.7.8 已启用：清通知改成多路径（UUID 三路提取 + 沿父类链找 API + 对象图兜底 + 收横幅）"
               "｜上一版只试一条 notificationResponse 链、dump 又只看本类方法，所以两次都空转");
         // 【0.7.9】本版专有条幅（看到这一行 = 本版已生效）
+        MFLog(@"[notify] 0.7.10 已启用：清通知改「dispatcher + destination」双 hub 扫描 + 横幅立刻收"
+              "（0.7.10 只在 dispatcher 上找列表，而 iOS 17 的请求存在 destination 里 ⇒ 三次全落空）");
         MFLog(@"[notify] 0.7.9 已启用：点通知恢复（UUID 提取移出主链路 + 全链路异常闸）"
-              "｜0.7.9 在打日志阶段就取 UUID，取异常抛出去把整条 open 请求打死 ⇒ 点了没反应、全屏也不开");
+              "｜0.7.10 在打日志阶段就取 UUID，取异常抛出去把整条 open 请求打死 ⇒ 点了没反应、全屏也不开");
     });
     return sharedInstance;
 }
