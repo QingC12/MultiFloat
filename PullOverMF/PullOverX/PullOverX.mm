@@ -1370,7 +1370,20 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     //    POCaptureCompat.plist。本文件（主 dylib）依旧只注入 SpringBoard，
     //    **一行新 hook 都没加**（前期"不要多个 hook，确保不卡开机"的要求继续满足）。
     //  取证工具：`.workbuddy-ai/tmp/probe_undef.py <deb>` 列未定义符号并标出加载期绑定的全局量。
-    MFLogRawC("=== PullOverMF 0.6.22 加载（SpringBoard）===");
+    MFLogRawC("=== PullOverMF 0.7.0 加载（SpringBoard）===");
+
+    // ===== 【0.7.0 · P0 诊断】启动阶段心跳 =====
+    //  背景：用户报「每次注销后先触发安全模式」。要定因必须先知道崩在哪一段。
+    //  机制：MFLogRawC 用 setvbuf(_IONBF) 无缓冲 ⇒ 每行立即落盘，崩溃不会吞掉最后一条。
+    //  用法：日志里**连阶段 1 都没有** = dyld 加载期崩溃（跟本文件逻辑无关）；
+    //        日志停在阶段 N = 崩点在阶段 N 与 N+1 之间。
+    //  行为零变化（只写日志），可长期保留。
+    {
+        char bootLine[192];
+        snprintf(bootLine, sizeof(bootLine),
+                 "[boot] 0.7.0 阶段 1/8：constructor 已进入（pid=%d）", (int)getpid());
+        MFLogRawC(bootLine);
+    }
 
     // 【MF 0.1.3】Stheno 风格圆盘选择器：延迟 2 秒安装（等屏幕就绪）。
     // 零 hook；安装失败只损失圆盘，不影响浮窗与手柄。
@@ -1405,6 +1418,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     //          任意位置 跟随/停靠/悬停/松手）+ 恢复跟随 + 松手必关圆盘（见 MFRingPicker.m）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        MFLog(@"[boot] 0.7.0 阶段 8/8：圆盘安装回调进入（2 秒延迟已到）");
         MFRingPickerInstall();
     });
 
@@ -1413,9 +1427,18 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
     //  · 0.2.7 新增 SBSystemGestureManager 系统边缘手势（triggr 实证路线，全屏 App 内有效）。
     // 共用同一"崩溃自解除"：任何手势 hook 注册前立标记，存活 20 秒自动撤；
     // 下次启动见标记则本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）。
+
+    {
+        char bootLine[224];
+        snprintf(bootLine, sizeof(bootLine),
+                 "[boot] 0.7.0 阶段 2/8：进入手势注册段（崩溃标记=%s，pid=%d）",
+                 POPosixFileExists(kPOGestureGuardPath) ? "存在-上次启动20秒内崩过" : "不存在",
+                 (int)getpid());
+        MFLogRawC(bootLine);
+    }
     {
         if (POPosixFileExists(kPOGestureGuardPath)) {
-            MFLogRawC("PullOverMF 0.6.22: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
+            MFLogRawC("PullOverMF 0.7.0: 检测到手势 hook 崩溃标记 -> 本轮不注册（删除 /var/mobile/PullOverMF.gestureguard 可重试）");
         } else {
             int registered = 0;
             char summary[384];
@@ -1450,7 +1473,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                 }
             }
             if (registered == 0) {
-                MFLogRawC("PullOverMF 0.6.22: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
+                MFLogRawC("PullOverMF 0.7.0: Stheno 候选手势类全部不存在（预期内）-> 走 SBSystemGestureManager 边缘手势路线");
             }
 
             // —— ② 0.2.7 注册 / 0.2.8 完整驱动：SBSystemGestureManager 系统边缘手势（triggr 实证 iOS 15~18）——
@@ -1485,9 +1508,10 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
             }
 
             if (registered > 0) {
+                MFLogRawC("[boot] 0.7.0 阶段 3/8：手势 hook 注册分支已进入");
                 char line[512];
                 snprintf(line, sizeof(line),
-                         "PullOverMF 0.6.22: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
+                         "PullOverMF 0.7.0: 手势 hook 已注册 %d 个（崩溃自解除已布防）: %s",
                          registered, (summaryLen > 0 ? summary : "SBSystemGestureManager 边缘手势"));
                 MFLogRawC(line);
                 POPosixWriteFile(kPOGestureGuardPath);
@@ -1502,17 +1526,25 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                     MFRingInstallEdgePanGesture();
                 });
             } else {
-                MFLogRawC("PullOverMF 0.6.22: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
+                MFLogRawC("PullOverMF 0.7.0: 手势 hook 目标全部不存在 -> 不注册（系统手势原样放行）");
             }
         }
     }
 
+    MFLogRawC("[boot] 0.7.0 阶段 4/8：手势段结束，开始相机授权/设置读取");
     POSetCameraForegroundGrantBundleIdentifier(nil);
     if (POSettingsEnabled([POApplicationHelper settings])) {
         PORegisterScreenBlankObserver();
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, POSettingsDidChange,
                                         kPOSettingsChangedNotification, NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
+    }
+    {
+        char bootLine[176];
+        snprintf(bootLine, sizeof(bootLine),
+                 "[boot] 0.7.0 阶段 5/8：相机授权+设置读取完成，开始场景类 hook（pid=%d）",
+                 (int)getpid());
+        MFLogRawC(bootLine);
     }
     {
         Class sceneManagerClass = objc_getClass("FBSceneManager");
@@ -1561,6 +1593,7 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                             (IMP)&_logos_method$_ungrouped$UIMutableApplicationSceneSettings$setBackgrounded$,
                             (IMP *)&_logos_orig$_ungrouped$UIMutableApplicationSceneSettings$setBackgrounded$);
         }
+        MFLogRawC("[boot] 0.7.0 阶段 6/8：场景类 hook 段完成，开始 SBMainWorkspace 段");
         Class mainWorkspaceClass = objc_getClass("SBMainWorkspace");
         SEL handleOpenSelector = NSSelectorFromString(@"systemService:handleOpenApplicationRequest:withCompletion:");
         if ([mainWorkspaceClass instancesRespondToSelector:handleOpenSelector]) {
@@ -1616,5 +1649,11 @@ static __attribute__((constructor)) void POInstallSpringBoardHooks(int __unused 
                             (IMP)&_logos_method$_ungrouped$SBHomeHardwareButton$singlePressUp$,
                             (IMP *)&_logos_orig$_ungrouped$SBHomeHardwareButton$singlePressUp$);
         }
+    }
+    {
+        char bootLine[160];
+        snprintf(bootLine, sizeof(bootLine),
+                 "[boot] 0.7.0 阶段 7/8：constructor 全部完成（pid=%d）", (int)getpid());
+        MFLogRawC(bootLine);
     }
 }
