@@ -561,7 +561,7 @@ static NSString *POExternalOptionsSummary(NSDictionary *dictionary) {
     dispatch_once(&onceToken, ^{
         sharedInstance = [POExternalActivationCoordinator new];
         MFLog(@"[notify] 0.7.4 P2 已启用：点通知 → 悬浮窗"
-              "（开关 mfNotificationClickFloat 默认开；0.7.5 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
+              "（开关 mfNotificationClickFloat 默认开；0.7.6 起入口 = 圆盘编辑器一级行「点通知进悬浮窗」，"
               "二级页里可选「全部应用」或「仅选中的应用」）"
               "｜识别 = launchOrigin 含 notification/bulletin/banner，或调用栈命中 NCNotification/SBNotification/Banner");
     });

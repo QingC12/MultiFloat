@@ -496,6 +496,7 @@
 #define MF_RING_EDITOR_ROW_CHEVRON   991017   // 一级菜单行右侧箭头（布局时定位）
 // 【0.7.5 用户指令】「点通知进悬浮窗」二级页（总开关 / 适用范围 / 应用名单）
 #define MF_RING_NOTIFY_MARK          991018   // 名单行右侧勾选圈
+#define MF_RING_NOTIFY_ICON          991019   // 【0.7.6】名单行左侧应用图标（28pt）
 #define MF_RING_NOTIFY_ROW_H         50.0     // 名单每行高
 #define MF_RING_NOTIFY_ROW_GAP       8.0      // 名单行间距
 #define MF_RING_ORDER_CELL_W 76.0             // 排序条格子宽
@@ -1681,6 +1682,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 //   全部 App 收进二级「应用管理」（已添加 / 未添加 两个 tab）；已添加 tab 顶部有
 //   圆盘实时预览 —— 拖动排序/加/减成员时图标位置即时跟随，所见即圆盘真实排布。
 @property (nonatomic, strong) NSArray<NSDictionary<NSString *, NSString *> *> *editorApps;  // 枚举结果留存（二级页数据源）
+@property (nonatomic, assign) NSUInteger mfNotifyIconGeneration;   // 【0.7.6】名单图标分批填充的代次（关面板时 +1 作废旧批次）
 @property (nonatomic, strong) UIView *editorMenuBox;               // 一级菜单容器
 @property (nonatomic, strong) UIView *editorAppsBox;               // 二级「应用管理」页容器
 @property (nonatomic, assign) BOOL editorLevel2Visible;            // 当前在二级页？
@@ -1823,6 +1825,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
 - (void)buildEditorNotifyPageInPanel:(UIView *)panel width:(CGFloat)width height:(CGFloat)height;
 - (void)layoutEditorNotifyPage;
 - (void)refreshEditorNotifyVisuals;
+- (void)fillEditorNotifyIconsFromIndex:(NSUInteger)index generation:(NSUInteger)generation;
 - (void)onEditorNotifySwitchChanged:(UISwitch *)switchView;
 - (void)onEditorNotifyScopeTapped:(UIButton *)sender;
 - (void)onEditorNotifyAppTapped:(UIButton *)sender;
@@ -2646,7 +2649,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
                 [strongSelf mfShowRecordToastActive:active];
                 [strongSelf mfApplyRecordBadge];
             });
-            MFLog(@"[ring] 0.7.5 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
+            MFLog(@"[ring] 0.7.6 录屏状态观察者已注册（开/关提示条 + 红点徽章）");
         });
         MFSystemActionRecordSyncState();
         [self mfApplyRecordBadge];
@@ -3524,7 +3527,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     [self layoutEditorAppsAnimated:NO];
     [self rebuildEditorRingPreview];
     [self refreshEditorCount];
-    MFLog(@"[ring] 0.7.5 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
+    MFLog(@"[ring] 0.7.6 编辑器已打开（二级菜单版）：%lu 个 App，已选 %lu 个",
           (unsigned long)apps.count, (unsigned long)selection.count);
 
     // 真图标延后分批抓（先"首字母"占位，避免一次性拉几百张图标卡住 SpringBoard）
@@ -4306,7 +4309,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         row.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
         row.layer.cornerRadius = 12.0;
         row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-        row.contentEdgeInsets = UIEdgeInsetsMake(0.0, 14.0, 0.0, 46.0);
+        row.contentEdgeInsets = UIEdgeInsetsMake(0.0, 50.0, 0.0, 46.0);   // 【0.7.6】左侧让出 28pt 图标位
         row.accessibilityIdentifier = bundleId;
         [row setTitle:name forState:UIControlStateNormal];
         [row setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.92] forState:UIControlStateNormal];
@@ -4326,12 +4329,68 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         mark.userInteractionEnabled = NO;
         [row addSubview:mark];
 
+        // 【0.7.6】左侧应用图标：先放半透明占位块，真图由 fillEditorNotifyIconsFromIndex: 分批贴。
+        UIImageView *iconView = [[UIImageView alloc] initWithFrame:CGRectZero];
+        iconView.tag = MF_RING_NOTIFY_ICON;
+        iconView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.10];
+        iconView.layer.cornerRadius = 7.0;
+        iconView.layer.masksToBounds = YES;
+        iconView.contentMode = UIViewContentModeScaleAspectFill;
+        iconView.userInteractionEnabled = NO;
+        [row addSubview:iconView];
+
         [scroll addSubview:row];
         [rows addObject:row];
     }
     self.editorNotifyRows = rows;
+    MFLog(@"[ring] 0.7.6 已启用：点通知名单每行显示应用图标（左 28pt，8 个/批填充，不阻塞翻页）");
     MFLog(@"[ring] 点通知进悬浮窗：名单可选项 %lu 个，已勾选 %lu 个",
           (unsigned long)rows.count, (unsigned long)self.editorNotifySelected.count);
+}
+
+/// 【0.7.6 用户指令】点通知名单每行显示应用图标。
+/// 8 个一批、主线程续跑（与网格 `fillEditorIcons:fromIndex:generation:` 同一节奏），
+/// 首屏先贴、往下滚时陆续贴上 —— 名单可能上百行，一次性同步取会把编辑器卡住。
+/// 图标与圆盘/网格共用 `MFRingIconForBundleId()` 的进程内缓存 ⇒ 第二次进页面基本零成本。
+/// 取不到就留占位色块：不猜、不画假图（与圆盘「无图标不显示」同一原则）。
+- (void)fillEditorNotifyIconsFromIndex:(NSUInteger)index generation:(NSUInteger)generation {
+    if (self.editorNotifyBox == nil || generation != self.mfNotifyIconGeneration) {
+        return;
+    }
+    NSArray<UIButton *> *rows = self.editorNotifyRows;
+    NSUInteger total = rows.count;
+    if (index >= total) {
+        MFLog(@"[ring] <<< 通知名单图标抓取完成（%lu 个）", (unsigned long)total);
+        return;
+    }
+    NSUInteger end = MIN(index + 8, total);
+    MFRingGuardArm();
+    for (NSUInteger i = index; i < end; i++) {
+        UIButton *row = rows[i];
+        if (row.superview == nil) {
+            continue;
+        }
+        UIImageView *iconView = (UIImageView *)[row viewWithTag:MF_RING_NOTIFY_ICON];
+        if (iconView == nil || iconView.image != nil) {
+            continue;
+        }
+        NSString *bundleId = row.accessibilityIdentifier;
+        UIImage *icon = MFRingIconForBundleId(bundleId);
+        if (icon == nil) {
+            continue;
+        }
+        iconView.image = icon;
+        iconView.backgroundColor = [UIColor clearColor];
+    }
+    MFRingGuardDisarm();
+    if (end >= total) {
+        MFLog(@"[ring] <<< 通知名单图标抓取完成（%lu 个）", (unsigned long)total);
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf fillEditorNotifyIconsFromIndex:end generation:generation];
+    });
 }
 
 - (void)layoutEditorNotifyPage {
@@ -4366,6 +4425,8 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
         row.frame = CGRectMake(12.0, y, rowW, MF_RING_NOTIFY_ROW_H);
         UILabel *mark = (UILabel *)[row viewWithTag:MF_RING_NOTIFY_MARK];
         mark.frame = CGRectMake(rowW - 34.0, (MF_RING_NOTIFY_ROW_H - 22.0) / 2.0, 22.0, 22.0);
+        UIImageView *iconView = (UIImageView *)[row viewWithTag:MF_RING_NOTIFY_ICON];
+        iconView.frame = CGRectMake(12.0, (MF_RING_NOTIFY_ROW_H - 28.0) / 2.0, 28.0, 28.0);
         y += MF_RING_NOTIFY_ROW_H + MF_RING_NOTIFY_ROW_GAP;
     }
     self.editorNotifyScroll.contentSize = CGSizeMake(w, MAX(0.0, y));
@@ -4608,6 +4669,9 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     } else if (page == self.editorNotifyBox) {
         [self layoutEditorNotifyPage];
         [self refreshEditorNotifyVisuals];
+        // 【0.7.6】进页才开始贴图标（分批，首屏优先）；已贴过的行会自动跳过
+        self.mfNotifyIconGeneration += 1;
+        [self fillEditorNotifyIconsFromIndex:0 generation:self.mfNotifyIconGeneration];
     }
 
     CGFloat slide = (page != nil) ? -24.0 : 0.0;
@@ -5054,6 +5118,7 @@ UIView *MFRingHitTestViewForHostPoint(UIWindow *window, CGPoint point);
     self.editorRowTrigger = nil;
     self.editorRowOther = nil;
     self.editorRowNotify = nil;
+    self.mfNotifyIconGeneration += 1;   // 【0.7.6】代次 +1 ⇒ 作废还在跑的分批图标填充
     self.editorNotifyBox = nil;
     self.editorVisiblePage = nil;
     self.editorNotifyBackButton = nil;
@@ -5787,7 +5852,7 @@ void MFRingInstallEdgePanGesture(void) {
                                                                       recognizer, MFRingEdgeGestureType + 1ULL);
             installedDouble = YES;
         }
-        MFLog(@"[ring] 0.7.5 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
+        MFLog(@"[ring] 0.7.6 边缘手势已注册：单指=%d 双指=%d edge=%@（全屏 App 内贴边滑出呼出；左滑返回插件可用双指呼出）",
               installedSingle, installedDouble, edgeName);
     } @catch (NSException *installException) {
         MFLog(@"[ring] !! 0.2.7 边缘手势注册异常：%@ -> 不影响圆盘本体", installException);
